@@ -1100,7 +1100,6 @@ pub(crate) struct InterruptAttributeNotAllowed {
     /// "not a function"
     #[label(passes_not_fn)]
     pub not_fn: Option<Span>,
-    pub no_body: Option<Span>,
     /// "interrupt attribute can be applied to a function (with body)"
     #[help]
     pub help: (),
