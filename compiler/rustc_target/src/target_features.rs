@@ -1037,7 +1037,9 @@ impl Target {
             Arch::CSky => CSKY_FEATURES_FOR_CORRECT_FIXED_LENGTH_VECTOR_ABI,
             // FIXME: for some tier3 targets, we are overly cautious and always give warnings
             // when passing args in vector registers.
-            Arch::Avr | Arch::Msp430 | Arch::SpirV | Arch::V810 | Arch::Xtensa | Arch::Other(_) => &[],
+            Arch::Avr | Arch::Msp430 | Arch::SpirV | Arch::V810 | Arch::Xtensa | Arch::Other(_) => {
+                &[]
+            }
         }
     }
 

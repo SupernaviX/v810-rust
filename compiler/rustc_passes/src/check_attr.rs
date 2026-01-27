@@ -744,11 +744,7 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
     }
 
     /// Checks if `#[interrupt]` is applied to a function definition.
-    fn check_interrupt(&self,
-        attr_span: Span,
-        target_span: Span,
-        target: Target,
-    ) {
+    fn check_interrupt(&self, attr_span: Span, target_span: Span, target: Target) {
         if matches!(target, Target::Fn) {
             return;
         }
