@@ -749,17 +749,13 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
         target_span: Span,
         target: Target,
     ) {
-        let mut not_fn = None;
-
-        match target {
-            Target::Fn => return,
-            _ => {
-                not_fn = Some(target_span);
-            }
+        if matches!(target, Target::Fn) {
+            return;
         }
+
         self.dcx().emit_err(errors::InterruptAttributeNotAllowed {
             attr_span,
-            not_fn,
+            not_fn: target_span,
             help: (),
         });
     }
