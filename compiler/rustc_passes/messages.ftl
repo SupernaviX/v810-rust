@@ -272,6 +272,11 @@ passes_inline_ignored_for_exported =
 passes_inner_crate_level_attr =
     crate-level attribute should be in the root module
 
+passes_interrupt_attribute_not_allowed =
+    interrupt attribute not allowed here
+    .not_fn = not a function
+    .help = interrupt attribute can be applied to a function
+
 passes_invalid_attr_at_crate_level =
     `{$name}` attribute cannot be used at crate level
     .suggestion = perhaps you meant to use an outer attribute
@@ -474,11 +479,6 @@ passes_sanitize_attribute_not_allowed =
     .not_fn_impl_mod = not a function, impl block, or module
     .no_body = function has no body
     .help = sanitize attribute can be applied to a function (with body), impl block, or module
-
-passes_interrupt_attribute_not_allowed =
-    interrupt attribute not allowed here
-    .not_fn = not a function
-    .help = interrupt attribute can be applied to a function
 
 passes_trait_impl_const_stability_mismatch = const stability on the impl does not match the const stability on the trait
 passes_trait_impl_const_stability_mismatch_impl_stable = this impl is (implicitly) stable...
