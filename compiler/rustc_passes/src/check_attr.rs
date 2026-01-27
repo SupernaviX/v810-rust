@@ -207,8 +207,8 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
                 &Attribute::Parsed(AttributeKind::Sanitize { on_set, off_set, rtsan: _, span: attr_span}) => {
                     self.check_sanitize(attr_span, on_set | off_set, span, target);
                 },
-                Attribute::Parsed(AttributeKind::Interrupt) => {
-                    self.check_interrupt(hir_id, *attr_span, span, target)
+                Attribute::Parsed(AttributeKind::Interrupt(attr_span)) => {
+                    self.check_interrupt(*attr_span, span, target)
                 }
                 Attribute::Parsed(AttributeKind::Link(_, attr_span)) => {
                     self.check_link(hir_id, *attr_span, span, target)
@@ -744,17 +744,24 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
     }
 
     /// Checks if `#[interrupt]` is applied to a function definition.
-    fn check_interrupt(&self, hir_id: HirId, attr_span: Span, span: Span, target: Target) {
+    fn check_interrupt(&self,
+        attr_span: Span,
+        target_span: Span,
+        target: Target,
+    ) {
+        let mut not_fn = None;
+
         match target {
-            Target::Fn => {}
+            Target::Fn => return,
             _ => {
-                self.dcx().emit_err(errors::AttrShouldBeAppliedToFn {
-                    attr_span,
-                    defn_span: span,
-                    on_crate: hir_id == CRATE_HIR_ID,
-                });
+                not_fn = Some(target_span);
             }
         }
+        self.dcx().emit_err(errors::InterruptAttributeNotAllowed {
+            attr_span,
+            not_fn,
+            help: (),
+        });
     }
 
     /// Debugging aid for `object_lifetime_default` query.

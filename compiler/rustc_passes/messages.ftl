@@ -475,6 +475,11 @@ passes_sanitize_attribute_not_allowed =
     .no_body = function has no body
     .help = sanitize attribute can be applied to a function (with body), impl block, or module
 
+passes_interrupt_attribute_not_allowed =
+    interrupt attribute not allowed here
+    .not_fn = not a function
+    .help = interrupt attribute can be applied to a function
+
 passes_trait_impl_const_stability_mismatch = const stability on the impl does not match the const stability on the trait
 passes_trait_impl_const_stability_mismatch_impl_stable = this impl is (implicitly) stable...
 passes_trait_impl_const_stability_mismatch_impl_unstable = this impl is unstable...

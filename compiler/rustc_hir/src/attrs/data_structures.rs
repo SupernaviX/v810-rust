@@ -897,7 +897,7 @@ pub enum AttributeKind {
     InstructionSet(InstructionSetAttr),
 
     /// Represents `#[interrupt]`
-    Interrupt,
+    Interrupt(Span),
 
     /// Represents `#[link]`.
     Link(ThinVec<LinkEntry>, Span),

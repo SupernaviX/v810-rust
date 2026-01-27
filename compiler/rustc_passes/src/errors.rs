@@ -1091,6 +1091,21 @@ pub(crate) struct SanitizeAttributeNotAllowed {
     pub help: (),
 }
 
+/// "interrupt attribute not allowed here"
+#[derive(Diagnostic)]
+#[diag(passes_interrupt_attribute_not_allowed)]
+pub(crate) struct InterruptAttributeNotAllowed {
+    #[primary_span]
+    pub attr_span: Span,
+    /// "not a function"
+    #[label(passes_not_fn)]
+    pub not_fn: Option<Span>,
+    pub no_body: Option<Span>,
+    /// "interrupt attribute can be applied to a function (with body)"
+    #[help]
+    pub help: (),
+}
+
 // FIXME(jdonszelmann): move back to rustc_attr
 #[derive(Diagnostic)]
 #[diag(passes_rustc_const_stable_indirect_pairing)]
