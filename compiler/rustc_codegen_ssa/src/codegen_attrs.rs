@@ -276,7 +276,7 @@ fn process_builtin_attrs(
             AttributeKind::InstructionSet(instruction_set) => {
                 codegen_fn_attrs.instruction_set = Some(*instruction_set)
             }
-            AttributeKind::Interrupt => {
+            AttributeKind::Interrupt(..) => {
                 codegen_fn_attrs.flags |= CodegenFnAttrFlags::INTERRUPT
             }
             AttributeKind::RustcAllocator => {
