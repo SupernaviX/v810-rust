@@ -61,7 +61,7 @@ impl AttributeKind {
             Ignore { .. } => No,
             Inline(..) => No,
             InstructionSet(..) => No,
-            Interrupt => Yes,
+            Interrupt(..) => Yes,
             Link(..) => No,
             LinkName { .. } => Yes, // Needed for rustdoc
             LinkOrdinal { .. } => No,
