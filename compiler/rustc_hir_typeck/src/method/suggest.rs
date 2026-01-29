@@ -1384,13 +1384,14 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 && let hir::Node::Stmt(&hir::Stmt { kind: hir::StmtKind::Semi(parent), .. })
                 | hir::Node::Expr(parent) = tcx.parent_hir_node(path_expr.hir_id)
             {
-                let replacement_span =
-                    if let hir::ExprKind::Call(..) | hir::ExprKind::Struct(..) = parent.kind {
-                        // We want to replace the parts that need to go, like `()` and `{}`.
+                // We want to replace the parts that need to go, like `()` and `{}`.
+                let replacement_span = match parent.kind {
+                    hir::ExprKind::Call(callee, _) if callee.hir_id == path_expr.hir_id => {
                         span.with_hi(parent.span.hi())
-                    } else {
-                        span
-                    };
+                    }
+                    hir::ExprKind::Struct(..) => span.with_hi(parent.span.hi()),
+                    _ => span,
+                };
                 match (variant.ctor, parent.kind) {
                     (None, hir::ExprKind::Struct(..)) => {
                         // We want a struct and we have a struct. We won't suggest changing
@@ -2511,7 +2512,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 applicability = Applicability::HasPlaceholders;
                 "(...)".to_owned()
             };
-            err.span_suggestion(
+            err.span_suggestion_verbose(
                 sugg_span,
                 "use associated function syntax instead",
                 format!("{ty_str}::{item_name}{args}"),
@@ -3280,6 +3281,63 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         }
     }
 
+    /// Checks if we can suggest a derive macro for the unmet trait bound.
+    /// Returns Some(list_of_derives) if possible, or None if not.
+    fn consider_suggesting_derives_for_ty(
+        &self,
+        trait_pred: ty::TraitPredicate<'tcx>,
+        adt: ty::AdtDef<'tcx>,
+    ) -> Option<Vec<(String, Span, Symbol)>> {
+        let diagnostic_name = self.tcx.get_diagnostic_name(trait_pred.def_id())?;
+
+        let can_derive = match diagnostic_name {
+            sym::Default
+            | sym::Eq
+            | sym::PartialEq
+            | sym::Ord
+            | sym::PartialOrd
+            | sym::Clone
+            | sym::Copy
+            | sym::Hash
+            | sym::Debug => true,
+            _ => false,
+        };
+
+        if !can_derive {
+            return None;
+        }
+
+        let trait_def_id = trait_pred.def_id();
+        let self_ty = trait_pred.self_ty();
+
+        // We need to check if there is already a manual implementation of the trait
+        // for this specific ADT to avoid suggesting `#[derive(..)]` that would conflict.
+        if self.tcx.non_blanket_impls_for_ty(trait_def_id, self_ty).any(|impl_def_id| {
+            self.tcx
+                .type_of(impl_def_id)
+                .instantiate_identity()
+                .ty_adt_def()
+                .is_some_and(|def| def.did() == adt.did())
+        }) {
+            return None;
+        }
+
+        let mut derives = Vec::new();
+        let self_name = self_ty.to_string();
+        let self_span = self.tcx.def_span(adt.did());
+
+        for super_trait in supertraits(self.tcx, ty::Binder::dummy(trait_pred.trait_ref)) {
+            if let Some(parent_diagnostic_name) = self.tcx.get_diagnostic_name(super_trait.def_id())
+            {
+                derives.push((self_name.clone(), self_span, parent_diagnostic_name));
+            }
+        }
+
+        derives.push((self_name, self_span, diagnostic_name));
+
+        Some(derives)
+    }
+
     fn note_predicate_source_and_get_derives(
         &self,
         err: &mut Diag<'_>,
@@ -3297,35 +3355,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 Some(adt) if adt.did().is_local() => adt,
                 _ => continue,
             };
-            if let Some(diagnostic_name) = self.tcx.get_diagnostic_name(trait_pred.def_id()) {
-                let can_derive = match diagnostic_name {
-                    sym::Default => !adt.is_enum(),
-                    sym::Eq
-                    | sym::PartialEq
-                    | sym::Ord
-                    | sym::PartialOrd
-                    | sym::Clone
-                    | sym::Copy
-                    | sym::Hash
-                    | sym::Debug => true,
-                    _ => false,
-                };
-                if can_derive {
-                    let self_name = trait_pred.self_ty().to_string();
-                    let self_span = self.tcx.def_span(adt.did());
-                    for super_trait in
-                        supertraits(self.tcx, ty::Binder::dummy(trait_pred.trait_ref))
-                    {
-                        if let Some(parent_diagnostic_name) =
-                            self.tcx.get_diagnostic_name(super_trait.def_id())
-                        {
-                            derives.push((self_name.clone(), self_span, parent_diagnostic_name));
-                        }
-                    }
-                    derives.push((self_name, self_span, diagnostic_name));
-                } else {
-                    traits.push(trait_pred.def_id());
-                }
+            if let Some(new_derives) = self.consider_suggesting_derives_for_ty(trait_pred, adt) {
+                derives.extend(new_derives);
             } else {
                 traits.push(trait_pred.def_id());
             }
@@ -3543,10 +3574,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         span: Span,
         return_type: Option<Ty<'tcx>>,
     ) {
-        let output_ty = match self.err_ctxt().get_impl_future_output_ty(ty) {
-            Some(output_ty) => self.resolve_vars_if_possible(output_ty),
-            _ => return,
-        };
+        let Some(output_ty) = self.err_ctxt().get_impl_future_output_ty(ty) else { return };
+        let output_ty = self.resolve_vars_if_possible(output_ty);
         let method_exists =
             self.method_exists_for_diagnostic(item_name, output_ty, call.hir_id, return_type);
         debug!("suggest_await_before_method: is_method_exist={}", method_exists);

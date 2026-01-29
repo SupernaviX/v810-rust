@@ -137,19 +137,24 @@ jobs:
           body: |
             # Rust toolchain
 
+            The below instructions will install this toolchain as part of rustup, with the name "v810". You can use it in specific projects by running this command:
+            ```sh
+            rustup default set v810
+            ```
+
             Download the right toolchain for your OS.
              - Windows: rust-v810-windows.tar.xz
              - Mac: rust-v810-darwin.tar.xz
              - Linux: rust-v810-linux.tar.xz
 
             ## Installation on Mac/Linux
-            1. Install (rustup)[https://rustup.rs/]
+            1. Install [rustup](https://rustup.rs/)
             2. Download the toolchain, and extract the contents with `tar -xvf <thing-you-downloaded>.tar.xz` 
             3. Navigate to the new directory, and run `./install.sh --prefix=~/.rustup/toolchains/v810`
 
             ## Installation on Windows
             1. Install a posix-compatible shell such as bash
-            2. Install (rustup)[https://rustup.rs/]
+            2. Install [rustup](https://rustup.rs/)
             3. Download the toolchain, and extract the contents with `tar -xvf <thing-you-downloaded>.tar.xz` 
             4. Navigate to the new directory, and run `./install.sh --prefix=~/.rustup/toolchains/v810`
 

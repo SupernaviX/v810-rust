@@ -7,9 +7,9 @@ pub(crate) fn target() -> Target {
     Target {
         llvm_target: "v810-unknown-vb".into(),
         metadata: TargetMetadata {
-            description: None,
-            tier: None,
-            host_tools: None,
+            description: Some("V810 (Virtual Boy)".into()),
+            tier: Some(3),
+            host_tools: Some(false),
             std: Some(false),
         },
         pointer_width: 32,
