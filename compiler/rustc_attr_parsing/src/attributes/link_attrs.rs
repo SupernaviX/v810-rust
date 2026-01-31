@@ -529,7 +529,15 @@ impl<S: Stage> NoArgsAttributeParser<S> for StdInternalSymbolParser {
         Allow(Target::Static),
         Allow(Target::ForeignStatic),
     ]);
-    const CREATE: fn(Span) -> AttributeKind = AttributeKind::StdInternalSymbol;
+    const CREATE: fn(Span) -> AttributeKind = AttributeKind::RustcStdInternalSymbol;
+}
+
+pub(crate) struct InterruptParser;
+impl<S: Stage> NoArgsAttributeParser<S> for InterruptParser {
+    const PATH: &[Symbol] = &[sym::interrupt];
+    const ON_DUPLICATE: OnDuplicate<S> = OnDuplicate::Warn;
+    const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowList(&[Allow(Target::Fn)]);
+    const CREATE: fn(Span) -> AttributeKind = AttributeKind::Interrupt;
 }
 
 pub(crate) struct LinkOrdinalParser;
