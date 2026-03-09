@@ -10,24 +10,23 @@ use rustc_middle::dep_graph::{WorkProduct, WorkProductId};
 use rustc_middle::ty::TyCtxt;
 use rustc_middle::util::Providers;
 use rustc_session::Session;
-use rustc_session::config::{self, CrateType, OutputFilenames, PrintRequest};
+use rustc_session::config::{CrateType, OutputFilenames, PrintRequest};
 use rustc_span::Symbol;
 
 use super::CodegenObject;
 use super::write::WriteBackendMethods;
 use crate::back::archive::ArArchiveBuilderBuilder;
 use crate::back::link::link_binary;
-use crate::back::write::TargetMachineFactoryFn;
-use crate::{CodegenResults, ModuleCodegen, TargetConfig};
+use crate::{CompiledModules, CrateInfo, ModuleCodegen, TargetConfig};
 
 pub trait BackendTypes {
-    type Value: CodegenObject + PartialEq;
-    type Metadata: CodegenObject;
     type Function: CodegenObject;
-
     type BasicBlock: Copy;
-    type Type: CodegenObject + PartialEq;
     type Funclet;
+
+    type Value: CodegenObject + PartialEq;
+    type Type: CodegenObject + PartialEq;
+    type FunctionSignature: CodegenObject + PartialEq;
 
     // FIXME(eddyb) find a common convention for all of the debuginfo-related
     // names (choose between `Dbg`, `Debug`, `DebugInfo`, `DI` etc.).
@@ -37,10 +36,6 @@ pub trait BackendTypes {
 }
 
 pub trait CodegenBackend {
-    /// Locale resources for diagnostic messages - a string the content of the Fluent resource.
-    /// Called before `init` so that all other functions are able to emit translatable diagnostics.
-    fn locale_resource(&self) -> &'static str;
-
     fn name(&self) -> &'static str;
 
     fn init(&self, _sess: &Session) {}
@@ -78,6 +73,17 @@ pub trait CodegenBackend {
 
     fn print_version(&self) {}
 
+    /// Returns a list of all intrinsics that this backend definitely
+    /// replaces, which means their fallback bodies do not need to be monomorphized.
+    fn replaced_intrinsics(&self) -> Vec<Symbol> {
+        vec![]
+    }
+
+    /// Is ThinLTO supported by this backend?
+    fn thin_lto_supported(&self) -> bool {
+        true
+    }
+
     /// Value printed by `--print=backend-has-zstd`.
     ///
     /// Used by compiletest to determine whether tests involving zstd compression
@@ -96,7 +102,9 @@ pub trait CodegenBackend {
 
     fn provide(&self, _providers: &mut Providers) {}
 
-    fn codegen_crate<'tcx>(&self, tcx: TyCtxt<'tcx>) -> Box<dyn Any>;
+    fn target_cpu(&self, sess: &Session) -> String;
+
+    fn codegen_crate<'tcx>(&self, tcx: TyCtxt<'tcx>, crate_info: &CrateInfo) -> Box<dyn Any>;
 
     /// This is called on the returned `Box<dyn Any>` from [`codegen_crate`](Self::codegen_crate)
     ///
@@ -108,20 +116,26 @@ pub trait CodegenBackend {
         ongoing_codegen: Box<dyn Any>,
         sess: &Session,
         outputs: &OutputFilenames,
-    ) -> (CodegenResults, FxIndexMap<WorkProductId, WorkProduct>);
+    ) -> (CompiledModules, FxIndexMap<WorkProductId, WorkProduct>);
 
-    /// This is called on the returned [`CodegenResults`] from [`join_codegen`](Self::join_codegen).
+    fn print_pass_timings(&self) {}
+
+    fn print_statistics(&self) {}
+
+    /// This is called on the returned [`CompiledModules`] from [`join_codegen`](Self::join_codegen).
     fn link(
         &self,
         sess: &Session,
-        codegen_results: CodegenResults,
+        compiled_modules: CompiledModules,
+        crate_info: CrateInfo,
         metadata: EncodedMetadata,
         outputs: &OutputFilenames,
     ) {
         link_binary(
             sess,
             &ArArchiveBuilderBuilder,
-            codegen_results,
+            compiled_modules,
+            crate_info,
             metadata,
             outputs,
             self.name(),
@@ -130,7 +144,7 @@ pub trait CodegenBackend {
 }
 
 pub trait ExtraBackendMethods:
-    CodegenBackend + WriteBackendMethods + Sized + Send + Sync + DynSend + DynSync
+    WriteBackendMethods + Sized + Send + Sync + DynSend + DynSync
 {
     fn codegen_allocator<'tcx>(
         &self,
@@ -146,26 +160,6 @@ pub trait ExtraBackendMethods:
         tcx: TyCtxt<'_>,
         cgu_name: Symbol,
     ) -> (ModuleCodegen<Self::Module>, u64);
-
-    fn target_machine_factory(
-        &self,
-        sess: &Session,
-        opt_level: config::OptLevel,
-        target_features: &[String],
-    ) -> TargetMachineFactoryFn<Self>;
-
-    fn spawn_named_thread<F, T>(
-        _time_trace: bool,
-        name: String,
-        f: F,
-    ) -> std::io::Result<std::thread::JoinHandle<T>>
-    where
-        F: FnOnce() -> T,
-        F: Send + 'static,
-        T: Send + 'static,
-    {
-        std::thread::Builder::new().name(name).spawn(f)
-    }
 
     /// Returns `true` if this backend can be safely called from multiple threads.
     ///

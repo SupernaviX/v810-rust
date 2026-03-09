@@ -5,17 +5,12 @@
 // tidy-alphabetical-start
 #![allow(internal_features)]
 #![allow(rustc::direct_use_of_rustc_type_ir)]
-#![feature(assert_matches)]
 #![feature(associated_type_defaults)]
-#![feature(box_patterns)]
 #![feature(default_field_values)]
-#![feature(error_reporter)]
 #![feature(macro_metavar_expr_concat)]
 #![feature(negative_impls)]
 #![feature(never_type)]
 #![feature(rustc_attrs)]
-#![feature(try_blocks)]
-#![feature(yeet_expr)]
 // tidy-alphabetical-end
 
 extern crate self as rustc_errors;
@@ -23,14 +18,13 @@ extern crate self as rustc_errors;
 use std::backtrace::{Backtrace, BacktraceStatus};
 use std::borrow::Cow;
 use std::cell::Cell;
-use std::error::Report;
 use std::ffi::OsStr;
 use std::hash::Hash;
 use std::io::Write;
 use std::num::NonZero;
 use std::ops::DerefMut;
 use std::path::{Path, PathBuf};
-use std::{fmt, panic};
+use std::{assert_matches, fmt, panic};
 
 use Level::*;
 // Used by external projects such as `rust-gpu`.
@@ -42,8 +36,8 @@ pub use anstyle::{
 pub use codes::*;
 pub use decorate_diag::{BufferedEarlyLint, DecorateDiagCompat, LintBuffer};
 pub use diagnostic::{
-    BugAbort, Diag, DiagArgMap, DiagInner, DiagStyledString, Diagnostic, EmissionGuarantee,
-    FatalAbort, LintDiagnostic, LintDiagnosticBox, StringPart, Subdiag, Subdiagnostic,
+    BugAbort, Diag, DiagInner, DiagLocation, DiagStyledString, Diagnostic, EmissionGuarantee,
+    FatalAbort, StringPart, Subdiag, Subdiagnostic,
 };
 pub use diagnostic_impls::{
     DiagSymbolList, ElidedLifetimeInPathSubdiag, ExpectedLifetimeParameter,
@@ -51,18 +45,18 @@ pub use diagnostic_impls::{
 };
 pub use emitter::ColorConfig;
 use emitter::{DynEmitter, Emitter};
+use rustc_data_structures::AtomicRef;
 use rustc_data_structures::fx::{FxHashSet, FxIndexMap, FxIndexSet};
 use rustc_data_structures::stable_hasher::StableHasher;
 use rustc_data_structures::sync::{DynSend, Lock};
-use rustc_data_structures::{AtomicRef, assert_matches};
 pub use rustc_error_messages::{
-    DiagArg, DiagArgFromDisplay, DiagArgName, DiagArgValue, DiagMessage, FluentBundle, IntoDiagArg,
-    LanguageIdentifier, LazyFallbackBundle, MultiSpan, SpanLabel, SubdiagMessage,
-    fallback_fluent_bundle, fluent_bundle, into_diag_arg_using_display,
+    DiagArg, DiagArgFromDisplay, DiagArgMap, DiagArgName, DiagArgValue, DiagMessage, IntoDiagArg,
+    LanguageIdentifier, MultiSpan, SpanLabel, fluent_bundle, into_diag_arg_using_display,
 };
 use rustc_hashes::Hash128;
 use rustc_lint_defs::LintExpectationId;
 pub use rustc_lint_defs::{Applicability, listify, pluralize};
+pub use rustc_macros::msg;
 use rustc_macros::{Decodable, Encodable};
 pub use rustc_span::ErrorGuaranteed;
 pub use rustc_span::fatal_error::{FatalError, FatalErrorMarker, catch_fatal_errors};
@@ -71,7 +65,8 @@ use rustc_span::{DUMMY_SP, Span};
 use tracing::debug;
 
 use crate::emitter::TimingEvent;
-use crate::registry::Registry;
+use crate::formatting::DiagMessageAddArg;
+pub use crate::formatting::format_diag_message;
 use crate::timings::TimingRecord;
 
 pub mod annotate_snippet_emitter_writer;
@@ -80,19 +75,13 @@ mod decorate_diag;
 mod diagnostic;
 mod diagnostic_impls;
 pub mod emitter;
-pub mod error;
+pub mod formatting;
 pub mod json;
 mod lock;
 pub mod markdown;
-pub mod registry;
-#[cfg(test)]
-mod tests;
 pub mod timings;
-pub mod translation;
 
 pub type PResult<'a, T> = Result<T, Diag<'a>>;
-
-rustc_fluent_macro::fluent_messages! { "../messages.ftl" }
 
 // `PResult` is used a lot. Make sure it doesn't unintentionally get bigger.
 #[cfg(target_pointer_width = "64")]
@@ -299,8 +288,6 @@ impl<'a> std::ops::Deref for DiagCtxtHandle<'a> {
 struct DiagCtxtInner {
     flags: DiagCtxtFlags,
 
-    registry: Registry,
-
     /// The error guarantees from all emitted errors. The length gives the error count.
     err_guars: Vec<ErrorGuaranteed>,
     /// The error guarantee from all emitted lint errors. The length gives the
@@ -482,43 +469,17 @@ impl DiagCtxt {
         self
     }
 
-    pub fn with_registry(mut self, registry: Registry) -> Self {
-        self.inner.get_mut().registry = registry;
-        self
-    }
-
     pub fn new(emitter: Box<DynEmitter>) -> Self {
         Self { inner: Lock::new(DiagCtxtInner::new(emitter)) }
     }
 
     pub fn make_silent(&self) {
         let mut inner = self.inner.borrow_mut();
-        let translator = inner.emitter.translator().clone();
-        inner.emitter = Box::new(emitter::SilentEmitter { translator });
+        inner.emitter = Box::new(emitter::SilentEmitter {});
     }
 
     pub fn set_emitter(&self, emitter: Box<dyn Emitter + DynSend>) {
         self.inner.borrow_mut().emitter = emitter;
-    }
-
-    /// Translate `message` eagerly with `args` to `SubdiagMessage::Eager`.
-    pub fn eagerly_translate<'a>(
-        &self,
-        message: DiagMessage,
-        args: impl Iterator<Item = DiagArg<'a>>,
-    ) -> SubdiagMessage {
-        let inner = self.inner.borrow();
-        inner.eagerly_translate(message, args)
-    }
-
-    /// Translate `message` eagerly with `args` to `String`.
-    pub fn eagerly_translate_to_string<'a>(
-        &self,
-        message: DiagMessage,
-        args: impl Iterator<Item = DiagArg<'a>>,
-    ) -> String {
-        let inner = self.inner.borrow();
-        inner.eagerly_translate_to_string(message, args)
     }
 
     // This is here to not allow mutation of flags;
@@ -539,7 +500,6 @@ impl DiagCtxt {
         let mut inner = self.inner.borrow_mut();
         let DiagCtxtInner {
             flags: _,
-            registry: _,
             err_guars,
             lint_err_guars,
             delayed_bugs,
@@ -813,7 +773,7 @@ impl<'a> DiagCtxtHandle<'a> {
                 .emitted_diagnostic_codes
                 .iter()
                 .filter_map(|&code| {
-                    if inner.registry.try_find_description(code).is_ok() {
+                    if crate::codes::try_find_description(code).is_ok() {
                         Some(code.to_string())
                     } else {
                         None
@@ -885,7 +845,7 @@ impl<'a> DiagCtxtHandle<'a> {
         let inner = &mut *self.inner.borrow_mut();
         let diags = std::mem::take(&mut inner.future_breakage_diagnostics);
         if !diags.is_empty() {
-            inner.emitter.emit_future_breakage_report(diags, &inner.registry);
+            inner.emitter.emit_future_breakage_report(diags);
         }
     }
 
@@ -1186,7 +1146,6 @@ impl DiagCtxtInner {
     fn new(emitter: Box<DynEmitter>) -> Self {
         Self {
             flags: DiagCtxtFlags { can_emit_warnings: true, ..Default::default() },
-            registry: Registry::new(&[]),
             err_guars: Vec::new(),
             lint_err_guars: Vec::new(),
             delayed_bugs: Vec::new(),
@@ -1362,7 +1321,7 @@ impl DiagCtxtInner {
                 }
                 self.has_printed = true;
 
-                self.emitter.emit_diagnostic(diagnostic, &self.registry);
+                self.emitter.emit_diagnostic(diagnostic);
             }
 
             if is_error {
@@ -1438,39 +1397,6 @@ impl DiagCtxtInner {
         self.has_errors().or_else(|| self.delayed_bugs.get(0).map(|(_, guar)| guar).copied())
     }
 
-    /// Translate `message` eagerly with `args` to `SubdiagMessage::Eager`.
-    fn eagerly_translate<'a>(
-        &self,
-        message: DiagMessage,
-        args: impl Iterator<Item = DiagArg<'a>>,
-    ) -> SubdiagMessage {
-        SubdiagMessage::Str(Cow::from(self.eagerly_translate_to_string(message, args)))
-    }
-
-    /// Translate `message` eagerly with `args` to `String`.
-    fn eagerly_translate_to_string<'a>(
-        &self,
-        message: DiagMessage,
-        args: impl Iterator<Item = DiagArg<'a>>,
-    ) -> String {
-        let args = crate::translation::to_fluent_args(args);
-        self.emitter
-            .translator()
-            .translate_message(&message, &args)
-            .map_err(Report::new)
-            .unwrap()
-            .to_string()
-    }
-
-    fn eagerly_translate_for_subdiag(
-        &self,
-        diag: &DiagInner,
-        msg: impl Into<SubdiagMessage>,
-    ) -> SubdiagMessage {
-        let msg = diag.subdiagnostic_message_to_diagnostic_message(msg);
-        self.eagerly_translate(msg, diag.args.iter())
-    }
-
     fn flush_delayed(&mut self) {
         // Stashed diagnostics must be emitted before delayed bugs are flushed.
         // Otherwise, we might ICE prematurely when errors would have
@@ -1520,7 +1446,7 @@ impl DiagCtxtInner {
                 );
             }
 
-            let mut bug = if decorate { bug.decorate(self) } else { bug.inner };
+            let mut bug = if decorate { bug.decorate() } else { bug.inner };
 
             // "Undelay" the delayed bugs into plain bugs.
             if bug.level != DelayedBug {
@@ -1530,9 +1456,9 @@ impl DiagCtxtInner {
                 // We are at the `DiagInner`/`DiagCtxtInner` level rather than
                 // the usual `Diag`/`DiagCtxt` level, so we must augment `bug`
                 // in a lower-level fashion.
-                bug.arg("level", bug.level);
-                let msg = crate::fluent_generated::errors_invalid_flushed_delayed_diagnostic_level;
-                let msg = self.eagerly_translate_for_subdiag(&bug, msg); // after the `arg` call
+                let msg = msg!(
+                    "`flushed_delayed` got diagnostic with level {$level}, instead of the expected `DelayedBug`"
+                ).arg("level", bug.level).format();
                 bug.sub(Note, msg, bug.span.primary_span().unwrap().into());
             }
             bug.level = Bug;
@@ -1567,20 +1493,23 @@ impl DelayedDiagInner {
         DelayedDiagInner { inner: diagnostic, note: backtrace }
     }
 
-    fn decorate(self, dcx: &DiagCtxtInner) -> DiagInner {
+    fn decorate(self) -> DiagInner {
         // We are at the `DiagInner`/`DiagCtxtInner` level rather than the
         // usual `Diag`/`DiagCtxt` level, so we must construct `diag` in a
         // lower-level fashion.
         let mut diag = self.inner;
         let msg = match self.note.status() {
-            BacktraceStatus::Captured => crate::fluent_generated::errors_delayed_at_with_newline,
+            BacktraceStatus::Captured => msg!(
+                "delayed at {$emitted_at}
+                {$note}"
+            ),
             // Avoid the needless newline when no backtrace has been captured,
             // the display impl should just be a single line.
-            _ => crate::fluent_generated::errors_delayed_at_without_newline,
-        };
-        diag.arg("emitted_at", diag.emitted_at.clone());
-        diag.arg("note", self.note);
-        let msg = dcx.eagerly_translate_for_subdiag(&diag, msg); // after the `arg` calls
+            _ => msg!("delayed at {$emitted_at} - {$note}"),
+        }
+        .arg("emitted_at", diag.emitted_at.clone())
+        .arg("note", self.note)
+        .format();
         diag.sub(Note, msg, diag.span.primary_span().unwrap_or(DUMMY_SP).into());
         diag
     }

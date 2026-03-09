@@ -172,10 +172,6 @@ See:
 - [`std::box::Boxed`](https://doc.rust-lang.org/std/boxed/struct.Box.html)
 - [Tracking issue for `box_patterns` feature #29641](https://github.com/rust-lang/rust/issues/29641)
 
-## `tests/ui/btreemap/`: B-Tree Maps
-
-Tests focused on `BTreeMap` collections and their compiler interactions. E.g. collection patterns, iterator behavior, and trait implementations specific to `BTreeMap`. See [`std::collections::BTreeMap`](https://doc.rust-lang.org/std/collections/struct.BTreeMap.html).
-
 ## `tests/ui/builtin-superkinds/`: Built-in Trait Hierarchy Tests
 
 Tests for built-in trait hierarchy (Send, Sync, Sized, etc.) and their supertrait relationships. E.g. auto traits and marker trait constraints.
@@ -262,11 +258,9 @@ This directory only contains one highly specific test. Other coinduction tests c
 
 ## `tests/ui/collections`
 
-These tests exercise the `collections` library.
+These tests exercise the `collections` library. For example, `BTreeMap` and `HashMap`.
 
 See [`std::collections`](https://doc.rust-lang.org/std/collections/index.html)
-
-**FIXME**: consider merge with `tests/ui/btreemap` and `tests/ui/hashmap`
 
 ## `tests/ui/command/`: `std::process::Command`
 
@@ -446,10 +440,6 @@ Everything to do with `--diagnostic-width`.
 
 Exercises `#[diagnostic::*]` namespaced attributes. See [RFC 3368 Diagnostic attribute namespace](https://github.com/rust-lang/rfcs/blob/master/text/3368-diagnostic-attribute-namespace.md).
 
-## `tests/ui/diagnostics-infra`
-
-This directory contains tests and infrastructure related to the diagnostics system, including support for translatable diagnostics
-
 ## `tests/ui/did_you_mean/`
 
 Tests for miscellaneous suggestions.
@@ -517,10 +507,6 @@ Previously known as "object safety".
 The `dyn` keyword is used to highlight that calls to methods on the associated Trait are dynamically dispatched. To use the trait this way, it must be dyn-compatible - tests about dyn-compatibility belong in `tests/ui/dyn-compatibility/`, while more general tests on dynamic dispatch belong here.
 
 See [`dyn` keyword](https://doc.rust-lang.org/std/keyword.dyn.html).
-
-## `tests/ui/dynamically-sized-types`: Dynamically Sized Types
-
-**FIXME**: should be coalesced with `tests/ui/dst`.
 
 ## `tests/ui/editions/`: Rust edition-specific peculiarities
 
@@ -611,6 +597,12 @@ See:
 - [`ffi_const` | The Unstable book](https://doc.rust-lang.org/unstable-book/language-features/ffi-const.html)
 - [`ffi_pure` | The Unstable book](https://doc.rust-lang.org/beta/unstable-book/language-features/ffi-pure.html)
 
+## `tests/ui/field_representing_types`: `#![feature(field_projections)]`
+
+Tests for field representing types `field_of!(Struct, field)`.
+
+See: [Tracking Issue for Field Projections #145383](https://github.com/rust-lang/rust/issues/145383)
+
 ## `tests/ui/float`
 
 See: [Tracking Issue for `f16` and `f128` float types #116909](https://github.com/rust-lang/rust/issues/116909)
@@ -688,10 +680,6 @@ Tests on range patterns where one of the bounds is not a direct value.
 
 **FIXME**: Overlaps with `ui/range`. `impossible_range.rs` is particularly suspected to be a duplicate test.
 
-## `tests/ui/hashmap/`
-
-Tests for the standard library collection [`std::collections::HashMap`](https://doc.rust-lang.org/std/collections/struct.HashMap.html).
-
 ## `tests/ui/higher-ranked/`
 
 Tests for higher-ranked trait bounds.
@@ -700,10 +688,6 @@ See:
 
 - [Higher-ranked trait bounds | rustc-dev-guide](https://rustc-dev-guide.rust-lang.org/traits/hrtb.html)
 - [Higher-ranked trait bounds | Nomicon](https://doc.rust-lang.org/nomicon/hrtb.html)
-
-## `tests/ui/higher-ranked-trait-bounds`
-
-**FIXME**: move to `tests/ui/higher-ranked/trait-bounds`
 
 ## `tests/ui/hygiene/`
 
@@ -720,6 +704,11 @@ This test category revolves around trait objects with `Sized` having illegal ope
 ## `tests/ui/impl-header-lifetime-elision/`
 
 Tests on lifetime elision in impl function signatures. See [Lifetime elision | Nomicon](https://doc.rust-lang.org/nomicon/lifetime-elision.html).
+
+## `tests/ui/impl-restriction/`
+Tests for `#![feature(impl_restriction)]`. See [Tracking issue for restrictions #105077
+](https://github.com/rust-lang/rust/issues/105077).
+
 
 ## `tests/ui/impl-trait/`
 
@@ -926,12 +915,6 @@ See [Tracking issue for allowing overlapping implementations for marker trait #2
 ## `tests/ui/match/`
 
 Broad category of tests on `match` constructs.
-
-## `tests/ui/meta/`: Tests for compiletest itself
-
-These tests check the function of the UI test suite at large and Compiletest in itself.
-
-**FIXME**: This should absolutely be merged with `tests/ui/compiletest-self-test/`.
 
 ## `tests/ui/methods/`
 
@@ -1529,12 +1512,6 @@ See [RFC 0132 Unified Function Call Syntax](https://github.com/rust-lang/rfcs/bl
 `#![feature(unboxed_closures)]`, `Fn`, `FnMut` and `FnOnce` traits
 
 See [Tracking issue for Fn traits (`unboxed_closures` & `fn_traits` feature)](https://github.com/rust-lang/rust/issues/29625).
-
-## `tests/ui/underscore-imports/`
-
-See [Underscore imports | Reference](https://doc.rust-lang.org/reference/items/use-declarations.html#underscore-imports).
-
-**FIXME**: should become a subdirectory of `tests/ui/imports/`.
 
 ## `tests/ui/underscore-lifetime/`: `'_` elided lifetime
 

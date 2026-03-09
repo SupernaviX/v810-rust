@@ -968,7 +968,7 @@ pub const fn _mm_set_ps1(a: f32) -> __m128 {
 /// [Intel's documentation](https://www.intel.com/content/www/us/en/docs/intrinsics-guide/index.html#text=_mm_set_ps)
 #[inline]
 #[target_feature(enable = "sse")]
-#[cfg_attr(test, assert_instr(unpcklps))]
+// This intrinsic has no corresponding instruction.
 #[stable(feature = "simd_x86", since = "1.27.0")]
 #[rustc_const_unstable(feature = "stdarch_const_x86", issue = "149298")]
 pub const fn _mm_set_ps(a: f32, b: f32, c: f32, d: f32) -> __m128 {
@@ -2816,14 +2816,32 @@ mod tests {
         let aa = &[3.0f32, 12.0, 23.0, NAN];
         let bb = &[3.0f32, 47.5, 1.5, NAN];
 
-        let ee = &[1i32, 0, 1, 0];
+        let ee = &[0i32, 0, 1, 0];
 
         for i in 0..4 {
             let a = _mm_setr_ps(aa[i], 1.0, 2.0, 3.0);
             let b = _mm_setr_ps(bb[i], 0.0, 2.0, 4.0);
 
-            let r = _mm_comige_ss(a, b);
+            let r = _mm_comigt_ss(a, b);
 
+            assert_eq!(
+                ee[i], r,
+                "_mm_comigt_ss({:?}, {:?}) = {}, expected: {} (i={})",
+                a, b, r, ee[i], i
+            );
+        }
+    }
+
+    #[simd_test(enable = "sse")]
+    fn test_mm_comige_ss() {
+        let aa = &[3.0f32, 23.0, 12.0, NAN];
+        let bb = &[3.0f32, 1.5, 47.5, NAN];
+        let ee = &[1i32, 1, 0, 0];
+
+        for i in 0..4 {
+            let a = _mm_setr_ps(aa[i], 1.0, 2.0, 3.0);
+            let b = _mm_setr_ps(bb[i], 0.0, 2.0, 4.0);
+            let r = _mm_comige_ss(a, b);
             assert_eq!(
                 ee[i], r,
                 "_mm_comige_ss({:?}, {:?}) = {}, expected: {} (i={})",

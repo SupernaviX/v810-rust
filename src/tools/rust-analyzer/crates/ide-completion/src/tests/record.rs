@@ -61,8 +61,6 @@ fn foo(baz: Baz) {
             en Baz
             en Result
             md core
-            ev Err
-            ev Ok
             bn Baz::Bar Baz::Bar$0
             bn Baz::Foo Baz::Foo$0
             bn Err(…)    Err($1)$0
@@ -89,10 +87,6 @@ fn foo(baz: Baz) {
             en Baz
             en Result
             md core
-            ev Bar
-            ev Err
-            ev Foo
-            ev Ok
             bn Bar        Bar$0
             bn Err(…) Err($1)$0
             bn Foo        Foo$0
@@ -287,6 +281,24 @@ fn main() {
 }
 
 #[test]
+fn functional_update_fields_completion() {
+    // Complete fields before functional update `..`
+    check(
+        r#"
+struct Point { x: i32 = 0, y: i32 = 0 }
+
+fn main() {
+    let p = Point { $0, .. };
+}
+"#,
+        expect![[r#"
+            fd x i32
+            fd y i32
+        "#]],
+    );
+}
+
+#[test]
 fn empty_union_literal() {
     check(
         r#"
@@ -302,7 +314,27 @@ fn foo() {
             fd bar f32
             fd foo u32
         "#]],
-    )
+    );
+}
+
+#[test]
+fn record_pattern_field_with_rest_pat() {
+    // When .. is present, complete all unspecified fields (even those with default values)
+    check(
+        r#"
+struct UserInfo { id: i32, age: f32, email: u64 }
+
+fn foo(u1: UserInfo) {
+    let UserInfo { id, $0, .. } = u1;
+}
+"#,
+        expect![[r#"
+            fd age   f32
+            fd email u64
+            kw mut
+            kw ref
+        "#]],
+    );
 }
 
 #[test]

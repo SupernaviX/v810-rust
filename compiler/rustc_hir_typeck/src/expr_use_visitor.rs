@@ -673,7 +673,9 @@ impl<'tcx, Cx: TypeInformationCtxt<'tcx>, D: Delegate<'tcx>> ExprUseVisitor<'tcx
 
         let with_expr = match *opt_with {
             hir::StructTailExpr::Base(w) => &*w,
-            hir::StructTailExpr::DefaultFields(_) | hir::StructTailExpr::None => {
+            hir::StructTailExpr::DefaultFields(_)
+            | hir::StructTailExpr::None
+            | hir::StructTailExpr::NoneWithError(_) => {
                 return Ok(());
             }
         };
@@ -819,14 +821,12 @@ impl<'tcx, Cx: TypeInformationCtxt<'tcx>, D: Delegate<'tcx>> ExprUseVisitor<'tcx
     /// The core driver for walking a pattern
     ///
     /// This should mirror how pattern-matching gets lowered to MIR, as
-    /// otherwise lowering will ICE when trying to resolve the upvars.
+    /// otherwise said lowering will ICE when trying to resolve the upvars.
     ///
     /// However, it is okay to approximate it here by doing *more* accesses than
     /// the actual MIR builder will, which is useful when some checks are too
-    /// cumbersome to perform here. For example, if after typeck it becomes
-    /// clear that only one variant of an enum is inhabited, and therefore a
-    /// read of the discriminant is not necessary, `walk_pat` will have
-    /// over-approximated the necessary upvar capture granularity.
+    /// cumbersome to perform here, because e.g. they require more typeck results
+    /// than available.
     ///
     /// Do note that discrepancies like these do still create obscure corners
     /// in the semantics of the language, and should be avoided if possible.
@@ -910,7 +910,8 @@ impl<'tcx, Cx: TypeInformationCtxt<'tcx>, D: Delegate<'tcx>> ExprUseVisitor<'tcx
 
                     let res = self.cx.typeck_results().qpath_res(qpath, *hir_id);
                     match res {
-                        Res::Def(DefKind::Const, _) | Res::Def(DefKind::AssocConst, _) => {
+                        Res::Def(DefKind::Const { .. }, _)
+                        | Res::Def(DefKind::AssocConst { .. }, _) => {
                             // Named constants have to be equated with the value
                             // being matched, so that's a read of the value being matched.
                             //
@@ -1407,9 +1408,9 @@ impl<'tcx, Cx: TypeInformationCtxt<'tcx>, D: Delegate<'tcx>> ExprUseVisitor<'tcx
         match res {
             Res::Def(
                 DefKind::Ctor(..)
-                | DefKind::Const
+                | DefKind::Const { .. }
                 | DefKind::ConstParam
-                | DefKind::AssocConst
+                | DefKind::AssocConst { .. }
                 | DefKind::Fn
                 | DefKind::AssocFn,
                 _,
@@ -1853,26 +1854,13 @@ impl<'tcx, Cx: TypeInformationCtxt<'tcx>, D: Delegate<'tcx>> ExprUseVisitor<'tcx
     }
 
     /// Checks whether a type has multiple variants, and therefore, whether a
-    /// read of the discriminant might be necessary. Note that the actual MIR
-    /// builder code does a more specific check, filtering out variants that
-    /// happen to be uninhabited.
-    ///
-    /// Here, it is not practical to perform such a check, because inhabitedness
-    /// queries require typeck results, and typeck requires closure capture analysis.
-    ///
-    /// Moreover, the language is moving towards uninhabited variants still semantically
-    /// causing a discriminant read, so we *shouldn't* perform any such check.
-    ///
-    /// FIXME(never_patterns): update this comment once the aforementioned MIR builder
-    /// code is changed to be insensitive to inhhabitedness.
+    /// read of the discriminant might be necessary.
     #[instrument(skip(self, span), level = "debug")]
     fn is_multivariant_adt(&self, ty: Ty<'tcx>, span: Span) -> bool {
         if let ty::Adt(def, _) = self.cx.structurally_resolve_type(span, ty).kind() {
-            // Note that if a non-exhaustive SingleVariant is defined in another crate, we need
-            // to assume that more cases will be added to the variant in the future. This mean
-            // that we should handle non-exhaustive SingleVariant the same way we would handle
-            // a MultiVariant.
-            def.variants().len() > 1 || def.variant_list_has_applicable_non_exhaustive()
+            // We treat non-exhaustive enums the same independent of the crate they are
+            // defined in, to avoid differences in the operational semantics between crates.
+            def.variants().len() > 1 || def.is_variant_list_non_exhaustive()
         } else {
             false
         }

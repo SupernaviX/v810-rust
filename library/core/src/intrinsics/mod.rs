@@ -409,8 +409,7 @@ pub const unsafe fn assume(b: bool) {
 /// Therefore, implementations must not require the user to uphold
 /// any safety invariants.
 ///
-/// This intrinsic does not have a stable counterpart.
-#[unstable(feature = "core_intrinsics", issue = "none")]
+/// The stabilized version of this intrinsic is [`core::hint::cold_path`].
 #[rustc_intrinsic]
 #[rustc_nounwind]
 #[miri::intrinsic_fallback_is_spec]
@@ -2179,6 +2178,19 @@ pub const unsafe fn unchecked_funnel_shr<T: [const] fallback::FunnelShift>(
     unsafe { a.unchecked_funnel_shr(b, shift) }
 }
 
+/// Carryless multiply.
+///
+/// Safe versions of this intrinsic are available on the integer primitives
+/// via the `carryless_mul` method. For example, [`u32::carryless_mul`].
+#[rustc_intrinsic]
+#[rustc_nounwind]
+#[rustc_const_unstable(feature = "uint_carryless_mul", issue = "152080")]
+#[unstable(feature = "uint_carryless_mul", issue = "152080")]
+#[miri::intrinsic_fallback_is_spec]
+pub const fn carryless_mul<T: [const] fallback::CarrylessMul>(a: T, b: T) -> T {
+    a.carryless_mul(b)
+}
+
 /// This is an implementation detail of [`crate::ptr::read`] and should
 /// not be used anywhere else.  See its comments for why this exists.
 ///
@@ -2739,18 +2751,6 @@ pub unsafe fn vtable_size(ptr: *const ()) -> usize;
 #[rustc_intrinsic]
 pub unsafe fn vtable_align(ptr: *const ()) -> usize;
 
-/// The intrinsic returns the `U` vtable for `T` if `T` can be coerced to the trait object type `U`.
-///
-/// # Compile-time failures
-/// Determining whether `T` can be coerced to the trait object type `U` requires trait resolution by the compiler.
-/// In some cases, that resolution can exceed the recursion limit,
-/// and compilation will fail instead of this function returning `None`.
-#[rustc_nounwind]
-#[unstable(feature = "core_intrinsics", issue = "none")]
-#[rustc_intrinsic]
-pub const fn vtable_for<T, U: ptr::Pointee<Metadata = ptr::DynMetadata<U>> + ?Sized>()
--> Option<ptr::DynMetadata<U>>;
-
 /// The size of a type in bytes.
 ///
 /// Note that, unlike most intrinsics, this is safe to call;
@@ -2812,6 +2812,20 @@ pub const fn align_of<T>() -> usize;
 #[lang = "offset_of"]
 pub const fn offset_of<T: PointeeSized>(variant: u32, field: u32) -> usize;
 
+/// The offset of a field queried by its field representing type.
+///
+/// Returns the offset of the field represented by `F`. This function essentially does the same as
+/// the [`offset_of`] intrinsic, but expects the field to be represented by a generic rather than
+/// the variant and field indices. This also is a safe intrinsic and can only be evaluated at
+/// compile-time, so it should only appear in constants or inline const blocks.
+///
+/// There should be no need to call this intrinsic manually, as its value is used to define
+/// [`Field::OFFSET`](crate::field::Field::OFFSET), which is publicly accessible.
+#[rustc_intrinsic]
+#[unstable(feature = "field_projections", issue = "145383")]
+#[rustc_const_unstable(feature = "field_projections", issue = "145383")]
+pub const fn field_offset<F: crate::field::Field>() -> usize;
+
 /// Returns the number of variants of the type `T` cast to a `usize`;
 /// if `T` has no variants, returns `0`. Uninhabited variants will be counted.
 ///
@@ -2852,6 +2866,20 @@ pub const unsafe fn size_of_val<T: ?Sized>(ptr: *const T) -> usize;
 #[rustc_intrinsic_const_stable_indirect]
 pub const unsafe fn align_of_val<T: ?Sized>(ptr: *const T) -> usize;
 
+#[rustc_intrinsic]
+#[unstable(feature = "core_intrinsics", issue = "none")]
+/// Check if a type represented by a `TypeId` implements a trait represented by a `TypeId`.
+/// It can only be called at compile time, the backends do
+/// not implement it. If it implements the trait the dyn metadata gets returned for vtable access.
+pub const fn type_id_vtable(
+    _id: crate::any::TypeId,
+    _trait: crate::any::TypeId,
+) -> Option<ptr::DynMetadata<*const ()>> {
+    panic!(
+        "`TypeId::trait_info_of` and `trait_info_of_trait_type_id` can only be called at compile-time"
+    )
+}
+
 /// Compute the type information of a concrete type.
 /// It can only be called at compile time, the backends do
 /// not implement it.
@@ -2887,7 +2915,7 @@ pub const fn type_name<T: ?Sized>() -> &'static str;
 #[rustc_nounwind]
 #[unstable(feature = "core_intrinsics", issue = "none")]
 #[rustc_intrinsic]
-pub const fn type_id<T: ?Sized + 'static>() -> crate::any::TypeId;
+pub const fn type_id<T: ?Sized>() -> crate::any::TypeId;
 
 /// Tests (at compile-time) if two [`crate::any::TypeId`] instances identify the
 /// same type. This is necessary because at const-eval time the actual discriminating
@@ -3473,7 +3501,7 @@ pub(crate) const fn miri_promise_symbolic_alignment(ptr: *const (), align: usize
 ///
 #[rustc_intrinsic]
 #[rustc_nounwind]
-pub unsafe fn va_arg<T: VaArgSafe>(ap: &mut VaList<'_>) -> T;
+pub const unsafe fn va_arg<T: VaArgSafe>(ap: &mut VaList<'_>) -> T;
 
 /// Duplicates a variable argument list. The returned list is initially at the same position as
 /// the one in `src`, but can be advanced independently.
@@ -3485,7 +3513,7 @@ pub unsafe fn va_arg<T: VaArgSafe>(ap: &mut VaList<'_>) -> T;
 /// when a variable argument list is used incorrectly.
 #[rustc_intrinsic]
 #[rustc_nounwind]
-pub fn va_copy<'f>(src: &VaList<'f>) -> VaList<'f> {
+pub const fn va_copy<'f>(src: &VaList<'f>) -> VaList<'f> {
     src.duplicate()
 }
 
@@ -3504,6 +3532,6 @@ pub fn va_copy<'f>(src: &VaList<'f>) -> VaList<'f> {
 ///
 #[rustc_intrinsic]
 #[rustc_nounwind]
-pub unsafe fn va_end(ap: &mut VaList<'_>) {
+pub const unsafe fn va_end(ap: &mut VaList<'_>) {
     /* deliberately does nothing */
 }

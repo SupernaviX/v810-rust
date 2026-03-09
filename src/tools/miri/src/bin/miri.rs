@@ -39,6 +39,7 @@ mod log;
 use std::env;
 use std::num::{NonZero, NonZeroI32};
 use std::ops::Range;
+use std::process::ExitCode;
 use std::rc::Rc;
 use std::str::FromStr;
 use std::sync::Once;
@@ -192,7 +193,11 @@ fn make_miri_codegen_backend(opts: &Options, target: &Target) -> Box<dyn Codegen
 
 impl rustc_driver::Callbacks for MiriCompilerCalls {
     fn config(&mut self, config: &mut rustc_interface::interface::Config) {
+        // We never reach codegen anyway.
         config.make_codegen_backend = Some(Box::new(make_miri_codegen_backend));
+
+        // Register our custom extra symbols.
+        config.extra_symbols = miri::sym::EXTRA_SYMBOLS.into();
     }
 
     fn after_analysis<'tcx>(
@@ -353,6 +358,9 @@ impl rustc_driver::Callbacks for MiriDepCompilerCalls {
                 )
             }
         });
+
+        // Register our custom extra symbols.
+        config.extra_symbols = miri::sym::EXTRA_SYMBOLS.into();
     }
 
     fn after_analysis<'tcx>(
@@ -404,7 +412,11 @@ fn run_compiler_and_exit(
     // Invoke compiler, catch any unwinding panics and handle return code.
     let exit_code =
         rustc_driver::catch_with_exit_code(move || rustc_driver::run_compiler(args, callbacks));
-    exit(exit_code)
+    exit(if exit_code == ExitCode::SUCCESS {
+        rustc_driver::EXIT_SUCCESS
+    } else {
+        rustc_driver::EXIT_FAILURE
+    })
 }
 
 /// Parses a comma separated list of `T` from the given string:
@@ -434,7 +446,7 @@ fn parse_range(val: &str) -> Result<Range<u32>, &'static str> {
     Ok(from..to)
 }
 
-fn main() {
+fn main() -> ExitCode {
     let early_dcx = EarlyDiagCtxt::new(ErrorOutputType::default());
 
     // Snapshot a copy of the environment before `rustc` starts messing with it.
@@ -449,9 +461,7 @@ fn main() {
         if crate_kind == "host" {
             // For host crates like proc macros and build scripts, we are an entirely normal rustc.
             // These eventually produce actual binaries and never run in Miri.
-            match rustc_driver::main() {
-                // Empty match proves this function will never return.
-            }
+            return rustc_driver::main();
         } else if crate_kind != "target" {
             panic!("invalid `MIRI_BE_RUSTC` value: {crate_kind:?}")
         };

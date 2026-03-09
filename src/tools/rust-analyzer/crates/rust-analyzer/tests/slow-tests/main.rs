@@ -15,12 +15,14 @@
 extern crate rustc_driver as _;
 
 mod cli;
+mod flycheck;
 mod ratoml;
 mod support;
 mod testdir;
 
 use std::{collections::HashMap, path::PathBuf, time::Instant};
 
+use ide_db::FxHashMap;
 use lsp_types::{
     CodeActionContext, CodeActionParams, CompletionParams, DidOpenTextDocumentParams,
     DocumentFormattingParams, DocumentRangeFormattingParams, FileRename, FormattingOptions,
@@ -669,6 +671,17 @@ fn main() {}
 #[test]
 fn test_format_document_range() {
     if skip_slow_tests() {
+        return;
+    }
+
+    // This test requires a nightly toolchain, so skip if it's not available.
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let has_nightly_rustfmt = toolchain::command("rustfmt", cwd, &FxHashMap::default())
+        .args(["+nightly", "--version"])
+        .output()
+        .is_ok_and(|out| out.status.success());
+    if !has_nightly_rustfmt {
+        tracing::warn!("skipping test_format_document_range: nightly rustfmt not available");
         return;
     }
 
@@ -1447,7 +1460,27 @@ foo = { path = "../foo" }
     .server()
     .wait_until_workspace_is_loaded();
 
-    server.request::<WorkspaceSymbolRequest>(Default::default(), json!([]));
+    server.request::<WorkspaceSymbolRequest>(
+        Default::default(),
+        json!([
+        {
+          "name": "bar",
+          "kind": 4,
+          "location": {
+            "uri": "file:///[..]bar/src/lib.rs",
+            "range": {
+              "start": {
+                "line": 0,
+                "character": 0
+              },
+              "end": {
+                "line": 0,
+                "character": 0
+              }
+            }
+          }
+        }]),
+    );
 
     let server = Project::with_fixture(
         r#"
@@ -1486,7 +1519,27 @@ version = "0.0.0"
     .server()
     .wait_until_workspace_is_loaded();
 
-    server.request::<WorkspaceSymbolRequest>(Default::default(), json!([]));
+    server.request::<WorkspaceSymbolRequest>(
+        Default::default(),
+        json!([
+        {
+          "name": "baz",
+          "kind": 4,
+          "location": {
+            "uri": "file:///[..]baz/src/lib.rs",
+            "range": {
+              "start": {
+                "line": 0,
+                "character": 0
+              },
+              "end": {
+                "line": 0,
+                "character": 0
+              }
+            }
+          }
+        }]),
+    );
 }
 
 #[test]

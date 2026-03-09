@@ -1005,8 +1005,8 @@ crate::target_spec_enum! {
     pub enum RustcAbi {
         /// On x86-32 only: make use of SSE and SSE2 for ABI purposes.
         X86Sse2 = "x86-sse2",
-        /// On x86-32/64 only: do not use any FPU or SIMD registers for the ABI.
-        X86Softfloat = "x86-softfloat",
+        /// On x86-32/64 and S390x: do not use any FPU or SIMD registers for the ABI.
+        Softfloat = "softfloat", "x86-softfloat",
     }
 
     parse_error_type = "rustc abi";
@@ -1082,7 +1082,7 @@ crate::target_spec_enum! {
 }
 
 crate::target_spec_enum! {
-    #[derive(Default)]
+    #[derive(Default, Encodable, Decodable)]
     pub enum SplitDebuginfo {
         /// Split debug-information is disabled, meaning that on supported platforms
         /// you can find all debug information in the executable itself. This is
@@ -1460,6 +1460,7 @@ supported_targets! {
     ("powerpc64le-unknown-linux-gnu", powerpc64le_unknown_linux_gnu),
     ("powerpc64le-unknown-linux-musl", powerpc64le_unknown_linux_musl),
     ("s390x-unknown-linux-gnu", s390x_unknown_linux_gnu),
+    ("s390x-unknown-none-softfloat", s390x_unknown_none_softfloat),
     ("s390x-unknown-linux-musl", s390x_unknown_linux_musl),
     ("sparc-unknown-linux-gnu", sparc_unknown_linux_gnu),
     ("sparc64-unknown-linux-gnu", sparc64_unknown_linux_gnu),
@@ -2213,8 +2214,10 @@ pub struct TargetOptions {
     pub env: Env,
     /// ABI name to distinguish multiple ABIs on the same OS and architecture. For instance, `"eabi"`
     /// or `"eabihf"`. Defaults to [`Abi::Unspecified`].
-    /// This field is *not* forwarded directly to LLVM; its primary purpose is `cfg(target_abi)`.
-    /// However, parts of the backend do check this field for specific values to enable special behavior.
+    /// This field is *not* forwarded directly to LLVM and therefore does not control which ABI (in
+    /// the sense of function calling convention) is actually used; its primary purpose is
+    /// `cfg(target_abi)`. The actual calling convention is controlled by `llvm_abiname`,
+    /// `llvm_floatabi`, and `rustc_abi`.
     pub abi: Abi,
     /// Vendor name to use for conditional compilation (`target_vendor`). Defaults to "unknown".
     #[rustc_lint_opt_deny_field_access(
@@ -3197,6 +3200,27 @@ impl Target {
                     "ARM targets must set `llvm-floatabi` to `hard` or `soft`",
                 )
             }
+            // PowerPC64 targets that are not AIX must set their ABI to either ELFv1 or ELFv2
+            Arch::PowerPC64 => {
+                if self.os == Os::Aix {
+                    check!(
+                        self.llvm_abiname.is_empty(),
+                        "AIX targets always use the AIX ABI and `llvm_abiname` should be left empty",
+                    );
+                } else if self.endian == Endian::Big {
+                    check_matches!(
+                        &*self.llvm_abiname,
+                        "elfv1" | "elfv2",
+                        "invalid PowerPC64 ABI name: {}",
+                        self.llvm_abiname,
+                    );
+                } else {
+                    check!(
+                        self.llvm_abiname == "elfv2",
+                        "little-endian PowerPC64 targets only support the `elfv2` ABI",
+                    );
+                }
+            }
             _ => {}
         }
 
@@ -3208,10 +3232,10 @@ impl Target {
                     Arch::X86,
                     "`x86-sse2` ABI is only valid for x86-32 targets"
                 ),
-                RustcAbi::X86Softfloat => check_matches!(
+                RustcAbi::Softfloat => check_matches!(
                     self.arch,
-                    Arch::X86 | Arch::X86_64,
-                    "`x86-softfloat` ABI is only valid for x86 targets"
+                    Arch::X86 | Arch::X86_64 | Arch::S390x | Arch::AArch64,
+                    "`softfloat` ABI is only valid for x86, s390x, and aarch64 targets"
                 ),
             }
         }
@@ -3366,6 +3390,9 @@ impl Target {
                 }
 
                 Err(format!("could not find specification for target {target_tuple:?}"))
+            }
+            TargetTuple::TargetJson { ref contents, .. } if !unstable_options => {
+                Err("custom targets are unstable and require `-Zunstable-options`".to_string())
             }
             TargetTuple::TargetJson { ref contents, .. } => Target::from_json(contents),
         }

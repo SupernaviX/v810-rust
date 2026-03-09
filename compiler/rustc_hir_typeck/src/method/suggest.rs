@@ -16,7 +16,7 @@ use rustc_errors::codes::*;
 use rustc_errors::{
     Applicability, Diag, MultiSpan, StashKey, listify, pluralize, struct_span_code_err,
 };
-use rustc_hir::attrs::AttributeKind;
+use rustc_hir::attrs::diagnostic::OnUnimplementedNote;
 use rustc_hir::def::{CtorKind, DefKind, Res};
 use rustc_hir::def_id::DefId;
 use rustc_hir::intravisit::{self, Visitor};
@@ -38,7 +38,6 @@ use rustc_span::{
     kw, sym,
 };
 use rustc_trait_selection::error_reporting::traits::DefIdOrName;
-use rustc_trait_selection::error_reporting::traits::on_unimplemented::OnUnimplementedNote;
 use rustc_trait_selection::infer::InferCtxtExt;
 use rustc_trait_selection::traits::query::evaluate_obligation::InferCtxtExt as _;
 use rustc_trait_selection::traits::{
@@ -200,7 +199,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         // NOTE: Reporting a method error should also suppress any unused trait errors,
         // since the method error is very possibly the reason why the trait wasn't used.
         for &import_id in
-            self.tcx.in_scope_traits(call_id).into_iter().flatten().flat_map(|c| &c.import_ids)
+            self.tcx.in_scope_traits(call_id).into_iter().flatten().flat_map(|c| c.import_ids)
         {
             self.typeck_results.borrow_mut().used_trait_imports.insert(import_id);
         }
@@ -854,7 +853,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         {
             err.span_label(span, format!("`{rcvr_ty}` is not an iterator"));
             if !span.in_external_macro(self.tcx.sess.source_map()) {
-                err.multipart_suggestion_verbose(
+                err.multipart_suggestion(
                     "call `.into_iter()` first",
                     vec![(span.shrink_to_lo(), format!("into_iter()."))],
                     Applicability::MaybeIncorrect,
@@ -1415,7 +1414,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     })
                     .collect::<Vec<_>>();
                 if !inherent_impls_candidate.is_empty() {
-                    inherent_impls_candidate.sort_by_key(|id| self.tcx.def_path_str(id));
+                    inherent_impls_candidate.sort_by_key(|&id| self.tcx.def_path_str(id));
                     inherent_impls_candidate.dedup();
 
                     // number of types to show at most
@@ -1581,7 +1580,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     }
                 }
             }
-            err.multipart_suggestion_verbose(
+            err.multipart_suggestion(
                 "there is a variant with a similar name",
                 suggestion,
                 Applicability::HasPlaceholders,
@@ -1748,19 +1747,34 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         // Find all the requirements that come from a local `impl` block.
         let mut skip_list: UnordSet<_> = Default::default();
         let mut spanned_predicates = FxIndexMap::default();
+        let mut manually_impl = false;
         for (p, parent_p, cause) in unsatisfied_predicates {
             // Extract the predicate span and parent def id of the cause,
             // if we have one.
-            let (item_def_id, cause_span) = match cause.as_ref().map(|cause| cause.code()) {
-                Some(ObligationCauseCode::ImplDerived(data)) => {
-                    (data.impl_or_alias_def_id, data.span)
-                }
-                Some(
-                    ObligationCauseCode::WhereClauseInExpr(def_id, span, _, _)
-                    | ObligationCauseCode::WhereClause(def_id, span),
-                ) if !span.is_dummy() => (*def_id, *span),
-                _ => continue,
-            };
+            let (item_def_id, cause_span, cause_msg) =
+                match cause.as_ref().map(|cause| cause.code()) {
+                    Some(ObligationCauseCode::ImplDerived(data)) => {
+                        let msg = if let DefKind::Impl { of_trait: true } =
+                            self.tcx.def_kind(data.impl_or_alias_def_id)
+                        {
+                            format!(
+                                "type parameter would need to implement `{}`",
+                                self.tcx
+                                    .item_name(self.tcx.impl_trait_id(data.impl_or_alias_def_id))
+                            )
+                        } else {
+                            format!("unsatisfied bound `{p}` introduced here")
+                        };
+                        (data.impl_or_alias_def_id, data.span, msg)
+                    }
+                    Some(
+                        ObligationCauseCode::WhereClauseInExpr(def_id, span, _, _)
+                        | ObligationCauseCode::WhereClause(def_id, span),
+                    ) if !span.is_dummy() => {
+                        (*def_id, *span, format!("unsatisfied bound `{p}` introduced here"))
+                    }
+                    _ => continue,
+                };
 
             // Don't point out the span of `WellFormed` predicates.
             if !matches!(
@@ -1791,13 +1805,14 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     let entry = entry.or_insert_with(|| {
                         (FxIndexSet::default(), FxIndexSet::default(), Vec::new())
                     });
-                    entry.0.insert(span);
+                    entry.0.insert(cause_span);
                     entry.1.insert((
-                        span,
-                        "unsatisfied trait bound introduced in this `derive` macro",
+                        cause_span,
+                        cause_msg,
                     ));
                     entry.2.push(p);
                     skip_list.insert(p);
+                    manually_impl = true;
                 }
 
                 // Unmet obligation coming from an `impl`.
@@ -1842,7 +1857,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     entry.2.push(p);
                     if cause_span != *item_span {
                         entry.0.insert(cause_span);
-                        entry.1.insert((cause_span, "unsatisfied trait bound introduced here"));
+                        entry.1.insert((cause_span, "unsatisfied trait bound introduced here".to_string()));
                     } else {
                         if let Some(of_trait) = of_trait {
                             entry.0.insert(of_trait.trait_ref.path.span);
@@ -1850,9 +1865,9 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         entry.0.insert(self_ty.span);
                     };
                     if let Some(of_trait) = of_trait {
-                        entry.1.insert((of_trait.trait_ref.path.span, ""));
+                        entry.1.insert((of_trait.trait_ref.path.span, String::new()));
                     }
-                    entry.1.insert((self_ty.span, ""));
+                    entry.1.insert((self_ty.span, String::new()));
                 }
                 Some(Node::Item(hir::Item {
                     kind: hir::ItemKind::Trait(_, rustc_ast::ast::IsAuto::Yes, ..),
@@ -1881,8 +1896,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         (FxIndexSet::default(), FxIndexSet::default(), Vec::new())
                     });
                     entry.0.insert(cause_span);
-                    entry.1.insert((ident.span, ""));
-                    entry.1.insert((cause_span, "unsatisfied trait bound introduced here"));
+                    entry.1.insert((ident.span, String::new()));
+                    entry.1.insert((cause_span, "unsatisfied trait bound introduced here".to_string()));
                     entry.2.push(p);
                 }
                 _ => {
@@ -2083,6 +2098,9 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             *suggested_derive = self.suggest_derive(err, unsatisfied_predicates);
             *unsatisfied_bounds = true;
         }
+        if manually_impl {
+            err.help("consider manually implementing the trait to avoid undesired bounds");
+        }
     }
 
     /// If an appropriate error source is not found, check method chain for possible candidates
@@ -2238,11 +2256,11 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         call_args: Option<Vec<Ty<'tcx>>>,
     ) -> Option<Symbol> {
         if let ty::Adt(adt, adt_args) = rcvr_ty.kind() {
-            for inherent_impl_did in self.tcx.inherent_impls(adt.did()).into_iter() {
+            for &inherent_impl_did in self.tcx.inherent_impls(adt.did()).into_iter() {
                 for inherent_method in
                     self.tcx.associated_items(inherent_impl_did).in_definition_order()
                 {
-                    if let Some(candidates) = find_attr!(self.tcx.get_all_attrs(inherent_method.def_id), AttributeKind::RustcConfusables{symbols, ..} => symbols)
+                    if let Some(candidates) = find_attr!(self.tcx, inherent_method.def_id, RustcConfusables{symbols, ..} => symbols)
                         && candidates.contains(&item_name.name)
                         && inherent_method.is_fn()
                     {
@@ -2297,7 +2315,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         sources: &mut Vec<CandidateSource>,
         sugg_span: Option<Span>,
     ) {
-        sources.sort_by_key(|source| match source {
+        sources.sort_by_key(|source| match *source {
             CandidateSource::Trait(id) => (0, self.tcx.def_path_str(id)),
             CandidateSource::Impl(id) => (1, self.tcx.def_path_str(id)),
         });
@@ -2450,7 +2468,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             .tcx
             .inherent_impls(adt_def.did())
             .iter()
-            .flat_map(|i| self.tcx.associated_items(i).in_definition_order())
+            .flat_map(|&i| self.tcx.associated_items(i).in_definition_order())
             // Only assoc fn with no receivers and only if
             // they are resolvable
             .filter(|item| {
@@ -2503,7 +2521,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         } else {
             String::new()
         };
-        match &items[..] {
+        match items[..] {
             [] => {}
             [(def_id, ret_ty)] => {
                 err.span_note(
@@ -2518,7 +2536,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             _ => {
                 let span: MultiSpan = items
                     .iter()
-                    .map(|(def_id, _)| self.tcx.def_span(def_id))
+                    .map(|&(def_id, _)| self.tcx.def_span(def_id))
                     .collect::<Vec<Span>>()
                     .into();
                 err.span_note(
@@ -2528,7 +2546,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                          following associated functions:\n{}{post}",
                         items
                             .iter()
-                            .map(|(def_id, _ret_ty)| self.tcx.def_path_str(def_id))
+                            .map(|&(def_id, _ret_ty)| self.tcx.def_path_str(def_id))
                             .collect::<Vec<String>>()
                             .join("\n")
                     ),
@@ -3500,7 +3518,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 traits.push(trait_pred.def_id());
             }
         }
-        traits.sort_by_key(|id| self.tcx.def_path_str(id));
+        traits.sort_by_key(|&id| self.tcx.def_path_str(id));
         traits.dedup();
 
         let len = traits.len();
@@ -3758,8 +3776,9 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 "method `poll` found on `Pin<&mut {ty_str}>`, \
                 see documentation for `std::pin::Pin`"
             ));
-            err.help("self type must be pinned to call `Future::poll`, \
-                see https://rust-lang.github.io/async-book/04_pinning/01_chapter.html#pinning-in-practice"
+            err.help(
+                "self type must be pinned to call `Future::poll`, \
+                see https://rust-lang.github.io/async-book/part-reference/pinning.html",
             );
         }
 
@@ -3902,7 +3921,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         valid_out_of_scope_traits.retain(|id| self.tcx.is_user_visible_dep(id.krate));
         if !valid_out_of_scope_traits.is_empty() {
             let mut candidates = valid_out_of_scope_traits;
-            candidates.sort_by_key(|id| self.tcx.def_path_str(id));
+            candidates.sort_by_key(|&id| self.tcx.def_path_str(id));
             candidates.dedup();
 
             // `TryFrom` and `FromIterator` have no methods

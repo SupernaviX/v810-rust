@@ -13,7 +13,9 @@ use crate::fold::{TypeFoldable, TypeSuperFoldable};
 use crate::relate::Relate;
 use crate::solve::{AdtDestructorKind, SizedTraitKind};
 use crate::visit::{Flags, TypeSuperVisitable, TypeVisitable};
-use crate::{self as ty, CollectAndApply, Interner, UpcastFrom};
+use crate::{
+    self as ty, ClauseKind, CollectAndApply, FieldInfo, Interner, PredicateKind, UpcastFrom,
+};
 
 pub trait Ty<I: Interner<Ty = Self>>:
     Copy
@@ -292,12 +294,6 @@ pub trait ValueConst<I: Interner<ValueConst = Self>>: Copy + Debug + Hash + Eq {
     fn valtree(self) -> I::ValTree;
 }
 
-// FIXME(mgca): This trait can be removed once we're not using a `Box` in `Branch`
-pub trait ValTree<I: Interner<ValTree = Self>>: Copy + Debug + Hash + Eq {
-    // This isnt' `IntoKind` because then we can't return a reference
-    fn kind(&self) -> &ty::ValTreeKind<I>;
-}
-
 pub trait ExprConst<I: Interner<ExprConst = Self>>: Copy + Debug + Hash + Eq + Relate<I> {
     fn args(self) -> I::GenericArgs;
 }
@@ -478,8 +474,27 @@ pub trait Predicate<I: Interner<Predicate = Self>>:
         }
     }
 
-    // FIXME: Eventually uplift the impl out of rustc and make this defaulted.
-    fn allow_normalization(self) -> bool;
+    fn allow_normalization(self) -> bool {
+        match self.kind().skip_binder() {
+            PredicateKind::Clause(ClauseKind::WellFormed(_)) | PredicateKind::AliasRelate(..) => {
+                false
+            }
+            PredicateKind::Clause(ClauseKind::Trait(_))
+            | PredicateKind::Clause(ClauseKind::HostEffect(..))
+            | PredicateKind::Clause(ClauseKind::RegionOutlives(_))
+            | PredicateKind::Clause(ClauseKind::TypeOutlives(_))
+            | PredicateKind::Clause(ClauseKind::Projection(_))
+            | PredicateKind::Clause(ClauseKind::ConstArgHasType(..))
+            | PredicateKind::Clause(ClauseKind::UnstableFeature(_))
+            | PredicateKind::DynCompatible(_)
+            | PredicateKind::Subtype(_)
+            | PredicateKind::Coerce(_)
+            | PredicateKind::Clause(ClauseKind::ConstEvaluatable(_))
+            | PredicateKind::ConstEquate(_, _)
+            | PredicateKind::NormalizesTo(..)
+            | PredicateKind::Ambiguous => true,
+        }
+    }
 }
 
 pub trait Clause<I: Interner<Clause = Self>>:
@@ -558,6 +573,8 @@ pub trait AdtDef<I: Interner>: Copy + Debug + Hash + Eq {
 
     fn is_struct(self) -> bool;
 
+    fn is_packed(self) -> bool;
+
     /// Returns the type of the struct tail.
     ///
     /// Expects the `AdtDef` to be a struct. If it is not, then this will panic.
@@ -566,6 +583,12 @@ pub trait AdtDef<I: Interner>: Copy + Debug + Hash + Eq {
     fn is_phantom_data(self) -> bool;
 
     fn is_manually_drop(self) -> bool;
+
+    fn field_representing_type_info(
+        self,
+        interner: I,
+        args: I::GenericArgs,
+    ) -> Option<FieldInfo<I>>;
 
     // FIXME: perhaps use `all_fields` and expose `FieldDef`.
     fn all_field_tys(self, interner: I) -> ty::EarlyBinder<I, impl IntoIterator<Item = I::Ty>>;

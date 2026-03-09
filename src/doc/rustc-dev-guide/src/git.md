@@ -308,8 +308,8 @@ reapplied to the most recent version of `main`.
 In other words, Git tries to
 pretend that the changes you made to the old version of `main` were instead
 made to the new version of `main`.
-During this process, you should expect to
-encounter at least one "rebase conflict". This happens when Git's attempt to
+During this process, you should expect to encounter at least one "rebase conflict".
+This happens when Git's attempt to
 reapply the changes fails because your changes conflicted with other changes that have been made.
 You can tell that this happened because you'll see lines in the output that look like
 
@@ -372,7 +372,7 @@ to ensure that Git doesn't create merge commits when `git pull`ing, without
 needing to pass `--ff-only` or `--rebase` every time.
 
 You can also `git push --force-with-lease` from main to double-check that your
-feature branches are in sync with their state on the Github side.
+feature branches are in sync with their state on the GitHub side.
 
 ## Advanced Rebasing
 
@@ -409,6 +409,13 @@ You also may want to squash just the last few commits together, possibly
 because they only represent "fixups" and not real changes.
 For example,
 `git rebase --interactive HEAD~2` will allow you to edit the two commits only.
+
+For pull requests in `rust-lang/rust`, you can ask [bors] to squash by commenting
+`@bors squash` on the PR.
+By default, [bors] combines all commit messages in the PR.
+To customize the commit message, use `@bors squash [msg|message=<commit-message>]`.
+
+[bors]: https://github.com/rust-lang/bors
 
 ### `git range-diff`
 
@@ -472,8 +479,8 @@ command useful, especially their ["Examples" section][range-diff-example-docs].
 
 ## No-Merge Policy
 
-The rust-lang/rust repo uses what is known as a "rebase workflow". This means
-that merge commits in PRs are not accepted.
+The rust-lang/rust repo uses what is known as a "rebase workflow".
+This means that merge commits in PRs are not accepted.
 As a result, if you are running
 `git merge` locally, chances are good that you should be rebasing instead.
 Of course, this is not always true; if your merge will just be a fast-forward,
@@ -494,7 +501,7 @@ to follow and understand.
 
 ### Hiding whitespace
 
-Github has a button for disabling whitespace changes that may be useful.
+GitHub has a button for disabling whitespace changes that may be useful.
 You can also use `git diff -w origin/main` to view changes locally.
 
 ![hide whitespace](./img/github-whitespace-changes.png)
@@ -505,7 +512,7 @@ To checkout PRs locally, you can use `git fetch upstream pull/NNNNN/head && git 
 FETCH_HEAD`.
 
 You can also use github's cli tool.
-Github shows a button on PRs where you can copy-paste the command to check it out locally.
+GitHub shows a button on PRs where you can copy-paste the command to check it out locally.
 See <https://cli.github.com/> for more info.
 
 ![`gh` suggestion](./img/github-cli.png)
@@ -521,7 +528,7 @@ for more details.
 
 ### Moving large sections of code
 
-Git and Github's default diff view for large moves *within* a file is quite poor; it will show each
+Git and GitHub's default diff view for large moves *within* a file is quite poor; it will show each
 line as deleted and each line as added, forcing you to compare each line yourself.
 Git has an option to show moved lines in a different color:
 
@@ -562,7 +569,7 @@ Rust projects from within the `rust` repo.
 Examples include Rust's fork of
 `llvm-project`, `cargo`, and libraries like `stdarch` and `backtrace`.
 
-Those projects are developed and maintained in an separate Git (and GitHub)
+Those projects are developed and maintained in a separate Git (and GitHub)
 repository, and they have their own Git history/commits, issue tracker and PRs.
 Submodules allow us to create some sort of embedded sub-repository inside the
 `rust` repository and use them like they were directories in the `rust` repository.

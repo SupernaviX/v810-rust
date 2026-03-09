@@ -5,10 +5,7 @@ use std::borrow::Cow;
 use base_db::AnchoredPath;
 use cfg::CfgExpr;
 use either::Either;
-use intern::{
-    Symbol,
-    sym::{self},
-};
+use intern::{Symbol, sym};
 use itertools::Itertools;
 use mbe::{DelimiterKind, expect_fragment};
 use span::{Edition, FileId, Span};
@@ -830,15 +827,18 @@ fn include_bytes_expand(
     span: Span,
 ) -> ExpandResult<tt::TopSubtree> {
     // FIXME: actually read the file here if the user asked for macro expansion
-    let res = tt::TopSubtree::invisible_from_leaves(
+    let underscore = sym::underscore;
+    let zero = tt::Literal {
+        text_and_suffix: sym::_0_u8,
         span,
-        [tt::Leaf::Literal(tt::Literal {
-            text_and_suffix: Symbol::empty(),
-            span,
-            kind: tt::LitKind::ByteStrRaw(1),
-            suffix_len: 0,
-        })],
-    );
+        kind: tt::LitKind::Integer,
+        suffix_len: 3,
+    };
+    // We don't use a real length since we can't know the file length, so we use an underscore
+    // to infer it.
+    let res = quote! {span =>
+        &[#zero; #underscore]
+    };
     ExpandResult::ok(res)
 }
 

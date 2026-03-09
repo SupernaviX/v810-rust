@@ -2,8 +2,8 @@
 // Note: please avoid adding other feature gates where possible
 #![feature(rustc_private)]
 // Only used to define intrinsics in `compiler_builtins.rs`.
-#![feature(f16)]
-#![feature(f128)]
+#![cfg_attr(feature = "jit", feature(f16))]
+#![cfg_attr(feature = "jit", feature(f128))]
 // Note: please avoid adding other feature gates where possible
 #![warn(rust_2018_idioms)]
 #![warn(unreachable_pub)]
@@ -23,7 +23,6 @@ extern crate rustc_hir;
 extern crate rustc_incremental;
 extern crate rustc_index;
 extern crate rustc_log;
-extern crate rustc_metadata;
 extern crate rustc_session;
 extern crate rustc_span;
 extern crate rustc_symbol_mangling;
@@ -41,7 +40,7 @@ use std::sync::Arc;
 use cranelift_codegen::isa::TargetIsa;
 use cranelift_codegen::settings::{self, Configurable};
 use rustc_codegen_ssa::traits::CodegenBackend;
-use rustc_codegen_ssa::{CodegenResults, TargetConfig};
+use rustc_codegen_ssa::{CompiledModules, CrateInfo, TargetConfig};
 use rustc_log::tracing::info;
 use rustc_middle::dep_graph::{WorkProduct, WorkProductId};
 use rustc_session::Session;
@@ -125,11 +124,6 @@ pub struct CraneliftCodegenBackend {
 }
 
 impl CodegenBackend for CraneliftCodegenBackend {
-    fn locale_resource(&self) -> &'static str {
-        // FIXME(rust-lang/rust#100717) - cranelift codegen backend is not yet translated
-        ""
-    }
-
     fn name(&self) -> &'static str {
         "cranelift"
     }
@@ -186,6 +180,10 @@ impl CodegenBackend for CraneliftCodegenBackend {
             && sess.target.env == Env::Gnu
             && sess.target.abi != Abi::Llvm);
 
+        // FIXME(f128): f128 math operations need f128 math symbols, which currently aren't always
+        // filled in by compiler-builtins. The only libc that provides these currently is glibc.
+        let has_reliable_f128_math = has_reliable_f16_f128 && sess.target.env == Env::Gnu;
+
         TargetConfig {
             target_features,
             unstable_target_features,
@@ -194,7 +192,7 @@ impl CodegenBackend for CraneliftCodegenBackend {
             has_reliable_f16: has_reliable_f16_f128,
             has_reliable_f16_math: has_reliable_f16_f128,
             has_reliable_f128: has_reliable_f16_f128,
-            has_reliable_f128_math: has_reliable_f16_f128,
+            has_reliable_f128_math,
         }
     }
 
@@ -202,12 +200,21 @@ impl CodegenBackend for CraneliftCodegenBackend {
         println!("Cranelift version: {}", cranelift_codegen::VERSION);
     }
 
-    fn codegen_crate(&self, tcx: TyCtxt<'_>) -> Box<dyn Any> {
+    fn target_cpu(&self, sess: &Session) -> String {
+        // FIXME handle `-Ctarget-cpu=native`
+        match sess.opts.cg.target_cpu {
+            Some(ref name) => name,
+            None => sess.target.cpu.as_ref(),
+        }
+        .to_owned()
+    }
+
+    fn codegen_crate(&self, tcx: TyCtxt<'_>, _crate_info: &CrateInfo) -> Box<dyn Any> {
         info!("codegen crate {}", tcx.crate_name(LOCAL_CRATE));
         let config = self.config.get().unwrap();
         if config.jit_mode {
             #[cfg(feature = "jit")]
-            driver::jit::run_jit(tcx, config.jit_args.clone());
+            driver::jit::run_jit(tcx, _crate_info, config.jit_args.clone());
 
             #[cfg(not(feature = "jit"))]
             tcx.dcx().fatal("jit support was disabled when compiling rustc_codegen_cranelift");
@@ -221,7 +228,7 @@ impl CodegenBackend for CraneliftCodegenBackend {
         ongoing_codegen: Box<dyn Any>,
         sess: &Session,
         outputs: &OutputFilenames,
-    ) -> (CodegenResults, FxIndexMap<WorkProductId, WorkProduct>) {
+    ) -> (CompiledModules, FxIndexMap<WorkProductId, WorkProduct>) {
         ongoing_codegen.downcast::<driver::aot::OngoingCodegen>().unwrap().join(sess, outputs)
     }
 }

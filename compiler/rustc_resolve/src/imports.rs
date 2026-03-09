@@ -70,7 +70,7 @@ pub(crate) enum ImportKind<'ra> {
         decls: PerNS<CmCell<PendingDecl<'ra>>>,
         /// `true` for `...::{self [as target]}` imports, `false` otherwise.
         type_ns_only: bool,
-        /// Did this import result from a nested import? ie. `use foo::{bar, baz};`
+        /// Did this import result from a nested import? i.e. `use foo::{bar, baz};`
         nested: bool,
         /// The ID of the `UseTree` that imported this `Import`.
         ///
@@ -371,6 +371,8 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
         // - A glob decl is overwritten by its clone after setting ambiguity in it.
         //   FIXME: avoid this by removing `warn_ambiguity`, or by triggering glob re-fetch
         //   with the same decl in some way.
+        // - A glob decl is overwritten by a glob decl with larger visibility.
+        //   FIXME: avoid this by updating this visibility in place.
         // - A glob decl is overwritten by a glob decl re-fetching an
         //   overwritten decl from other module (the recursive case).
         // Here we are detecting all such re-fetches and overwrite old decls
@@ -384,7 +386,8 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
             // FIXME: reenable the asserts when `warn_ambiguity` is removed (#149195).
             // assert_ne!(old_deep_decl, deep_decl);
             // assert!(old_deep_decl.is_glob_import());
-            assert!(!deep_decl.is_glob_import());
+            // FIXME: reenable the assert when visibility is updated in place.
+            // assert!(!deep_decl.is_glob_import());
             if old_glob_decl.ambiguity.get().is_some() && glob_decl.ambiguity.get().is_none() {
                 // Do not lose glob ambiguities when re-fetching the glob.
                 glob_decl.ambiguity.set_unchecked(old_glob_decl.ambiguity.get());
@@ -406,8 +409,9 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
             }
         } else if !old_glob_decl.vis().is_at_least(glob_decl.vis(), self.tcx) {
             // We are glob-importing the same item but with greater visibility.
-            old_glob_decl.vis.set_unchecked(glob_decl.vis());
-            old_glob_decl
+            // FIXME: Update visibility in place, but without regressions
+            // (#152004, #151124, #152347).
+            glob_decl
         } else if glob_decl.is_ambiguity_recursive() && !old_glob_decl.is_ambiguity_recursive() {
             // Overwriting a non-ambiguous glob import with an ambiguous glob import.
             old_glob_decl.ambiguity.set_unchecked(Some(glob_decl));
@@ -1041,16 +1045,20 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                 suggestion,
                 module,
                 error_implied_by_parse_error: _,
+                message,
             } => {
                 if no_ambiguity {
-                    assert!(import.imported_module.get().is_none());
+                    if !self.issue_145575_hack_applied {
+                        assert!(import.imported_module.get().is_none());
+                    }
                     self.report_error(
                         span,
                         ResolutionError::FailedToResolve {
-                            segment: Some(segment_name),
+                            segment: segment_name,
                             label,
                             suggestion,
                             module,
+                            message,
                         },
                     );
                 }
@@ -1066,7 +1074,9 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                 ..
             } => {
                 if no_ambiguity {
-                    assert!(import.imported_module.get().is_none());
+                    if !self.issue_145575_hack_applied {
+                        assert!(import.imported_module.get().is_none());
+                    }
                     let module = if let Some(ModuleOrUniformRoot::Module(m)) = module {
                         m.opt_def_id()
                     } else {
@@ -1189,7 +1199,11 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                     ident,
                     ns,
                     &import.parent_scope,
-                    Some(Finalize { report_private: false, ..finalize }),
+                    Some(Finalize {
+                        report_private: false,
+                        import_vis: Some(import.vis),
+                        ..finalize
+                    }),
                     bindings[ns].get().decl(),
                     Some(import),
                 );
@@ -1272,6 +1286,9 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                                 if i.name == ident.name {
                                     return None;
                                 } // Never suggest the same name
+                                if i.name == kw::Underscore {
+                                    return None;
+                                } // `use _` is never valid
 
                                 let resolution = resolution.borrow();
                                 if let Some(name_binding) = resolution.best_decl() {

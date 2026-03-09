@@ -27,6 +27,7 @@
 #![feature(restricted_std)]
 #![feature(rustc_attrs)]
 #![feature(extend_one)]
+#![feature(mem_conjure_zst)]
 #![recursion_limit = "256"]
 #![allow(internal_features)]
 #![deny(ffi_unwind_calls)]
@@ -54,7 +55,9 @@ use std::{error, fmt};
 pub use diagnostic::{Diagnostic, Level, MultiSpan};
 #[unstable(feature = "proc_macro_value", issue = "136652")]
 pub use rustc_literal_escaper::EscapeError;
-use rustc_literal_escaper::{MixedUnit, unescape_byte_str, unescape_c_str, unescape_str};
+use rustc_literal_escaper::{
+    MixedUnit, unescape_byte, unescape_byte_str, unescape_c_str, unescape_char, unescape_str,
+};
 #[unstable(feature = "proc_macro_totokens", issue = "130977")]
 pub use to_tokens::ToTokens;
 
@@ -107,15 +110,18 @@ impl !Send for TokenStream {}
 impl !Sync for TokenStream {}
 
 /// Error returned from `TokenStream::from_str`.
+///
+/// The contained error message is explicitly not guaranteed to be stable in any way,
+/// and may change between Rust versions or across compilations.
 #[stable(feature = "proc_macro_lib", since = "1.15.0")]
 #[non_exhaustive]
 #[derive(Debug)]
-pub struct LexError;
+pub struct LexError(String);
 
 #[stable(feature = "proc_macro_lexerror_impls", since = "1.44.0")]
 impl fmt::Display for LexError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("cannot parse string into token stream")
+        f.write_str(&self.0)
     }
 }
 
@@ -194,7 +200,7 @@ impl FromStr for TokenStream {
     type Err = LexError;
 
     fn from_str(src: &str) -> Result<TokenStream, LexError> {
-        Ok(TokenStream(Some(BridgeMethods::ts_from_str(src))))
+        Ok(TokenStream(Some(BridgeMethods::ts_from_str(src).map_err(LexError)?)))
     }
 }
 
@@ -1451,6 +1457,28 @@ impl Literal {
         })
     }
 
+    /// Returns the unescaped character value if the current literal is a byte character literal.
+    #[unstable(feature = "proc_macro_value", issue = "136652")]
+    pub fn byte_character_value(&self) -> Result<u8, ConversionErrorKind> {
+        self.0.symbol.with(|symbol| match self.0.kind {
+            bridge::LitKind::Char => {
+                unescape_byte(symbol).map_err(ConversionErrorKind::FailedToUnescape)
+            }
+            _ => Err(ConversionErrorKind::InvalidLiteralKind),
+        })
+    }
+
+    /// Returns the unescaped character value if the current literal is a character literal.
+    #[unstable(feature = "proc_macro_value", issue = "136652")]
+    pub fn character_value(&self) -> Result<char, ConversionErrorKind> {
+        self.0.symbol.with(|symbol| match self.0.kind {
+            bridge::LitKind::Char => {
+                unescape_char(symbol).map_err(ConversionErrorKind::FailedToUnescape)
+            }
+            _ => Err(ConversionErrorKind::InvalidLiteralKind),
+        })
+    }
+
     /// Returns the unescaped string value if the current literal is a string or a string literal.
     #[unstable(feature = "proc_macro_value", issue = "136652")]
     pub fn str_value(&self) -> Result<String, ConversionErrorKind> {
@@ -1569,7 +1597,7 @@ impl FromStr for Literal {
     fn from_str(src: &str) -> Result<Self, LexError> {
         match BridgeMethods::literal_from_str(src) {
             Ok(literal) => Ok(Literal(literal)),
-            Err(()) => Err(LexError),
+            Err(msg) => Err(LexError(msg)),
         }
     }
 }

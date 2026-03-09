@@ -11,13 +11,14 @@ use rustc_codegen_ssa::back::archive::{ArArchiveBuilderBuilder, ArchiveBuilderBu
 use rustc_codegen_ssa::back::link::link_binary;
 use rustc_codegen_ssa::target_features::cfg_target_feature;
 use rustc_codegen_ssa::traits::CodegenBackend;
-use rustc_codegen_ssa::{CodegenResults, CrateInfo, TargetConfig};
+use rustc_codegen_ssa::{CompiledModules, CrateInfo, TargetConfig};
 use rustc_data_structures::fx::FxIndexMap;
 use rustc_data_structures::jobserver::Proxy;
 use rustc_data_structures::sync;
 use rustc_metadata::{DylibError, EncodedMetadata, load_symbol_from_dylib};
 use rustc_middle::dep_graph::{WorkProduct, WorkProductId};
 use rustc_middle::ty::{CurrentGcx, TyCtxt};
+use rustc_query_impl::collect_active_jobs_from_all_queries;
 use rustc_session::config::{
     Cfg, CrateType, OutFileName, OutputFilenames, OutputTypes, Sysroot, host_tuple,
 };
@@ -184,8 +185,7 @@ pub(crate) fn run_in_thread_pool_with_globals<
     use rustc_data_structures::defer;
     use rustc_data_structures::sync::FromDyn;
     use rustc_middle::ty::tls;
-    use rustc_query_impl::QueryCtxt;
-    use rustc_query_system::query::{QueryContext, break_query_cycles};
+    use rustc_query_impl::break_query_cycles;
 
     let thread_stack_size = init_stack_size(thread_builder_diag);
 
@@ -231,7 +231,12 @@ pub(crate) fn run_in_thread_pool_with_globals<
                 .name("rustc query cycle handler".to_string())
                 .spawn(move || {
                     let on_panic = defer(|| {
-                        eprintln!("internal compiler error: query cycle handler thread panicked, aborting process");
+                        // Split this long string so that it doesn't cause rustfmt to
+                        // give up on the entire builder expression.
+                        // <https://github.com/rust-lang/rustfmt/issues/3863>
+                        const MESSAGE: &str = "\
+internal compiler error: query cycle handler thread panicked, aborting process";
+                        eprintln!("{MESSAGE}");
                         // We need to abort here as we failed to resolve the deadlock,
                         // otherwise the compiler could just hang,
                         process::abort();
@@ -244,12 +249,17 @@ pub(crate) fn run_in_thread_pool_with_globals<
                             tls::with(|tcx| {
                                 // Accessing session globals is sound as they outlive `GlobalCtxt`.
                                 // They are needed to hash query keys containing spans or symbols.
-                                let query_map = rustc_span::set_session_globals_then(unsafe { &*(session_globals as *const SessionGlobals) }, || {
-                                    // Ensure there was no errors collecting all active jobs.
-                                    // We need the complete map to ensure we find a cycle to break.
-                                    QueryCtxt::new(tcx).collect_active_jobs(false).expect("failed to collect active queries in deadlock handler")
-                                });
-                                break_query_cycles(query_map, &registry);
+                                let job_map = rustc_span::set_session_globals_then(
+                                    unsafe { &*(session_globals as *const SessionGlobals) },
+                                    || {
+                                        // Ensure there were no errors collecting all active jobs.
+                                        // We need the complete map to ensure we find a cycle to break.
+                                        collect_active_jobs_from_all_queries(tcx, false).expect(
+                                            "failed to collect active queries in deadlock handler",
+                                        )
+                                    },
+                                );
+                                break_query_cycles(job_map, &registry);
                             })
                         })
                     });
@@ -290,7 +300,7 @@ pub(crate) fn run_in_thread_pool_with_globals<
                     diag.help(
                         "try lowering `-Z threads` or checking the operating system's resource limits",
                     );
-                    diag.emit();
+                    diag.emit()
                 })
         })
     })
@@ -351,10 +361,6 @@ pub struct DummyCodegenBackend {
 }
 
 impl CodegenBackend for DummyCodegenBackend {
-    fn locale_resource(&self) -> &'static str {
-        ""
-    }
-
     fn name(&self) -> &'static str {
         "dummy"
     }
@@ -395,12 +401,12 @@ impl CodegenBackend for DummyCodegenBackend {
         vec![CrateType::Rlib, CrateType::Executable]
     }
 
-    fn codegen_crate<'tcx>(&self, tcx: TyCtxt<'tcx>) -> Box<dyn Any> {
-        Box::new(CodegenResults {
-            modules: vec![],
-            allocator_module: None,
-            crate_info: CrateInfo::new(tcx, String::new()),
-        })
+    fn target_cpu(&self, _sess: &Session) -> String {
+        String::new()
+    }
+
+    fn codegen_crate<'tcx>(&self, _tcx: TyCtxt<'tcx>, _crate_info: &CrateInfo) -> Box<dyn Any> {
+        Box::new(CompiledModules { modules: vec![], allocator_module: None })
     }
 
     fn join_codegen(
@@ -408,24 +414,22 @@ impl CodegenBackend for DummyCodegenBackend {
         ongoing_codegen: Box<dyn Any>,
         _sess: &Session,
         _outputs: &OutputFilenames,
-    ) -> (CodegenResults, FxIndexMap<WorkProductId, WorkProduct>) {
+    ) -> (CompiledModules, FxIndexMap<WorkProductId, WorkProduct>) {
         (*ongoing_codegen.downcast().unwrap(), FxIndexMap::default())
     }
 
     fn link(
         &self,
         sess: &Session,
-        codegen_results: CodegenResults,
+        compiled_modules: CompiledModules,
+        crate_info: CrateInfo,
         metadata: EncodedMetadata,
         outputs: &OutputFilenames,
     ) {
         // JUSTIFICATION: TyCtxt no longer available here
         #[allow(rustc::bad_opt_access)]
-        if let Some(&crate_type) = codegen_results
-            .crate_info
-            .crate_types
-            .iter()
-            .find(|&&crate_type| crate_type != CrateType::Rlib)
+        if let Some(&crate_type) =
+            crate_info.crate_types.iter().find(|&&crate_type| crate_type != CrateType::Rlib)
             && outputs.outputs.should_link()
         {
             sess.dcx().fatal(format!(
@@ -436,7 +440,8 @@ impl CodegenBackend for DummyCodegenBackend {
         link_binary(
             sess,
             &DummyArchiveBuilderBuilder,
-            codegen_results,
+            compiled_modules,
+            crate_info,
             metadata,
             outputs,
             self.name(),

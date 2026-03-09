@@ -277,6 +277,7 @@ pub struct OpenOptions(fs_imp::OpenOptions);
 /// Representation of the various timestamps on a file.
 #[derive(Copy, Clone, Debug, Default)]
 #[stable(feature = "file_set_times", since = "1.75.0")]
+#[must_use = "must be applied to a file via `File::set_times` to have any effect"]
 pub struct FileTimes(fs_imp::FileTimes);
 
 /// Representation of the various permissions on a file.
@@ -2679,7 +2680,7 @@ impl AsInner<fs_imp::DirEntry> for DirEntry {
 ///
 /// This function will only ever return an error of kind `NotFound` if the given
 /// path does not exist. Note that the inverse is not true,
-/// ie. if a path does not exist, its removal may fail for a number of reasons,
+/// i.e. if a path does not exist, its removal may fail for a number of reasons,
 /// such as insufficient permissions.
 ///
 /// # Examples
@@ -3149,7 +3150,7 @@ pub fn create_dir_all<P: AsRef<Path>>(path: P) -> io::Result<()> {
 ///
 /// This function will only ever return an error of kind `NotFound` if the given
 /// path does not exist. Note that the inverse is not true,
-/// ie. if a path does not exist, its removal may fail for a number of reasons,
+/// i.e. if a path does not exist, its removal may fail for a number of reasons,
 /// such as insufficient permissions.
 ///
 /// # Examples

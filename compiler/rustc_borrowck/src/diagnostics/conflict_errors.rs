@@ -28,7 +28,7 @@ use rustc_middle::ty::{
 use rustc_mir_dataflow::move_paths::{InitKind, MoveOutIndex, MovePathIndex};
 use rustc_span::def_id::{DefId, LocalDefId};
 use rustc_span::hygiene::DesugaringKind;
-use rustc_span::{BytePos, Ident, Span, Symbol, kw, sym};
+use rustc_span::{BytePos, ExpnKind, Ident, MacroKind, Span, Symbol, kw, sym};
 use rustc_trait_selection::error_reporting::InferCtxtErrorExt;
 use rustc_trait_selection::error_reporting::traits::FindExprBySpan;
 use rustc_trait_selection::error_reporting::traits::call_kind::CallKind;
@@ -535,7 +535,7 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
                 if let Some(pat) = finder.parent_pat {
                     sugg.insert(0, (pat.span.shrink_to_lo(), "ref ".to_string()));
                 }
-                err.multipart_suggestion_verbose(
+                err.multipart_suggestion(
                     "borrow this binding in the pattern to avoid moving the value",
                     sugg,
                     Applicability::MachineApplicable,
@@ -1157,7 +1157,10 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
         let hir::ExprKind::Path(hir::QPath::Resolved(None, path)) = base.kind else { return };
         let (hir::def::Res::Local(_)
         | hir::def::Res::Def(
-            DefKind::Const | DefKind::ConstParam | DefKind::Static { .. } | DefKind::AssocConst,
+            DefKind::Const { .. }
+            | DefKind::ConstParam
+            | DefKind::Static { .. }
+            | DefKind::AssocConst { .. },
             _,
         )) = path.res
         else {
@@ -1256,7 +1259,7 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
                 self.suggest_cloning_inner(err, ty, expr);
             }
         } else if let ty::Adt(def, args) = ty.kind()
-            && def.did().as_local().is_some()
+            && let Some(local_did) = def.did().as_local()
             && def.variants().iter().all(|variant| {
                 variant
                     .fields
@@ -1266,12 +1269,50 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
         {
             let ty_span = self.infcx.tcx.def_span(def.did());
             let mut span: MultiSpan = ty_span.into();
-            span.push_span_label(ty_span, "consider implementing `Clone` for this type");
-            span.push_span_label(expr.span, "you could clone this value");
-            err.span_note(
-                span,
-                format!("if `{ty}` implemented `Clone`, you could clone the value"),
+            let mut derive_clone = false;
+            self.infcx.tcx.for_each_relevant_impl(
+                self.infcx.tcx.lang_items().clone_trait().unwrap(),
+                ty,
+                |def_id| {
+                    if self.infcx.tcx.is_automatically_derived(def_id) {
+                        derive_clone = true;
+                        span.push_span_label(
+                            self.infcx.tcx.def_span(def_id),
+                            "derived `Clone` adds implicit bounds on type parameters",
+                        );
+                        if let Some(generics) = self.infcx.tcx.hir_get_generics(local_did) {
+                            for param in generics.params {
+                                if let hir::GenericParamKind::Type { .. } = param.kind {
+                                    span.push_span_label(
+                                        param.span,
+                                        format!(
+                                            "introduces an implicit `{}: Clone` bound",
+                                            param.name.ident()
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                },
             );
+            let msg = if !derive_clone {
+                span.push_span_label(
+                    ty_span,
+                    format!(
+                        "consider {}implementing `Clone` for this type",
+                        if derive_clone { "manually " } else { "" }
+                    ),
+                );
+                format!("if `{ty}` implemented `Clone`, you could clone the value")
+            } else {
+                format!("if all bounds were met, you could clone the value")
+            };
+            span.push_span_label(expr.span, "you could clone this value");
+            err.span_note(span, msg);
+            if derive_clone {
+                err.help("consider manually implementing `Clone` to avoid undesired bounds");
+            }
         } else if let ty::Param(param) = ty.kind()
             && let Some(_clone_trait_def) = self.infcx.tcx.lang_items().clone_trait()
             && let generics = self.infcx.tcx.generics_of(self.mir_def_id())
@@ -1397,6 +1438,12 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
         expr: &hir::Expr<'_>,
     ) -> bool {
         let tcx = self.infcx.tcx;
+
+        // Don't suggest `.clone()` in a derive macro expansion.
+        if let ExpnKind::Macro(MacroKind::Derive, _) = self.body.span.ctxt().outer_expn_data().kind
+        {
+            return false;
+        }
         if let Some(_) = self.clone_on_reference(expr) {
             // Avoid redundant clone suggestion already suggested in `explain_captures`.
             // See `tests/ui/moves/needs-clone-through-deref.rs`
@@ -1471,7 +1518,7 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
         } else {
             "consider cloning the value if the performance cost is acceptable"
         };
-        err.multipart_suggestion_verbose(msg, sugg, Applicability::MachineApplicable);
+        err.multipart_suggestion(msg, sugg, Applicability::MachineApplicable);
         true
     }
 
@@ -2309,12 +2356,12 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
             tcx: TyCtxt<'hir>,
             issue_span: Span,
             expr_span: Span,
-            body_expr: Option<&'hir hir::Expr<'hir>>,
-            loop_bind: Option<&'hir Ident>,
-            loop_span: Option<Span>,
-            head_span: Option<Span>,
-            pat_span: Option<Span>,
-            head: Option<&'hir hir::Expr<'hir>>,
+            body_expr: Option<&'hir hir::Expr<'hir>> = None,
+            loop_bind: Option<&'hir Ident> = None,
+            loop_span: Option<Span> = None,
+            head_span: Option<Span> = None,
+            pat_span: Option<Span> = None,
+            head: Option<&'hir hir::Expr<'hir>> = None,
         }
         impl<'hir> Visitor<'hir> for ExprFinder<'hir> {
             fn visit_expr(&mut self, ex: &'hir hir::Expr<'hir>) {
@@ -2380,17 +2427,7 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
                 hir::intravisit::walk_expr(self, ex);
             }
         }
-        let mut finder = ExprFinder {
-            tcx,
-            expr_span: span,
-            issue_span,
-            loop_bind: None,
-            body_expr: None,
-            head_span: None,
-            loop_span: None,
-            pat_span: None,
-            head: None,
-        };
+        let mut finder = ExprFinder { tcx, expr_span: span, issue_span, .. };
         finder.visit_expr(tcx.hir_body(body_id).value);
 
         if let Some(body_expr) = finder.body_expr
@@ -2625,13 +2662,13 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
 
         struct ExpressionFinder<'tcx> {
             capture_span: Span,
-            closure_change_spans: Vec<Span>,
-            closure_arg_span: Option<Span>,
-            in_closure: bool,
-            suggest_arg: String,
+            closure_change_spans: Vec<Span> = vec![],
+            closure_arg_span: Option<Span> = None,
+            in_closure: bool = false,
+            suggest_arg: String = String::new(),
             tcx: TyCtxt<'tcx>,
-            closure_local_id: Option<hir::HirId>,
-            closure_call_changes: Vec<(Span, String)>,
+            closure_local_id: Option<hir::HirId> = None,
+            closure_call_changes: Vec<(Span, String)> = vec![],
         }
         impl<'hir> Visitor<'hir> for ExpressionFinder<'hir> {
             fn visit_expr(&mut self, e: &'hir hir::Expr<'hir>) {
@@ -2712,16 +2749,8 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
         }) = self.infcx.tcx.hir_node(self.mir_hir_id())
             && let hir::Node::Expr(expr) = self.infcx.tcx.hir_node(body_id.hir_id)
         {
-            let mut finder = ExpressionFinder {
-                capture_span: *capture_kind_span,
-                closure_change_spans: vec![],
-                closure_arg_span: None,
-                in_closure: false,
-                suggest_arg: String::new(),
-                closure_local_id: None,
-                closure_call_changes: vec![],
-                tcx: self.infcx.tcx,
-            };
+            let mut finder =
+                ExpressionFinder { capture_span: *capture_kind_span, tcx: self.infcx.tcx, .. };
             finder.visit_expr(expr);
 
             if finder.closure_change_spans.is_empty() || finder.closure_call_changes.is_empty() {
@@ -2739,7 +2768,7 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
                 .chain(finder.closure_call_changes)
                 .collect();
 
-            err.multipart_suggestion_verbose(
+            err.multipart_suggestion(
                 "try explicitly passing `&Self` into the closure as an argument",
                 sugg,
                 Applicability::MachineApplicable,
@@ -3327,7 +3356,7 @@ impl<'infcx, 'tcx> MirBorrowckCtxt<'_, 'infcx, 'tcx> {
 
                             let addition =
                                 format!("let {}binding = {};\n{}", mutability, s, " ".repeat(p));
-                            err.multipart_suggestion_verbose(
+                            err.multipart_suggestion(
                                 msg,
                                 vec![
                                     (stmt.span.shrink_to_lo(), addition),

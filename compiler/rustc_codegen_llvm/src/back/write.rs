@@ -1,7 +1,6 @@
 use std::ffi::{CStr, CString};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::ptr::null_mut;
 use std::sync::Arc;
 use std::{fs, slice, str};
 
@@ -29,7 +28,7 @@ use rustc_target::spec::{
 };
 use tracing::{debug, trace};
 
-use crate::back::lto::ThinBuffer;
+use crate::back::lto::{Buffer, ModuleBuffer};
 use crate::back::owned_target_machine::OwnedTargetMachine;
 use crate::back::profiling::{
     LlvmSelfProfiler, selfprofile_after_pass_callback, selfprofile_before_pass_callback,
@@ -38,8 +37,8 @@ use crate::builder::SBuilder;
 use crate::builder::gpu_offload::scalar_width;
 use crate::common::AsCCharPtr;
 use crate::errors::{
-    CopyBitcode, FromLlvmDiag, FromLlvmOptimizationDiag, LlvmError, UnknownCompression,
-    WithLlvmError, WriteBytecode,
+    CopyBitcode, FromLlvmDiag, FromLlvmOptimizationDiag, LlvmError, ParseTargetMachineConfig,
+    UnknownCompression, WithLlvmError, WriteBytecode,
 };
 use crate::llvm::diagnostic::OptimizationDiagnosticKind::*;
 use crate::llvm::{self, DiagnosticInfo};
@@ -111,8 +110,7 @@ pub(crate) fn create_informational_target_machine(
     // Can't use query system here quite yet because this function is invoked before the query
     // system/tcx is set up.
     let features = llvm_util::global_llvm_features(sess, only_base_features);
-    target_machine_factory(sess, config::OptLevel::No, &features)(config)
-        .unwrap_or_else(|err| llvm_err(sess.dcx(), err))
+    target_machine_factory(sess, config::OptLevel::No, &features)(sess.dcx(), config)
 }
 
 pub(crate) fn create_target_machine(tcx: TyCtxt<'_>, mod_name: &str) -> OwnedTargetMachine {
@@ -138,8 +136,7 @@ pub(crate) fn create_target_machine(tcx: TyCtxt<'_>, mod_name: &str) -> OwnedTar
         tcx.sess,
         tcx.backend_optimization_level(()),
         tcx.global_backend_features(()),
-    )(config)
-    .unwrap_or_else(|err| llvm_err(tcx.dcx(), err))
+    )(tcx.dcx(), config)
 }
 
 fn to_llvm_opt_settings(cfg: config::OptLevel) -> (llvm::CodeGenOptLevel, llvm::CodeGenOptSize) {
@@ -278,7 +275,7 @@ pub(crate) fn target_machine_factory(
     let large_data_threshold = sess.opts.unstable_opts.large_data_threshold.unwrap_or(0);
 
     let prof = SelfProfilerRef::clone(&sess.prof);
-    Arc::new(move |config: TargetMachineFactoryConfig| {
+    Arc::new(move |dcx: DiagCtxtHandle<'_>, config: TargetMachineFactoryConfig| {
         // Self-profile timer for invoking a factory to create a target machine.
         let _prof_timer = prof.generic_activity("target_machine_factory_inner");
 
@@ -320,11 +317,12 @@ pub(crate) fn target_machine_factory(
             use_wasm_eh,
             large_data_threshold,
         )
+        .unwrap_or_else(|err| dcx.emit_fatal(ParseTargetMachineConfig(err)))
     })
 }
 
 pub(crate) fn save_temp_bitcode(
-    cgcx: &CodegenContext<LlvmCodegenBackend>,
+    cgcx: &CodegenContext,
     module: &ModuleCodegen<ModuleLlvm>,
     name: &str,
 ) {
@@ -337,13 +335,13 @@ pub(crate) fn save_temp_bitcode(
         &module.name,
         cgcx.invocation_temp.as_deref(),
     );
-    write_bitcode_to_file(module, &path)
+    write_bitcode_to_file(&module.module_llvm, &path)
 }
 
-fn write_bitcode_to_file(module: &ModuleCodegen<ModuleLlvm>, path: &Path) {
+fn write_bitcode_to_file(module: &ModuleLlvm, path: &Path) {
     unsafe {
         let path = path_to_c_string(&path);
-        let llmod = module.module_llvm.llmod();
+        let llmod = module.llmod();
         llvm::LLVMWriteBitcodeToFile(llmod, path.as_ptr());
     }
 }
@@ -359,14 +357,14 @@ pub(crate) enum CodegenDiagnosticsStage {
 }
 
 pub(crate) struct DiagnosticHandlers<'a> {
-    data: *mut (&'a CodegenContext<LlvmCodegenBackend>, &'a SharedEmitter),
+    data: *mut (&'a CodegenContext, &'a SharedEmitter),
     llcx: &'a llvm::Context,
     old_handler: Option<&'a llvm::DiagnosticHandler>,
 }
 
 impl<'a> DiagnosticHandlers<'a> {
     pub(crate) fn new(
-        cgcx: &'a CodegenContext<LlvmCodegenBackend>,
+        cgcx: &'a CodegenContext,
         shared_emitter: &'a SharedEmitter,
         llcx: &'a llvm::Context,
         module: &ModuleCodegen<ModuleLlvm>,
@@ -432,7 +430,7 @@ impl<'a> Drop for DiagnosticHandlers<'a> {
 }
 
 fn report_inline_asm(
-    cgcx: &CodegenContext<LlvmCodegenBackend>,
+    cgcx: &CodegenContext,
     msg: String,
     level: llvm::DiagnosticLevel,
     cookie: u64,
@@ -464,8 +462,7 @@ unsafe extern "C" fn diagnostic_handler(info: &DiagnosticInfo, user: *mut c_void
     if user.is_null() {
         return;
     }
-    let (cgcx, shared_emitter) =
-        unsafe { *(user as *const (&CodegenContext<LlvmCodegenBackend>, &SharedEmitter)) };
+    let (cgcx, shared_emitter) = unsafe { *(user as *const (&CodegenContext, &SharedEmitter)) };
 
     let dcx = DiagCtxt::new(Box::new(shared_emitter.clone()));
     let dcx = dcx.handle();
@@ -561,10 +558,12 @@ pub(crate) enum AutodiffStage {
 }
 
 pub(crate) unsafe fn llvm_optimize(
-    cgcx: &CodegenContext<LlvmCodegenBackend>,
+    cgcx: &CodegenContext,
+    prof: &SelfProfilerRef,
     dcx: DiagCtxtHandle<'_>,
     module: &ModuleCodegen<ModuleLlvm>,
-    thin_lto_buffer: Option<&mut *mut llvm::ThinLTOBuffer>,
+    thin_lto_buffer: Option<&mut Option<Buffer>>,
+    thin_lto_summary_buffer: Option<&mut Option<Buffer>>,
     config: &ModuleConfig,
     opt_level: config::OptLevel,
     opt_stage: llvm::OptStage,
@@ -758,10 +757,9 @@ pub(crate) unsafe fn llvm_optimize(
         }
     }
 
-    let mut llvm_profiler = cgcx
-        .prof
+    let mut llvm_profiler = prof
         .llvm_recording_enabled()
-        .then(|| LlvmSelfProfiler::new(cgcx.prof.get_self_profiler().unwrap()));
+        .then(|| LlvmSelfProfiler::new(prof.get_self_profiler().unwrap()));
 
     let llvm_selfprofiler =
         llvm_profiler.as_mut().map(|s| s as *mut _ as *mut c_void).unwrap_or(std::ptr::null_mut());
@@ -788,8 +786,7 @@ pub(crate) unsafe fn llvm_optimize(
             config.verify_llvm_ir,
             config.lint_llvm_ir,
             thin_lto_buffer,
-            config.emit_thin_lto,
-            config.emit_thin_lto_summary,
+            thin_lto_summary_buffer,
             merge_functions,
             unroll_loops,
             vectorize_slp,
@@ -880,7 +877,7 @@ pub(crate) unsafe fn llvm_optimize(
                 &out_obj,
                 None,
                 llvm::FileType::ObjectFile,
-                &cgcx.prof,
+                prof,
                 true,
             );
             // We ignore cgcx.save_temps here and unconditionally always keep our `host.out` artifact.
@@ -893,12 +890,13 @@ pub(crate) unsafe fn llvm_optimize(
 
 // Unsafe due to LLVM calls.
 pub(crate) fn optimize(
-    cgcx: &CodegenContext<LlvmCodegenBackend>,
+    cgcx: &CodegenContext,
+    prof: &SelfProfilerRef,
     shared_emitter: &SharedEmitter,
     module: &mut ModuleCodegen<ModuleLlvm>,
     config: &ModuleConfig,
 ) {
-    let _timer = cgcx.prof.generic_activity_with_arg("LLVM_module_optimize", &*module.name);
+    let _timer = prof.generic_activity_with_arg("LLVM_module_optimize", &*module.name);
 
     let dcx = DiagCtxt::new(Box::new(shared_emitter.clone()));
     let dcx = dcx.handle();
@@ -907,13 +905,8 @@ pub(crate) fn optimize(
     let _handlers =
         DiagnosticHandlers::new(cgcx, shared_emitter, llcx, module, CodegenDiagnosticsStage::Opt);
 
-    if config.emit_no_opt_bc {
-        let out = cgcx.output_filenames.temp_path_ext_for_cgu(
-            "no-opt.bc",
-            &module.name,
-            cgcx.invocation_temp.as_deref(),
-        );
-        write_bitcode_to_file(module, &out)
+    if module.kind == ModuleKind::Regular {
+        save_temp_bitcode(cgcx, module, "no-opt");
     }
 
     // FIXME(ZuseZ4): support SanitizeHWAddress and prevent illegal/unsupported opts
@@ -934,20 +927,23 @@ pub(crate) fn optimize(
         // The bitcode obtained during the `codegen` phase is no longer suitable for performing LTO.
         // It may have undergone LTO due to ThinLocal, so we need to obtain the embedded bitcode at
         // this point.
-        let mut thin_lto_buffer = if (module.kind == ModuleKind::Regular
+        let (mut thin_lto_buffer, mut thin_lto_summary_buffer) = if (module.kind
+            == ModuleKind::Regular
             && config.emit_obj == EmitObj::ObjectCode(BitcodeSection::Full))
             || config.emit_thin_lto_summary
         {
-            Some(null_mut())
+            (Some(None), config.emit_thin_lto_summary.then_some(None))
         } else {
-            None
+            (None, None)
         };
         unsafe {
             llvm_optimize(
                 cgcx,
+                prof,
                 dcx,
                 module,
                 thin_lto_buffer.as_mut(),
+                thin_lto_summary_buffer.as_mut(),
                 config,
                 opt_level,
                 opt_stage,
@@ -955,23 +951,24 @@ pub(crate) fn optimize(
             )
         };
         if let Some(thin_lto_buffer) = thin_lto_buffer {
-            let thin_lto_buffer = unsafe { ThinBuffer::from_raw_ptr(thin_lto_buffer) };
+            let thin_lto_buffer = thin_lto_buffer.unwrap();
             module.thin_lto_buffer = Some(thin_lto_buffer.data().to_vec());
             let bc_summary_out = cgcx.output_filenames.temp_path_for_cgu(
                 OutputType::ThinLinkBitcode,
                 &module.name,
                 cgcx.invocation_temp.as_deref(),
             );
-            if config.emit_thin_lto_summary
+            if let Some(thin_lto_summary_buffer) = thin_lto_summary_buffer
                 && let Some(thin_link_bitcode_filename) = bc_summary_out.file_name()
             {
-                let summary_data = thin_lto_buffer.thin_link_data();
-                cgcx.prof.artifact_size(
+                let thin_lto_summary_buffer = thin_lto_summary_buffer.unwrap();
+                let summary_data = thin_lto_summary_buffer.data();
+                prof.artifact_size(
                     "llvm_bitcode_summary",
                     thin_link_bitcode_filename.to_string_lossy(),
                     summary_data.len() as u64,
                 );
-                let _timer = cgcx.prof.generic_activity_with_arg(
+                let _timer = prof.generic_activity_with_arg(
                     "LLVM_module_codegen_emit_bitcode_summary",
                     &*module.name,
                 );
@@ -984,12 +981,13 @@ pub(crate) fn optimize(
 }
 
 pub(crate) fn codegen(
-    cgcx: &CodegenContext<LlvmCodegenBackend>,
+    cgcx: &CodegenContext,
+    prof: &SelfProfilerRef,
     shared_emitter: &SharedEmitter,
     module: ModuleCodegen<ModuleLlvm>,
     config: &ModuleConfig,
 ) -> CompiledModule {
-    let _timer = cgcx.prof.generic_activity_with_arg("LLVM_module_codegen", &*module.name);
+    let _timer = prof.generic_activity_with_arg("LLVM_module_codegen", &*module.name);
 
     let dcx = DiagCtxt::new(Box::new(shared_emitter.clone()));
     let dcx = dcx.handle();
@@ -1028,18 +1026,17 @@ pub(crate) fn codegen(
         if config.bitcode_needed() {
             if config.emit_bc || config.emit_obj == EmitObj::Bitcode {
                 let thin = {
-                    let _timer = cgcx.prof.generic_activity_with_arg(
+                    let _timer = prof.generic_activity_with_arg(
                         "LLVM_module_codegen_make_bitcode",
                         &*module.name,
                     );
-                    ThinBuffer::new(llmod, config.emit_thin_lto)
+                    ModuleBuffer::new(llmod, cgcx.lto != Lto::Fat)
                 };
                 let data = thin.data();
-                let _timer = cgcx
-                    .prof
+                let _timer = prof
                     .generic_activity_with_arg("LLVM_module_codegen_emit_bitcode", &*module.name);
                 if let Some(bitcode_filename) = bc_out.file_name() {
-                    cgcx.prof.artifact_size(
+                    prof.artifact_size(
                         "llvm_bitcode",
                         bitcode_filename.to_string_lossy(),
                         data.len() as u64,
@@ -1051,8 +1048,7 @@ pub(crate) fn codegen(
             }
 
             if config.embed_bitcode() && module.kind == ModuleKind::Regular {
-                let _timer = cgcx
-                    .prof
+                let _timer = prof
                     .generic_activity_with_arg("LLVM_module_codegen_embed_bitcode", &*module.name);
                 let thin_bc =
                     module.thin_lto_buffer.as_deref().expect("cannot find embedded bitcode");
@@ -1062,7 +1058,7 @@ pub(crate) fn codegen(
 
         if config.emit_ir {
             let _timer =
-                cgcx.prof.generic_activity_with_arg("LLVM_module_codegen_emit_ir", &*module.name);
+                prof.generic_activity_with_arg("LLVM_module_codegen_emit_ir", &*module.name);
             let out = cgcx.output_filenames.temp_path_for_cgu(
                 OutputType::LlvmAssembly,
                 &module.name,
@@ -1100,7 +1096,7 @@ pub(crate) fn codegen(
                 unsafe { llvm::LLVMRustPrintModule(llmod, out_c.as_ptr(), demangle_callback) };
 
             if result == llvm::LLVMRustResult::Success {
-                record_artifact_size(&cgcx.prof, "llvm_ir", &out);
+                record_artifact_size(prof, "llvm_ir", &out);
             }
 
             result
@@ -1110,7 +1106,7 @@ pub(crate) fn codegen(
 
         if config.emit_asm {
             let _timer =
-                cgcx.prof.generic_activity_with_arg("LLVM_module_codegen_emit_asm", &*module.name);
+                prof.generic_activity_with_arg("LLVM_module_codegen_emit_asm", &*module.name);
             let path = cgcx.output_filenames.temp_path_for_cgu(
                 OutputType::Assembly,
                 &module.name,
@@ -1134,16 +1130,15 @@ pub(crate) fn codegen(
                 &path,
                 None,
                 llvm::FileType::AssemblyFile,
-                &cgcx.prof,
+                prof,
                 config.verify_llvm_ir,
             );
         }
 
         match config.emit_obj {
             EmitObj::ObjectCode(_) => {
-                let _timer = cgcx
-                    .prof
-                    .generic_activity_with_arg("LLVM_module_codegen_emit_obj", &*module.name);
+                let _timer =
+                    prof.generic_activity_with_arg("LLVM_module_codegen_emit_obj", &*module.name);
 
                 let dwo_out = cgcx
                     .output_filenames
@@ -1170,7 +1165,7 @@ pub(crate) fn codegen(
                     &obj_out,
                     dwo_out,
                     llvm::FileType::ObjectFile,
-                    &cgcx.prof,
+                    prof,
                     config.verify_llvm_ir,
                 );
             }
@@ -1190,7 +1185,7 @@ pub(crate) fn codegen(
             EmitObj::None => {}
         }
 
-        record_llvm_cgu_instructions_stats(&cgcx.prof, &module.name, llmod);
+        record_llvm_cgu_instructions_stats(prof, &module.name, llmod);
     }
 
     // `.dwo` files are only emitted if:
@@ -1239,7 +1234,7 @@ fn create_section_with_flags_asm(section_name: &str, section_flags: &str, data: 
     asm
 }
 
-pub(crate) fn bitcode_section_name(cgcx: &CodegenContext<LlvmCodegenBackend>) -> &'static CStr {
+pub(crate) fn bitcode_section_name(cgcx: &CodegenContext) -> &'static CStr {
     if cgcx.target_is_like_darwin {
         c"__LLVM,__bitcode"
     } else if cgcx.target_is_like_aix {
@@ -1251,7 +1246,7 @@ pub(crate) fn bitcode_section_name(cgcx: &CodegenContext<LlvmCodegenBackend>) ->
 
 /// Embed the bitcode of an LLVM module for LTO in the LLVM module itself.
 fn embed_bitcode(
-    cgcx: &CodegenContext<LlvmCodegenBackend>,
+    cgcx: &CodegenContext,
     llcx: &llvm::Context,
     llmod: &llvm::Module,
     bitcode: &[u8],
@@ -1335,11 +1330,7 @@ fn embed_bitcode(
 // when using MSVC linker. We do this only for data, as linker can fix up
 // code references on its own.
 // See #26591, #27438
-fn create_msvc_imps(
-    cgcx: &CodegenContext<LlvmCodegenBackend>,
-    llcx: &llvm::Context,
-    llmod: &llvm::Module,
-) {
+fn create_msvc_imps(cgcx: &CodegenContext, llcx: &llvm::Context, llmod: &llvm::Module) {
     if !cgcx.msvc_imps_needed {
         return;
     }
