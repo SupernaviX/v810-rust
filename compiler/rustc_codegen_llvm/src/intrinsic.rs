@@ -1,20 +1,19 @@
 use std::cmp::Ordering;
 use std::ffi::c_uint;
-use std::ptr;
+use std::{assert_matches, ptr};
 
 use rustc_abi::{
     Align, BackendRepr, ExternAbi, Float, HasDataLayout, Primitive, Size, WrappingRange,
 };
 use rustc_codegen_ssa::base::{compare_simd_types, wants_msvc_seh, wants_wasm_eh};
-use rustc_codegen_ssa::codegen_attrs::autodiff_attrs;
 use rustc_codegen_ssa::common::{IntPredicate, TypeKind};
 use rustc_codegen_ssa::errors::{ExpectedPointerMutability, InvalidMonomorphization};
 use rustc_codegen_ssa::mir::operand::{OperandRef, OperandValue};
 use rustc_codegen_ssa::mir::place::{PlaceRef, PlaceValue};
 use rustc_codegen_ssa::traits::*;
-use rustc_data_structures::assert_matches;
+use rustc_hir as hir;
 use rustc_hir::def_id::LOCAL_CRATE;
-use rustc_hir::{self as hir};
+use rustc_hir::find_attr;
 use rustc_middle::mir::BinOp;
 use rustc_middle::ty::layout::{FnAbiOf, HasTyCtxt, HasTypingEnv, LayoutOf};
 use rustc_middle::ty::offload_meta::OffloadMetadata;
@@ -38,7 +37,7 @@ use crate::declare::declare_raw_fn;
 use crate::errors::{
     AutoDiffWithoutEnable, AutoDiffWithoutLto, OffloadWithoutEnable, OffloadWithoutFatLTO,
 };
-use crate::llvm::{self, Metadata, Type, Value};
+use crate::llvm::{self, Type, Value};
 use crate::type_of::LayoutLlvmExt;
 use crate::va_arg::emit_va_arg;
 
@@ -387,6 +386,27 @@ impl<'ll, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'_, 'll, 'tcx> {
                 let pair = self.insert_value(pair, high, 1);
                 pair
             }
+
+            // FIXME move into the branch below when LLVM 22 is the lowest version we support.
+            sym::carryless_mul if crate::llvm_util::get_version() >= (22, 0, 0) => {
+                let ty = args[0].layout.ty;
+                if !ty.is_integral() {
+                    tcx.dcx().emit_err(InvalidMonomorphization::BasicIntegerType {
+                        span,
+                        name,
+                        ty,
+                    });
+                    return Ok(());
+                }
+                let (size, _) = ty.int_size_and_signed(self.tcx);
+                let width = size.bits();
+                let llty = self.type_ix(width);
+
+                let lhs = args[0].immediate();
+                let rhs = args[1].immediate();
+                self.call_intrinsic("llvm.clmul", &[llty], &[lhs, rhs])
+            }
+
             sym::ctlz
             | sym::ctlz_nonzero
             | sym::cttz
@@ -646,10 +666,32 @@ impl<'ll, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'_, 'll, 'tcx> {
     ) -> Self::Value {
         let tcx = self.tcx();
 
-        // FIXME remove usage of fn_abi
-        let fn_abi = self.fn_abi_of_instance(instance, ty::List::empty());
-        assert!(!fn_abi.ret.is_indirect());
-        let fn_ty = fn_abi.llvm_type(self);
+        let fn_ty = instance.ty(tcx, self.typing_env());
+        let fn_sig = match *fn_ty.kind() {
+            ty::FnDef(def_id, args) => {
+                tcx.instantiate_bound_regions_with_erased(tcx.fn_sig(def_id).instantiate(tcx, args))
+            }
+            _ => unreachable!(),
+        };
+        assert!(!fn_sig.c_variadic);
+
+        let ret_layout = self.layout_of(fn_sig.output());
+        let llreturn_ty = if ret_layout.is_zst() {
+            self.type_void()
+        } else {
+            ret_layout.immediate_llvm_type(self)
+        };
+
+        let mut llargument_tys = Vec::with_capacity(fn_sig.inputs().len());
+        for &arg in fn_sig.inputs() {
+            let arg_layout = self.layout_of(arg);
+            if arg_layout.is_zst() {
+                continue;
+            }
+            llargument_tys.push(arg_layout.immediate_llvm_type(self));
+        }
+
+        let fn_ty = self.type_func(&llargument_tys, llreturn_ty);
 
         let fn_ptr = if let Some(&llfn) = self.intrinsic_instances.borrow().get(&instance) {
             llfn
@@ -665,12 +707,11 @@ impl<'ll, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'_, 'll, 'tcx> {
                 let llfn = declare_raw_fn(
                     self,
                     sym,
-                    fn_abi.llvm_cconv(self),
+                    llvm::CCallConv,
                     llvm::UnnamedAddr::Global,
                     llvm::Visibility::Default,
                     fn_ty,
                 );
-                fn_abi.apply_attrs_llfn(self, llfn, Some(instance));
 
                 llfn
             };
@@ -757,8 +798,9 @@ impl<'ll, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'_, 'll, 'tcx> {
         &mut self,
         llvtable: &'ll Value,
         vtable_byte_offset: u64,
-        typeid: &'ll Metadata,
+        typeid: &[u8],
     ) -> Self::Value {
+        let typeid = self.create_metadata(typeid);
         let typeid = self.get_metadata_value(typeid);
         let vtable_byte_offset = self.const_i32(vtable_byte_offset as i32);
         let type_checked_load = self.call_intrinsic(
@@ -1325,7 +1367,9 @@ fn codegen_autodiff<'ll, 'tcx>(
     let val_arr = get_args_from_tuple(bx, args[2], fn_diff);
     let diff_symbol = symbol_name_for_instance_in_crate(tcx, fn_diff.clone(), LOCAL_CRATE);
 
-    let Some(mut diff_attrs) = autodiff_attrs(tcx, fn_diff.def_id()) else {
+    let Some(Some(mut diff_attrs)) =
+        find_attr!(tcx, fn_diff.def_id(), RustcAutodiff(attr) => attr.clone())
+    else {
         bug!("could not find autodiff attrs")
     };
 
@@ -1347,7 +1391,7 @@ fn codegen_autodiff<'ll, 'tcx>(
         &diff_symbol,
         llret_ty,
         &val_arr,
-        diff_attrs.clone(),
+        &diff_attrs,
         result,
         fnc_tree,
     );
@@ -2763,6 +2807,7 @@ fn generic_simd_intrinsic<'ll, 'tcx>(
             | sym::simd_ctlz
             | sym::simd_ctpop
             | sym::simd_cttz
+            | sym::simd_carryless_mul
             | sym::simd_funnel_shl
             | sym::simd_funnel_shr
     ) {
@@ -2787,6 +2832,7 @@ fn generic_simd_intrinsic<'ll, 'tcx>(
             sym::simd_cttz => "llvm.cttz",
             sym::simd_funnel_shl => "llvm.fshl",
             sym::simd_funnel_shr => "llvm.fshr",
+            sym::simd_carryless_mul => "llvm.clmul",
             _ => unreachable!(),
         };
         let int_size = in_elem.int_size_and_signed(bx.tcx()).0.bits();
@@ -2812,6 +2858,17 @@ fn generic_simd_intrinsic<'ll, 'tcx>(
                 &[vec_ty],
                 &[args[0].immediate(), args[1].immediate(), args[2].immediate()],
             )),
+            sym::simd_carryless_mul => {
+                if crate::llvm_util::get_version() >= (22, 0, 0) {
+                    Ok(bx.call_intrinsic(
+                        llvm_intrinsic,
+                        &[vec_ty],
+                        &[args[0].immediate(), args[1].immediate()],
+                    ))
+                } else {
+                    span_bug!(span, "`simd_carryless_mul` needs LLVM 22 or higher");
+                }
+            }
             _ => unreachable!(),
         };
     }

@@ -706,7 +706,30 @@ fn completes_after_ref_expr() {
             kw while
             kw while let
         "#]],
-    )
+    );
+    check(
+        r#"fn main() { let _ = &$0x.foo() }"#,
+        expect![[r#"
+            fn main() fn()
+            bt u32     u32
+            kw const
+            kw crate::
+            kw false
+            kw for
+            kw if
+            kw if let
+            kw loop
+            kw match
+            kw mut
+            kw raw
+            kw return
+            kw self::
+            kw true
+            kw unsafe
+            kw while
+            kw while let
+        "#]],
+    );
 }
 
 #[test]
@@ -2159,6 +2182,32 @@ fn foo() { match () { () => if foo {} $0, _ => (), } }
             kw ref
         "#]],
     );
+    check(
+        r#"
+fn foo() -> (i32, i32) { if foo {} el$0 (2, 3) }
+"#,
+        expect![[r#"
+            fn foo fn() -> (i32, i32)
+            bt u32                u32
+            kw const
+            kw crate::
+            kw else
+            kw else if
+            kw false
+            kw for
+            kw if
+            kw if let
+            kw loop
+            kw match
+            kw return
+            kw self::
+            kw true
+            kw unsafe
+            kw while
+            kw while let
+            ex foo()
+        "#]],
+    );
     // FIXME: support else completion after ast::RecordExprField
 }
 
@@ -3219,6 +3268,8 @@ fn foo() {
             sn dbg        dbg!(expr)
             sn dbgr      dbg!(&expr)
             sn deref           *expr
+            sn let               let
+            sn letm          let mut
             sn match   match expr {}
             sn ref             &expr
             sn refm        &mut expr
@@ -3605,6 +3656,41 @@ fn main() {
             sn refm                &mut expr
             sn return            return expr
             sn unsafe              unsafe {}
+        "#]],
+    );
+}
+
+#[test]
+fn rpitit_with_reference() {
+    check(
+        r#"
+trait Foo {
+    fn foo(&self);
+}
+
+trait Bar {
+    fn bar(&self) -> &impl Foo;
+}
+
+fn baz(v: impl Bar) {
+    v.bar().$0
+}
+    "#,
+        expect![[r#"
+            me foo() (as Foo) fn(&self)
+            sn box       Box::new(expr)
+            sn call      function(expr)
+            sn const           const {}
+            sn dbg           dbg!(expr)
+            sn dbgr         dbg!(&expr)
+            sn deref              *expr
+            sn let                  let
+            sn letm             let mut
+            sn match      match expr {}
+            sn ref                &expr
+            sn refm           &mut expr
+            sn return       return expr
+            sn unsafe         unsafe {}
         "#]],
     );
 }

@@ -14,6 +14,7 @@ LL |     cfg!(target_feature = "_UNEXPECTED_VALUE");
 `7e10`
 `a`
 `aclass`
+`addsubiw`
 `adx`
 `aes`
 `altivec`
@@ -58,6 +59,7 @@ LL |     cfg!(target_feature = "_UNEXPECTED_VALUE");
 `bf16`
 `bmi1`
 `bmi2`
+`break`
 `bti`
 `bulk-memory`
 `c`
@@ -84,6 +86,9 @@ LL |     cfg!(target_feature = "_UNEXPECTED_VALUE");
 `e2`
 `ecv`
 `edsp`
+`eijmpcall`
+`elpm`
+`elpmx`
 `elrw`
 `enhanced-sort`
 `ermsb`
@@ -150,6 +155,7 @@ LL |     cfg!(target_feature = "_UNEXPECTED_VALUE");
 `hvxv79`
 `hwdiv`
 `i8mm`
+`ijmpcall`
 `isa-68000`
 `isa-68010`
 `isa-68020`
@@ -158,6 +164,7 @@ LL |     cfg!(target_feature = "_UNEXPECTED_VALUE");
 `isa-68060`
 `isa-68881`
 `isa-68882`
+`jmpcall`
 `jsconv`
 `kl`
 `lahfsahf`
@@ -168,6 +175,9 @@ LL |     cfg!(target_feature = "_UNEXPECTED_VALUE");
 `ld-seq-sa`
 `leoncasa`
 `lor`
+`lowbytefirst`
+`lpm`
+`lpmx`
 `lse`
 `lse128`
 `lse2`
@@ -189,11 +199,13 @@ LL |     cfg!(target_feature = "_UNEXPECTED_VALUE");
 `mops`
 `movbe`
 `movrs`
+`movw`
 `mp`
 `mp1e2`
 `msa`
 `msync`
 `mte`
+`mul`
 `multivalue`
 `mutable-globals`
 `neon`
@@ -259,6 +271,7 @@ LL |     cfg!(target_feature = "_UNEXPECTED_VALUE");
 `reference-types`
 `relax`
 `relaxed-simd`
+`rmw`
 `rtm`
 `rva23u64`
 `sb`
@@ -311,6 +324,8 @@ LL |     cfg!(target_feature = "_UNEXPECTED_VALUE");
 `sme2p1`
 `soft-float`
 `spe`
+`spm`
+`spmx`
 `ssbs`
 `sse`
 `sse2`
@@ -335,6 +350,7 @@ LL |     cfg!(target_feature = "_UNEXPECTED_VALUE");
 `tbm`
 `thumb-mode`
 `thumb2`
+`tinyencoding`
 `tme`
 `transactional-execution`
 `trust`

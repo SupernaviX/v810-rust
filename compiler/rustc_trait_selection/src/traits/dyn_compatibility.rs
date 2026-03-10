@@ -7,9 +7,9 @@
 use std::ops::ControlFlow;
 
 use rustc_errors::FatalError;
-use rustc_hir::attrs::AttributeKind;
+use rustc_hir::def::DefKind;
 use rustc_hir::def_id::DefId;
-use rustc_hir::{self as hir, LangItem, find_attr};
+use rustc_hir::{self as hir, LangItem};
 use rustc_middle::query::Providers;
 use rustc_middle::ty::{
     self, EarlyBinder, GenericArgs, Ty, TyCtxt, TypeFoldable, TypeFolder, TypeSuperFoldable,
@@ -314,6 +314,11 @@ pub fn dyn_compatibility_violations_for_assoc_item(
     trait_def_id: DefId,
     item: ty::AssocItem,
 ) -> Vec<DynCompatibilityViolation> {
+    // `final` assoc functions don't prevent a trait from being dyn-compatible
+    if tcx.defaultness(item.def_id).is_final() {
+        return Vec::new();
+    }
+
     // Any item that has a `Self: Sized` requisite is otherwise exempt from the regulations.
     if tcx.generics_require_sized_self(item.def_id) {
         return Vec::new();
@@ -322,7 +327,7 @@ pub fn dyn_compatibility_violations_for_assoc_item(
     let span = || item.ident(tcx).span;
 
     match item.kind {
-        ty::AssocKind::Const { name } => {
+        ty::AssocKind::Const { name, is_type_const } => {
             // We will permit type associated consts if they are explicitly mentioned in the
             // trait object type. We can't check this here, as here we only check if it is
             // guaranteed to not be possible.
@@ -332,7 +337,7 @@ pub fn dyn_compatibility_violations_for_assoc_item(
             if tcx.features().min_generic_const_args() {
                 if !tcx.generics_of(item.def_id).is_own_empty() {
                     errors.push(AssocConstViolation::Generic);
-                } else if !find_attr!(tcx.get_all_attrs(item.def_id), AttributeKind::TypeConst(_)) {
+                } else if !is_type_const {
                     errors.push(AssocConstViolation::NonType);
                 }
 
@@ -833,8 +838,10 @@ impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for IllegalSelfTypeVisitor<'tcx> {
         match ct.kind() {
             ty::ConstKind::Unevaluated(proj) if self.tcx.features().min_generic_const_args() => {
                 match self.allow_self_projections {
-                    AllowSelfProjections::Yes => {
-                        let trait_def_id = self.tcx.parent(proj.def);
+                    AllowSelfProjections::Yes
+                        if let trait_def_id = self.tcx.parent(proj.def)
+                            && self.tcx.def_kind(trait_def_id) == DefKind::Trait =>
+                    {
                         let trait_ref = ty::TraitRef::from_assoc(self.tcx, trait_def_id, proj.args);
 
                         // Only walk contained consts if the parent trait is not a supertrait.
@@ -844,7 +851,7 @@ impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for IllegalSelfTypeVisitor<'tcx> {
                             ct.super_visit_with(self)
                         }
                     }
-                    AllowSelfProjections::No => ct.super_visit_with(self),
+                    _ => ct.super_visit_with(self),
                 }
             }
             _ => ct.super_visit_with(self),

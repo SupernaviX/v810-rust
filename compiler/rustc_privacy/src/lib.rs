@@ -21,7 +21,6 @@ use rustc_data_structures::fx::FxHashSet;
 use rustc_data_structures::intern::Interned;
 use rustc_errors::{MultiSpan, listify};
 use rustc_hir as hir;
-use rustc_hir::attrs::AttributeKind;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::{DefId, LocalDefId, LocalModDefId};
 use rustc_hir::intravisit::{self, InferKind, Visitor};
@@ -38,8 +37,6 @@ use rustc_session::lint;
 use rustc_span::hygiene::Transparency;
 use rustc_span::{Ident, Span, Symbol, sym};
 use tracing::debug;
-
-rustc_fluent_macro::fluent_messages! { "../messages.ftl" }
 
 ////////////////////////////////////////////////////////////////////////////////
 // Generic infrastructure used to implement specific visitors below.
@@ -510,7 +507,7 @@ impl<'tcx> EmbargoVisitor<'tcx> {
         let hir_id = self.tcx.local_def_id_to_hir_id(local_def_id);
         let attrs = self.tcx.hir_attrs(hir_id);
 
-        if find_attr!(attrs, AttributeKind::RustcMacroTransparency(x) => *x)
+        if find_attr!(attrs, RustcMacroTransparency(x) => *x)
             .unwrap_or(Transparency::fallback(md.macro_rules))
             != Transparency::Opaque
         {
@@ -577,7 +574,10 @@ impl<'tcx> EmbargoVisitor<'tcx> {
         self.update(def_id, macro_ev, Level::Reachable);
         match def_kind {
             // No type privacy, so can be directly marked as reachable.
-            DefKind::Const | DefKind::Static { .. } | DefKind::TraitAlias | DefKind::TyAlias => {
+            DefKind::Const { .. }
+            | DefKind::Static { .. }
+            | DefKind::TraitAlias
+            | DefKind::TyAlias => {
                 if vis.is_accessible_from(module, self.tcx) {
                     self.update(def_id, macro_ev, Level::Reachable);
                 }
@@ -624,7 +624,7 @@ impl<'tcx> EmbargoVisitor<'tcx> {
 
             // These have type privacy, so are not reachable unless they're
             // public, or are not namespaced at all.
-            DefKind::AssocConst
+            DefKind::AssocConst { .. }
             | DefKind::AssocTy
             | DefKind::ConstParam
             | DefKind::Ctor(_, _)
@@ -682,7 +682,7 @@ impl<'tcx> EmbargoVisitor<'tcx> {
                 }
             }
             DefKind::ForeignTy
-            | DefKind::Const
+            | DefKind::Const { .. }
             | DefKind::Static { .. }
             | DefKind::Fn
             | DefKind::TyAlias => {
@@ -804,7 +804,7 @@ impl<'tcx> EmbargoVisitor<'tcx> {
             | DefKind::Variant
             | DefKind::AssocFn
             | DefKind::AssocTy
-            | DefKind::AssocConst
+            | DefKind::AssocConst { .. }
             | DefKind::TyParam
             | DefKind::AnonConst
             | DefKind::InlineConst
@@ -878,7 +878,7 @@ pub struct TestReachabilityVisitor<'a, 'tcx> {
 
 impl<'a, 'tcx> TestReachabilityVisitor<'a, 'tcx> {
     fn effective_visibility_diagnostic(&self, def_id: LocalDefId) {
-        if self.tcx.has_attr(def_id, sym::rustc_effective_visibility) {
+        if find_attr!(self.tcx, def_id, RustcEffectiveVisibility) {
             let mut error_msg = String::new();
             let span = self.tcx.def_span(def_id.to_def_id());
             if let Some(effective_vis) = self.effective_visibilities.effective_vis(def_id) {
@@ -1100,7 +1100,7 @@ impl<'tcx> Visitor<'tcx> for NamePrivacyVisitor<'tcx> {
                         qpath.span(),
                     );
                 }
-                hir::StructTailExpr::None => {
+                hir::StructTailExpr::None | hir::StructTailExpr::NoneWithError(_) => {
                     let mut failed_fields = vec![];
                     for field in fields {
                         let (hir_id, use_ctxt) = (field.hir_id, field.ident.span);
@@ -1159,14 +1159,14 @@ impl<'tcx> TypePrivacyVisitor<'tcx> {
         let typeck_results = self
             .maybe_typeck_results
             .unwrap_or_else(|| span_bug!(span, "`hir::Expr` or `hir::Pat` outside of a body"));
-        let result: ControlFlow<()> = try {
+        try {
             self.visit(typeck_results.node_type(id))?;
             self.visit(typeck_results.node_args(id))?;
             if let Some(adjustments) = typeck_results.adjustments().get(id) {
                 adjustments.iter().try_for_each(|adjustment| self.visit(adjustment.target))?;
             }
-        };
-        result.is_break()
+        }
+        .is_break()
     }
 
     fn check_def_id(&self, def_id: DefId, kind: &str, descr: &dyn fmt::Display) -> bool {
@@ -1290,7 +1290,10 @@ impl<'tcx> Visitor<'tcx> for TypePrivacyVisitor<'tcx> {
         let def = def.filter(|(kind, _)| {
             matches!(
                 kind,
-                DefKind::AssocFn | DefKind::AssocConst | DefKind::AssocTy | DefKind::Static { .. }
+                DefKind::AssocFn
+                    | DefKind::AssocConst { .. }
+                    | DefKind::AssocTy
+                    | DefKind::Static { .. }
             )
         });
         if let Some((kind, def_id)) = def {
@@ -1616,7 +1619,7 @@ impl<'tcx> PrivateItemsInPublicInterfacesChecker<'_, 'tcx> {
         let def_kind = tcx.def_kind(def_id);
 
         match def_kind {
-            DefKind::Const | DefKind::Static { .. } | DefKind::Fn | DefKind::TyAlias => {
+            DefKind::Const { .. } | DefKind::Static { .. } | DefKind::Fn | DefKind::TyAlias => {
                 if let DefKind::TyAlias = def_kind {
                     self.check_unnameable(def_id, effective_vis);
                 }

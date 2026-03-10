@@ -150,10 +150,11 @@ pub trait Interner:
 
     // Kinds of consts
     type Const: Const<Self>;
+    type Consts: Copy + Debug + Hash + Eq + SliceLike<Item = Self::Const> + Default;
     type ParamConst: Copy + Debug + Hash + Eq + ParamLike;
     type ValueConst: ValueConst<Self>;
     type ExprConst: ExprConst<Self>;
-    type ValTree: ValTree<Self>;
+    type ValTree: Copy + Debug + Hash + Eq + IntoKind<Kind = ty::ValTreeKind<Self>>;
     type ScalarInt: Copy + Debug + Hash + Eq;
 
     // Kinds of regions
@@ -205,6 +206,7 @@ pub trait Interner:
     fn type_of_opaque_hir_typeck(self, def_id: Self::LocalDefId)
     -> ty::EarlyBinder<Self, Self::Ty>;
     fn const_of_item(self, def_id: Self::DefId) -> ty::EarlyBinder<Self, Self::Const>;
+    fn anon_const_kind(self, def_id: Self::DefId) -> ty::AnonConstKind;
 
     type AdtDef: AdtDef<Self>;
     fn adt_def(self, adt_def_id: Self::AdtId) -> Self::AdtDef;

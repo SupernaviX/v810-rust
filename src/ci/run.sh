@@ -118,7 +118,6 @@ if [ "$DEPLOY$DEPLOY_ALT" = "1" ]; then
   else
     RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --enable-llvm-static-stdcpp"
   fi
-  RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --set rust.remap-debuginfo"
 
   if [ "$DEPLOY_ALT" != "" ] && isLinux; then
     RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --debuginfo-level=2"
@@ -141,6 +140,8 @@ if [ "$DEPLOY$DEPLOY_ALT" = "1" ]; then
     RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --enable-debug-assertions"
   fi
 else
+  RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --set rust.remap-debuginfo=false"
+
   # We almost always want debug assertions enabled, but sometimes this takes too
   # long for too little benefit, so we just turn them off.
   if [ "$NO_DEBUG_ASSERTIONS" = "" ]; then

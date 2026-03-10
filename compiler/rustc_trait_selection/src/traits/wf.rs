@@ -951,6 +951,34 @@ impl<'a, 'tcx> TypeVisitor<TyCtxt<'tcx>> for WfPredicates<'a, 'tcx> {
                         ty::Binder::dummy(ty::PredicateKind::DynCompatible(principal)),
                     ));
                 }
+
+                if !t.has_escaping_bound_vars() {
+                    for projection in data.projection_bounds() {
+                        let pred_binder = projection
+                            .with_self_ty(tcx, t)
+                            .map_bound(|p| {
+                                p.term.as_const().map(|ct| {
+                                    let assoc_const_ty = tcx
+                                        .type_of(p.projection_term.def_id)
+                                        .instantiate(tcx, p.projection_term.args);
+                                    ty::PredicateKind::Clause(ty::ClauseKind::ConstArgHasType(
+                                        ct,
+                                        assoc_const_ty,
+                                    ))
+                                })
+                            })
+                            .transpose();
+                        if let Some(pred_binder) = pred_binder {
+                            self.out.push(traits::Obligation::with_depth(
+                                tcx,
+                                self.cause(ObligationCauseCode::WellFormed(None)),
+                                self.recursion_depth,
+                                self.param_env,
+                                pred_binder,
+                            ));
+                        }
+                    }
+                }
             }
 
             // Inference variables are the complicated case, since we don't
@@ -988,19 +1016,22 @@ impl<'a, 'tcx> TypeVisitor<TyCtxt<'tcx>> for WfPredicates<'a, 'tcx> {
         match c.kind() {
             ty::ConstKind::Unevaluated(uv) => {
                 if !c.has_escaping_bound_vars() {
-                    let predicate = ty::Binder::dummy(ty::PredicateKind::Clause(
-                        ty::ClauseKind::ConstEvaluatable(c),
-                    ));
-                    let cause = self.cause(ObligationCauseCode::WellFormed(None));
-                    self.out.push(traits::Obligation::with_depth(
-                        tcx,
-                        cause,
-                        self.recursion_depth,
-                        self.param_env,
-                        predicate,
-                    ));
+                    // Skip type consts as mGCA doesn't support evaluatable clauses
+                    if !tcx.is_type_const(uv.def) {
+                        let predicate = ty::Binder::dummy(ty::PredicateKind::Clause(
+                            ty::ClauseKind::ConstEvaluatable(c),
+                        ));
+                        let cause = self.cause(ObligationCauseCode::WellFormed(None));
+                        self.out.push(traits::Obligation::with_depth(
+                            tcx,
+                            cause,
+                            self.recursion_depth,
+                            self.param_env,
+                            predicate,
+                        ));
+                    }
 
-                    if tcx.def_kind(uv.def) == DefKind::AssocConst
+                    if matches!(tcx.def_kind(uv.def), DefKind::AssocConst { .. })
                         && tcx.def_kind(tcx.parent(uv.def)) == (DefKind::Impl { of_trait: false })
                     {
                         self.add_wf_preds_for_inherent_projection(uv.into());
@@ -1093,6 +1124,23 @@ impl<'a, 'tcx> TypeVisitor<TyCtxt<'tcx>> for WfPredicates<'a, 'tcx> {
                                     )
                                 },
                             ));
+                        }
+                        ty::Array(elem_ty, _len) => {
+                            let elem_vals = val.to_branch();
+                            let cause = self.cause(ObligationCauseCode::WellFormed(None));
+
+                            self.out.extend(elem_vals.iter().map(|&elem_val| {
+                                let predicate = ty::PredicateKind::Clause(
+                                    ty::ClauseKind::ConstArgHasType(elem_val, *elem_ty),
+                                );
+                                traits::Obligation::with_depth(
+                                    tcx,
+                                    cause.clone(),
+                                    self.recursion_depth,
+                                    self.param_env,
+                                    predicate,
+                                )
+                            }));
                         }
                         _ => {}
                     }

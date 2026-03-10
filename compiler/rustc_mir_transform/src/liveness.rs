@@ -1,6 +1,5 @@
 use rustc_abi::FieldIdx;
 use rustc_data_structures::fx::{FxHashSet, FxIndexMap, IndexEntry};
-use rustc_hir::attrs::AttributeKind;
 use rustc_hir::def::{CtorKind, DefKind};
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_hir::find_attr;
@@ -63,14 +62,14 @@ pub(crate) fn check_liveness<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> Den
     }
 
     // Don't run unused pass for #[naked]
-    if find_attr!(tcx.get_all_attrs(def_id.to_def_id()), AttributeKind::Naked(..)) {
+    if find_attr!(tcx, def_id.to_def_id(), Naked(..)) {
         return DenseBitSet::new_empty(0);
     }
 
     // Don't run unused pass for #[derive]
     let parent = tcx.parent(tcx.typeck_root_def_id(def_id.to_def_id()));
     if let DefKind::Impl { of_trait: true } = tcx.def_kind(parent)
-        && find_attr!(tcx.get_all_attrs(parent), AttributeKind::AutomaticallyDerived(..))
+        && find_attr!(tcx, parent, AutomaticallyDerived(..))
     {
         return DenseBitSet::new_empty(0);
     }
@@ -202,7 +201,7 @@ fn maybe_suggest_unit_pattern_typo<'tcx>(
     let constants = tcx
         .hir_body_owners()
         .filter(|&def_id| {
-            matches!(tcx.def_kind(def_id), DefKind::Const)
+            matches!(tcx.def_kind(def_id), DefKind::Const { .. })
                 && tcx.type_of(def_id).instantiate_identity() == ty
                 && tcx.visibility(def_id).is_accessible_from(body_def_id, tcx)
         })
@@ -1243,9 +1242,12 @@ struct TransferFunction<'a, 'tcx> {
 impl<'tcx> Visitor<'tcx> for TransferFunction<'_, 'tcx> {
     fn visit_statement(&mut self, statement: &Statement<'tcx>, location: Location) {
         match statement.kind {
-            // `ForLet(None)` fake read erroneously marks the just-assigned local as live.
-            // This defeats the purpose of the analysis for `let` bindings.
-            StatementKind::FakeRead(box (FakeReadCause::ForLet(None), _)) => return,
+            // `ForLet(None)` and `ForGuardBinding` fake reads erroneously mark the just-assigned
+            // locals as live. This defeats the purpose of the analysis for such bindings.
+            StatementKind::FakeRead(box (
+                FakeReadCause::ForLet(None) | FakeReadCause::ForGuardBinding,
+                _,
+            )) => return,
             // Handle self-assignment by restricting the read/write they do.
             StatementKind::Assign(box (ref dest, ref rvalue))
                 if self.self_assignment.contains(&location) =>
@@ -1288,6 +1290,7 @@ impl<'tcx> Visitor<'tcx> for TransferFunction<'_, 'tcx> {
             TerminatorKind::Return
             | TerminatorKind::Yield { .. }
             | TerminatorKind::Goto { target: START_BLOCK } // Inserted for the `FnMut` case.
+            | TerminatorKind::Call { target: None, .. } // unwinding could be caught
                 if self.capture_kind != CaptureKind::None =>
             {
                 // All indirect captures have an effect on the environment, so we mark them as live.

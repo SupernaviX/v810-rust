@@ -56,9 +56,8 @@ This API is completely unstable and subject to change.
 */
 
 // tidy-alphabetical-start
-#![feature(assert_matches)]
+#![feature(default_field_values)]
 #![feature(gen_blocks)]
-#![feature(if_let_guard)]
 #![feature(iter_intersperse)]
 #![feature(never_type)]
 #![feature(slice_partition_dedup)]
@@ -84,12 +83,10 @@ mod variance;
 
 pub use errors::NoVariantNamed;
 use rustc_abi::{CVariadicStatus, ExternAbi};
-use rustc_hir::attrs::AttributeKind;
+use rustc_hir as hir;
 use rustc_hir::def::DefKind;
 use rustc_hir::lints::DelayedLint;
-use rustc_hir::{
-    find_attr, {self as hir},
-};
+use rustc_lint::DecorateAttrLint;
 use rustc_middle::mir::interpret::GlobalId;
 use rustc_middle::query::Providers;
 use rustc_middle::ty::{Const, Ty, TyCtxt};
@@ -100,8 +97,6 @@ use rustc_trait_selection::traits;
 
 pub use crate::collect::suggest_impl_trait;
 use crate::hir_ty_lowering::HirTyLowerer;
-
-rustc_fluent_macro::fluent_messages! { "../messages.ftl" }
 
 fn check_c_variadic_abi(tcx: TyCtxt<'_>, decl: &hir::FnDecl<'_>, abi: ExternAbi, span: Span) {
     if !decl.c_variadic {
@@ -152,20 +147,17 @@ pub fn provide(providers: &mut Providers) {
     };
 }
 
-fn emit_delayed_lint(lint: &DelayedLint, tcx: TyCtxt<'_>) {
+pub fn emit_delayed_lint(lint: &DelayedLint, tcx: TyCtxt<'_>) {
     match lint {
         DelayedLint::AttributeParsing(attribute_lint) => {
-            tcx.node_span_lint(
+            tcx.emit_node_span_lint(
                 attribute_lint.lint_id.lint,
                 attribute_lint.id,
                 attribute_lint.span,
-                |diag| {
-                    rustc_lint::decorate_attribute_lint(
-                        tcx.sess,
-                        Some(tcx),
-                        &attribute_lint.kind,
-                        diag,
-                    );
+                DecorateAttrLint {
+                    sess: tcx.sess,
+                    tcx: Some(tcx),
+                    diagnostic: &attribute_lint.kind,
                 },
             );
         }
@@ -180,14 +172,14 @@ pub fn check_crate(tcx: TyCtxt<'_>) {
         // what we are intending to discard, to help future type-based refactoring.
         type R = Result<(), ErrorGuaranteed>;
 
-        let _: R = tcx.ensure_ok().check_type_wf(());
+        let _: R = tcx.ensure_result().check_type_wf(());
 
         for &trait_def_id in tcx.all_local_trait_impls(()).keys() {
-            let _: R = tcx.ensure_ok().coherent_trait(trait_def_id);
+            let _: R = tcx.ensure_result().coherent_trait(trait_def_id);
         }
         // these queries are executed for side-effects (error reporting):
-        let _: R = tcx.ensure_ok().crate_inherent_impls_validity_check(());
-        let _: R = tcx.ensure_ok().crate_inherent_impls_overlap_check(());
+        let _: R = tcx.ensure_result().crate_inherent_impls_validity_check(());
+        let _: R = tcx.ensure_result().crate_inherent_impls_overlap_check(());
     });
 
     tcx.sess.time("emit_ast_lowering_delayed_lints", || {
@@ -235,9 +227,9 @@ pub fn check_crate(tcx: TyCtxt<'_>) {
                 tcx.ensure_ok().eval_static_initializer(item_def_id);
                 check::maybe_check_static_with_link_section(tcx, item_def_id);
             }
-            DefKind::Const
+            DefKind::Const { .. }
                 if !tcx.generics_of(item_def_id).own_requires_monomorphization()
-                    && !find_attr!(tcx.get_all_attrs(item_def_id), AttributeKind::TypeConst(_)) =>
+                    && !tcx.is_type_const(item_def_id) =>
             {
                 // FIXME(generic_const_items): Passing empty instead of identity args is fishy but
                 //                             seems to be fine for now. Revisit this!

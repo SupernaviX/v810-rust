@@ -62,8 +62,9 @@ impl server::Server for RaSpanServer<'_> {
         self.tracked_paths.insert(path.into());
     }
 
-    fn literal_from_str(&mut self, s: &str) -> Result<Literal<Self::Span>, ()> {
+    fn literal_from_str(&mut self, s: &str) -> Result<Literal<Self::Span>, String> {
         literal_from_str(s, self.call_site)
+            .map_err(|()| "cannot parse string into literal".to_string())
     }
 
     fn emit_diagnostic(&mut self, _: Diagnostic<Self::Span>) {
@@ -81,14 +82,9 @@ impl server::Server for RaSpanServer<'_> {
     fn ts_is_empty(&mut self, stream: &Self::TokenStream) -> bool {
         stream.is_empty()
     }
-    fn ts_from_str(&mut self, src: &str) -> Self::TokenStream {
-        Self::TokenStream::from_str(src, self.call_site).unwrap_or_else(|e| {
-            Self::TokenStream::from_str(
-                &format!("compile_error!(\"failed to parse str to token stream: {e}\")"),
-                self.call_site,
-            )
-            .unwrap()
-        })
+    fn ts_from_str(&mut self, src: &str) -> Result<Self::TokenStream, String> {
+        Self::TokenStream::from_str(src, self.call_site)
+            .map_err(|e| format!("failed to parse str to token stream: {e}"))
     }
     fn ts_to_string(&mut self, stream: &Self::TokenStream) -> String {
         stream.to_string()
@@ -168,16 +164,22 @@ impl server::Server for RaSpanServer<'_> {
         self.callback.as_mut()?.source_text(span)
     }
 
-    fn span_parent(&mut self, _span: Self::Span) -> Option<Self::Span> {
-        // FIXME requires db, looks up the parent call site
+    fn span_parent(&mut self, span: Self::Span) -> Option<Self::Span> {
+        if let Some(ref mut callback) = self.callback {
+            return callback.span_parent(span);
+        }
         None
     }
     fn span_source(&mut self, span: Self::Span) -> Self::Span {
-        // FIXME requires db, returns the top level call site
+        if let Some(ref mut callback) = self.callback {
+            return callback.span_source(span);
+        }
         span
     }
     fn span_byte_range(&mut self, span: Self::Span) -> Range<usize> {
-        // FIXME requires db to resolve the ast id, THIS IS NOT INCREMENTAL
+        if let Some(cb) = self.callback.as_mut() {
+            return cb.byte_range(span);
+        }
         Range { start: span.range.start().into(), end: span.range.end().into() }
     }
     fn span_join(&mut self, first: Self::Span, second: Self::Span) -> Option<Self::Span> {
@@ -272,14 +274,12 @@ impl server::Server for RaSpanServer<'_> {
         Span { range: TextRange::empty(span.range.start()), ..span }
     }
 
-    fn span_line(&mut self, _span: Self::Span) -> usize {
-        // FIXME requires db to resolve line index, THIS IS NOT INCREMENTAL
-        1
+    fn span_line(&mut self, span: Self::Span) -> usize {
+        self.callback.as_mut().and_then(|cb| cb.line_column(span)).map_or(1, |(l, _)| l as usize)
     }
 
-    fn span_column(&mut self, _span: Self::Span) -> usize {
-        // FIXME requires db to resolve line index, THIS IS NOT INCREMENTAL
-        1
+    fn span_column(&mut self, span: Self::Span) -> usize {
+        self.callback.as_mut().and_then(|cb| cb.line_column(span)).map_or(1, |(_, c)| c as usize)
     }
 
     fn symbol_normalize_and_validate_ident(&mut self, string: &str) -> Result<Self::Symbol, ()> {

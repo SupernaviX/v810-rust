@@ -1,7 +1,7 @@
 // This file contains a bunch of malformed attributes.
 // We enable a bunch of features to not get feature-gate errs in this test.
+#![deny(invalid_doc_attributes)]
 #![feature(rustc_attrs)]
-#![feature(rustc_allow_const_fn_unstable)]
 #![feature(allow_internal_unstable)]
 // FIXME(#82232, #143834): temporarily renamed to mitigate `#[align]` nameres ambiguity
 #![feature(fn_align)]
@@ -39,8 +39,7 @@
 #[deprecated = 5]
 //~^ ERROR malformed
 #[doc]
-//~^ ERROR valid forms for the attribute are
-//~| WARN this was previously accepted by the compiler
+//~^ ERROR
 #[rustc_macro_transparency]
 //~^ ERROR malformed
 //~| ERROR attribute cannot be used on
@@ -75,8 +74,7 @@
 //~^ ERROR malformed
 //~| WARN crate-level attribute should be an inner attribute
 #[doc]
-//~^ ERROR valid forms for the attribute are
-//~| WARN this was previously accepted by the compiler
+//~^ ERROR
 #[target_feature]
 //~^ ERROR malformed
 #[export_stable = 1]
@@ -146,8 +144,6 @@ struct Test;
 #[diagnostic::on_unimplemented = 1]
 //~^ WARN malformed
 trait Hey {
-    #[type_const = 1]
-    //~^ ERROR malformed
     const HEY: usize = 5;
 }
 

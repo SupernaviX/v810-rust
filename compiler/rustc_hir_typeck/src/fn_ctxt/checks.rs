@@ -2,9 +2,12 @@ use std::ops::Deref;
 use std::{fmt, iter};
 
 use itertools::Itertools;
+use rustc_ast as ast;
 use rustc_data_structures::fx::FxIndexSet;
 use rustc_errors::codes::*;
 use rustc_errors::{Applicability, Diag, ErrorGuaranteed, MultiSpan, a_or_an, listify, pluralize};
+use rustc_hir as hir;
+use rustc_hir::attrs::DivergingBlockBehavior;
 use rustc_hir::def::{CtorKind, CtorOf, DefKind, Res};
 use rustc_hir::def_id::DefId;
 use rustc_hir::intravisit::Visitor;
@@ -24,7 +27,6 @@ use rustc_trait_selection::infer::InferCtxtExt;
 use rustc_trait_selection::traits::{self, ObligationCauseCode, ObligationCtxt, SelectionContext};
 use smallvec::SmallVec;
 use tracing::debug;
-use {rustc_ast as ast, rustc_hir as hir};
 
 use crate::Expectation::*;
 use crate::TupleArgumentsFlag::*;
@@ -45,29 +47,6 @@ rustc_index::newtype_index! {
     #[orderable]
     #[debug_format = "GenericIdx({})"]
     pub(crate) struct GenericIdx {}
-}
-
-#[derive(Clone, Copy, Default)]
-pub(crate) enum DivergingBlockBehavior {
-    /// This is the current stable behavior:
-    ///
-    /// ```rust
-    /// {
-    ///     return;
-    /// } // block has type = !, even though we are supposedly dropping it with `;`
-    /// ```
-    #[default]
-    Never,
-
-    /// Alternative behavior:
-    ///
-    /// ```ignore (very-unstable-new-attribute)
-    /// #![rustc_never_type_options(diverging_block_default = "unit")]
-    /// {
-    ///     return;
-    /// } // block has type = (), since we are dropping `!` from `return` with `;`
-    /// ```
-    Unit,
 }
 
 impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
@@ -104,7 +83,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     hir::ExprKind::ConstBlock(..) => return None,
                     hir::ExprKind::Path(qpath) => {
                         let res = self.typeck_results.borrow().qpath_res(qpath, element.hir_id);
-                        if let Res::Def(DefKind::Const | DefKind::AssocConst, _) = res {
+                        if let Res::Def(DefKind::Const { .. } | DefKind::AssocConst { .. }, _) = res
+                        {
                             return None;
                         }
                     }
@@ -2016,7 +1996,7 @@ impl<'a, 'b, 'tcx> FnCallDiagCtxt<'a, 'b, 'tcx> {
                             ),
                         );
                         err.code(self.err_code.to_owned());
-                        err.multipart_suggestion_verbose(
+                        err.multipart_suggestion(
                             "wrap these arguments in parentheses to construct a tuple",
                             vec![
                                 (lo.shrink_to_lo(), "(".to_string()),
@@ -2647,7 +2627,15 @@ impl<'a, 'b, 'tcx> FnCallDiagCtxt<'a, 'b, 'tcx> {
                 // To suggest a multipart suggestion when encountering `foo(1, "")` where the def
                 // was `fn foo(())`.
                 let (_, expected_ty) = self.formal_and_expected_inputs[expected_idx];
-                suggestions.push((*arg_span, self.ty_to_snippet(expected_ty, expected_idx)));
+                // Check if the new suggestion would overlap with any existing suggestion.
+                // This can happen when we have both removal suggestions (which may include
+                // adjacent commas) and type replacement suggestions for the same span.
+                let dominated = suggestions
+                    .iter()
+                    .any(|(span, _)| span.contains(*arg_span) || arg_span.overlaps(*span));
+                if !dominated {
+                    suggestions.push((*arg_span, self.ty_to_snippet(expected_ty, expected_idx)));
+                }
             }
         }
     }
@@ -2663,7 +2651,7 @@ impl<'a, 'b, 'tcx> FnCallDiagCtxt<'a, 'b, 'tcx> {
                 Some(format!("provide the argument{}", if plural { "s" } else { "" }))
             }
             SuggestionText::Remove(plural) => {
-                err.multipart_suggestion_verbose(
+                err.multipart_suggestion(
                     format!("remove the extra argument{}", if plural { "s" } else { "" }),
                     suggestions,
                     Applicability::HasPlaceholders,

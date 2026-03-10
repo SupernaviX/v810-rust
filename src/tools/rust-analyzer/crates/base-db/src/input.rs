@@ -221,6 +221,7 @@ pub enum LangCrateOrigin {
     ProcMacro,
     Std,
     Test,
+    Dependency,
     Other,
 }
 
@@ -245,7 +246,7 @@ impl fmt::Display for LangCrateOrigin {
             LangCrateOrigin::ProcMacro => "proc_macro",
             LangCrateOrigin::Std => "std",
             LangCrateOrigin::Test => "test",
-            LangCrateOrigin::Other => "other",
+            LangCrateOrigin::Other | LangCrateOrigin::Dependency => "other",
         };
         f.write_str(text)
     }
@@ -741,7 +742,7 @@ impl CrateGraphBuilder {
         deps.into_iter()
     }
 
-    /// Returns all crates in the graph, sorted in topological order (ie. dependencies of a crate
+    /// Returns all crates in the graph, sorted in topological order (i.e. dependencies of a crate
     /// come before the crate itself).
     fn crates_in_topological_order(&self) -> Vec<CrateBuilderId> {
         let mut res = Vec::new();

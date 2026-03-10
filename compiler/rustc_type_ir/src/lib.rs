@@ -5,10 +5,7 @@
 #![allow(rustc::usage_of_type_ir_inherent)]
 #![allow(rustc::usage_of_type_ir_traits)]
 #![cfg_attr(feature = "nightly", allow(internal_features))]
-#![cfg_attr(
-    feature = "nightly",
-    feature(associated_type_defaults, never_type, rustc_attrs, negative_impls)
-)]
+#![cfg_attr(feature = "nightly", feature(associated_type_defaults, rustc_attrs, negative_impls))]
 // tidy-alphabetical-end
 
 extern crate self as rustc_type_ir;
@@ -16,6 +13,7 @@ extern crate self as rustc_type_ir;
 use std::fmt;
 use std::hash::Hash;
 
+use rustc_abi::{FieldIdx, VariantIdx};
 #[cfg(feature = "nightly")]
 use rustc_macros::{Decodable, Encodable, HashStable_NoContext};
 
@@ -442,4 +440,13 @@ impl fmt::Display for ClosureKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.as_str().fmt(f)
     }
+}
+
+pub struct FieldInfo<I: Interner> {
+    pub base: I::Ty,
+    pub ty: I::Ty,
+    pub variant: Option<I::Symbol>,
+    pub variant_idx: VariantIdx,
+    pub name: I::Symbol,
+    pub field_idx: FieldIdx,
 }
