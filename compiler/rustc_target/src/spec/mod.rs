@@ -2234,8 +2234,8 @@ impl Target {
 
             AArch64 | AmdGpu | Arm | Arm64EC | Avr | CSky | Hexagon | LoongArch32 | LoongArch64
             | M68k | Mips | Mips32r6 | Mips64 | Mips64r6 | Msp430 | Nvptx64 | PowerPC
-            | PowerPC64 | RiscV32 | RiscV64 | S390x | Sparc | Sparc64 | Wasm32 | Wasm64 | X86
-            | X86_64 | Xtensa => true,
+            | PowerPC64 | RiscV32 | RiscV64 | S390x | Sparc | Sparc64 | V810 | Wasm32 | Wasm64
+            | X86 | X86_64 | Xtensa => true,
         }
     }
 }
