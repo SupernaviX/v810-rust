@@ -102,7 +102,7 @@ fn target_path(ctx: &AssistContext<'_>, mut original_path: ast::Path) -> Option<
     }
 
     match ctx.sema.resolve_path(&original_path)? {
-        PathResolution::Def(ModuleDef::Variant(_)) if on_first => original_path.qualifier(),
+        PathResolution::Def(ModuleDef::EnumVariant(_)) if on_first => original_path.qualifier(),
         PathResolution::Def(def) if def.as_assoc_item(ctx.db()).is_some() => {
             on_first.then_some(original_path.qualifier()?)
         }
@@ -111,8 +111,7 @@ fn target_path(ctx: &AssistContext<'_>, mut original_path: ast::Path) -> Option<
 }
 
 fn drop_generic_args(path: &ast::Path) -> ast::Path {
-    let path = path.clone_subtree();
-    let mut editor = SyntaxEditor::new(path.syntax().clone());
+    let (mut editor, path) = SyntaxEditor::with_ast_node(path);
     if let Some(segment) = path.segment()
         && let Some(generic_args) = segment.generic_arg_list()
     {

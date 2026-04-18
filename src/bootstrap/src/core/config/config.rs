@@ -78,6 +78,7 @@ pub const RUSTC_IF_UNCHANGED_ALLOWED_PATHS: &[&str] = &[
     ":!src/rustdoc-json-types",
     ":!tests",
     ":!triagebot.toml",
+    ":!src/bootstrap/defaults",
 ];
 
 /// Global configuration for the entire build and/or bootstrap.
@@ -139,6 +140,7 @@ pub struct Config {
     pub config: Option<PathBuf>,
     pub jobs: Option<u32>,
     pub cmd: Subcommand,
+    pub quiet: bool,
     pub incremental: bool,
     pub dump_bootstrap_shims: bool,
     /// Arguments appearing after `--` to be forwarded to tools,
@@ -368,6 +370,7 @@ impl Config {
         let Flags {
             cmd: flags_cmd,
             verbose: flags_verbose,
+            quiet: flags_quiet,
             incremental: flags_incremental,
             config: flags_config,
             build_dir: flags_build_dir,
@@ -414,6 +417,12 @@ impl Config {
             "flags.skip" = ?flags_skip,
             "flags.exclude" = ?flags_exclude
         );
+
+        if flags_cmd.no_doc() {
+            eprintln!(
+                "WARN: `x.py test --no-doc` is renamed to `--all-targets`. `--no-doc` will be removed in the near future. Additionally `--tests` is added which only executes unit and integration tests."
+            )
+        }
 
         // Set config values based on flags.
         let mut exec_ctx = ExecutionContext::new(flags_verbose, flags_cmd.fail_fast());
@@ -1429,6 +1438,7 @@ impl Config {
             print_step_timings: build_print_step_timings.unwrap_or(false),
             profiler: build_profiler.unwrap_or(false),
             python: build_python.map(PathBuf::from),
+            quiet: flags_quiet,
             reproducible_artifacts: flags_reproducible_artifact,
             reuse: build_reuse.map(PathBuf::from),
             rust_analyzer_info,
@@ -2234,17 +2244,31 @@ pub fn download_ci_rustc_commit<'a>(
         });
         match freshness {
             PathFreshness::LastModifiedUpstream { upstream } => upstream,
-            PathFreshness::HasLocalModifications { upstream } => {
-                if if_unchanged {
-                    return None;
-                }
-
+            PathFreshness::HasLocalModifications { upstream, modifications } => {
                 if dwn_ctx.is_running_on_ci() {
                     eprintln!("CI rustc commit matches with HEAD and we are in CI.");
                     eprintln!(
                         "`rustc.download-ci` functionality will be skipped as artifacts are not available."
                     );
                     return None;
+                }
+
+                eprintln!(
+                    "NOTE: detected {} modifications that could affect a build of rustc",
+                    modifications.len()
+                );
+                for file in modifications.iter().take(10) {
+                    eprintln!("- {}", file.display());
+                }
+                if modifications.len() > 10 {
+                    eprintln!("- ... and {} more", modifications.len() - 10);
+                }
+
+                if if_unchanged {
+                    eprintln!("skipping rustc download due to `download-rustc = 'if-unchanged'`");
+                    return None;
+                } else {
+                    eprintln!("downloading unconditionally due to `download-rustc = true`");
                 }
 
                 upstream

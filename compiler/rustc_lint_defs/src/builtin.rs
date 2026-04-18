@@ -37,14 +37,17 @@ declare_lint_pass! {
         DEPENDENCY_ON_UNIT_NEVER_TYPE_FALLBACK,
         DEPRECATED,
         DEPRECATED_IN_FUTURE,
+        DEPRECATED_LLVM_INTRINSIC,
         DEPRECATED_SAFE_2024,
         DEPRECATED_WHERE_CLAUSE_LOCATION,
+        DUPLICATE_FEATURES,
         DUPLICATE_MACRO_ATTRIBUTES,
         ELIDED_LIFETIMES_IN_ASSOCIATED_CONSTANT,
         ELIDED_LIFETIMES_IN_PATHS,
         EXPLICIT_BUILTIN_CFGS_IN_FLAGS,
         EXPORTED_PRIVATE_DEPENDENCIES,
         FFI_UNWIND_CALLS,
+        FLOAT_LITERAL_F32_FALLBACK,
         FORBIDDEN_LINT_GROUPS,
         FUNCTION_ITEM_REFERENCES,
         FUZZY_PROVENANCE_CASTS,
@@ -105,7 +108,6 @@ declare_lint_pass! {
         SEMICOLON_IN_EXPRESSIONS_FROM_MACROS,
         SHADOWING_SUPERTRAIT_ITEMS,
         SINGLE_USE_LIFETIMES,
-        SOFT_UNSTABLE,
         STABLE_FEATURES,
         TAIL_EXPR_DROP_ORDER,
         TEST_UNSTABLE_LINT,
@@ -1032,8 +1034,8 @@ declare_lint! {
     /// ```rust
     /// #[warn(unused_macro_rules)]
     /// macro_rules! unused_empty {
-    ///     (hello) => { println!("Hello, world!") }; // This rule is unused
-    ///     () => { println!("empty") }; // This rule is used
+    ///     (hello) => { println!("Hello, world!") }; // This rule is used
+    ///     () => { println!("empty") }; // This rule is unused
     /// }
     ///
     /// fn main() {
@@ -1091,6 +1093,33 @@ declare_lint! {
     pub UNUSED_FEATURES,
     Warn,
     "unused features found in crate-level `#[feature]` directives"
+}
+
+declare_lint! {
+    /// The `duplicate_features` lint detects duplicate features found in
+    /// crate-level [`feature` attributes].
+    ///
+    /// Note: This lint used to be a hard error (E0636).
+    ///
+    /// [`feature` attributes]: https://doc.rust-lang.org/nightly/unstable-book/
+    ///
+    /// ### Example
+    ///
+    /// ```rust,compile_fail
+    /// # #![allow(internal_features)]
+    /// #![feature(rustc_attrs)]
+    /// #![feature(rustc_attrs)]
+    /// ```
+    ///
+    /// {{produces}}
+    ///
+    /// ### Explanation
+    ///
+    /// Enabling a feature more than once is a no-op.
+    /// To avoid this warning, remove the second `feature()` attribute.
+    pub DUPLICATE_FEATURES,
+    Deny,
+    "duplicate features found in crate-level `#[feature]` directives"
 }
 
 declare_lint! {
@@ -2318,22 +2347,6 @@ declare_lint! {
 }
 
 declare_lint! {
-    /// The `soft_unstable` lint detects unstable features that were unintentionally allowed on
-    /// stable. This is a [future-incompatible] lint to transition this to a hard error in the
-    /// future. See [issue #64266] for more details.
-    ///
-    /// [issue #64266]: https://github.com/rust-lang/rust/issues/64266
-    /// [future-incompatible]: ../index.md#future-incompatible-lints
-    pub SOFT_UNSTABLE,
-    Deny,
-    "a feature gate that doesn't break dependent crates",
-    @future_incompatible = FutureIncompatibleInfo {
-        reason: fcw!(FutureReleaseError #64266),
-        report_in_deps: true,
-    };
-}
-
-declare_lint! {
     /// The `inline_no_sanitize` lint detects incompatible use of
     /// [`#[inline(always)]`][inline] and [`#[sanitize(xyz = "off")]`][sanitize].
     ///
@@ -2707,7 +2720,7 @@ declare_lint! {
     ///
     /// ### Example
     ///
-    /// ```rust
+    /// ```rust,compile_fail
     /// enum Void {}
     /// unsafe extern {
     ///     static EXTERN: Void;
@@ -2723,10 +2736,11 @@ declare_lint! {
     /// compiler which assumes that there are no initialized uninhabited places (such as locals or
     /// statics). This was accidentally allowed, but is being phased out.
     pub UNINHABITED_STATIC,
-    Warn,
+    Deny,
     "uninhabited static",
     @future_incompatible = FutureIncompatibleInfo {
         reason: fcw!(FutureReleaseError #74840),
+        report_in_deps: true,
     };
 }
 
@@ -3145,7 +3159,7 @@ declare_lint! {
     /// ### Example
     ///
     /// ```rust
-    /// #[cfg(FALSE)]
+    /// #[cfg(feature = "nightly")]
     /// macro foo() {}
     /// ```
     ///
@@ -3169,22 +3183,22 @@ declare_lint! {
     ///    ( $($tokens:tt)* ) => { $($tokens)* }
     /// }
     ///
-    /// #[cfg(FALSE)]
+    /// #[cfg(feature = "nightly")]
     /// identity! {
     ///    macro foo() {}
     /// }
     /// ```
     ///
     /// This is a [future-incompatible] lint to transition this
-    /// to a hard error in the future. See [issue #65860] for more details.
+    /// to a hard error in the future. See [issue #154045] for more details.
     ///
-    /// [issue #65860]: https://github.com/rust-lang/rust/issues/65860
+    /// [issue #154045]: https://github.com/rust-lang/rust/issues/154045
     /// [future-incompatible]: ../index.md#future-incompatible-lints
     pub UNSTABLE_SYNTAX_PRE_EXPANSION,
     Warn,
     "unstable syntax can change at any point in the future, causing a hard error!",
     @future_incompatible = FutureIncompatibleInfo {
-        reason: fcw!(FutureReleaseError #65860),
+        reason: fcw!(FutureReleaseError #154045),
     };
 }
 
@@ -5545,7 +5559,8 @@ declare_lint! {
     ///
     /// ### Example
     ///
-    /// ```rust
+    #[cfg_attr(bootstrap, doc = "```rust")]
+    #[cfg_attr(not(bootstrap), doc = "```rust,compile_fail")]
     /// // Using `...` in non-foreign function definitions is unstable, however stability is
     /// // currently only checked after attributes are expanded, so using `#[cfg(false)]` here will
     /// // allow this to compile on stable Rust.
@@ -5553,7 +5568,7 @@ declare_lint! {
     /// fn foo(...) {
     ///
     /// }
-    /// ```
+    #[doc = "```"]
     ///
     /// {{produces}}
     ///
@@ -5577,10 +5592,105 @@ declare_lint! {
     ///
     /// [future-incompatible]: ../index.md#future-incompatible-lints
     pub VARARGS_WITHOUT_PATTERN,
-    Warn,
+    Deny,
     "detects usage of `...` arguments without a pattern in non-foreign items",
     @future_incompatible = FutureIncompatibleInfo {
         reason: fcw!(FutureReleaseError #145544),
+        report_in_deps: true,
+    };
+}
+
+declare_lint! {
+    /// The `deprecated_llvm_intrinsic` lint detects usage of deprecated LLVM intrinsics.
+    ///
+    /// ### Example
+    ///
+    /// ```rust,ignore (requires x86)
+    /// #![cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    /// #![feature(link_llvm_intrinsics, abi_unadjusted)]
+    /// #![deny(deprecated_llvm_intrinsic)]
+    ///
+    /// unsafe extern "unadjusted" {
+    ///     #[link_name = "llvm.x86.addcarryx.u32"]
+    ///     fn foo(a: u8, b: u32, c: u32, d: &mut u32) -> u8;
+    /// }
+    ///
+    /// #[inline(never)]
+    /// #[target_feature(enable = "adx")]
+    /// pub fn bar(a: u8, b: u32, c: u32, d: &mut u32) -> u8 {
+    ///     unsafe { foo(a, b, c, d) }
+    /// }
+    /// ```
+    ///
+    /// This will produce:
+    ///
+    /// ```text
+    /// error: Using deprecated intrinsic `llvm.x86.addcarryx.u32`
+    ///  --> example.rs:7:5
+    ///   |
+    /// 7 |     fn foo(a: u8, b: u32, c: u32, d: &mut u32) -> u8;
+    ///   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ///   |
+    /// ```
+    ///
+    /// ### Explanation
+    ///
+    /// LLVM periodically updates its list of intrinsics. Deprecated intrinsics are unlikely
+    /// to be removed, but they may optimize less well than their new versions, so it's
+    /// best to use the new version. Also, some deprecated intrinsics might have buggy
+    /// behavior
+    pub DEPRECATED_LLVM_INTRINSIC,
+    Allow,
+    "detects uses of deprecated LLVM intrinsics",
+    @feature_gate = link_llvm_intrinsics;
+}
+
+declare_lint! {
+    /// The `float_literal_f32_fallback` lint detects situations where the type of an unsuffixed
+    /// float literal falls back to `f32` instead of `f64` to avoid a compilation error. This occurs
+    /// when there is a trait bound `f32: From<T>` (or equivalent, such as `T: Into<f32>`) and the
+    /// literal is inferred to have the same type as `T`.
+    ///
+    /// ### Example
+    ///
+    /// ```rust
+    /// fn foo(x: impl Into<f32>) -> f32 {
+    ///     x.into()
+    /// }
+    ///
+    /// fn main() {
+    ///     dbg!(foo(2.5));
+    /// }
+    /// ```
+    ///
+    /// {{produces}}
+    ///
+    /// ### Explanation
+    ///
+    /// Rust allows traits that are only implemented for a single floating point type to guide type
+    /// inference for floating point literals. This used to apply in the case of `f32: From<T>`
+    /// (where `T` was inferred to be the same type as a floating point literal), as the only
+    /// floating point type impl was `f32: From<f32>`. However, as Rust is in the process of adding
+    /// support for `f16`, there are now two implementations for floating point types:
+    /// `f32: From<f16>` and `f32: From<f32>`. This means that the trait bound `f32: From<T>` can no
+    /// longer guide inference for the type of the floating point literal. The default fallback for
+    /// unsuffixed floating point literals is `f64`. As `f32` does not implement `From<f64>`,
+    /// falling back to `f64` would cause a compilation error; therefore, the float type fallback
+    /// has been tempoarily adjusted to fallback to `f32` in this scenario.
+    ///
+    /// The lint will automatically provide a machine-applicable suggestion to add a `_f32` suffix
+    /// to the literal, which will fix the problem.
+    ///
+    /// This is a [future-incompatible] lint to transition this to a hard error in the future. See
+    /// [issue #154024] for more details.
+    ///
+    /// [issue #154024]: https://github.com/rust-lang/rust/issues/154024
+    /// [future-incompatible]: ../index.md#future-incompatible-lints
+    pub FLOAT_LITERAL_F32_FALLBACK,
+    Warn,
+    "detects unsuffixed floating point literals whose type fallback to `f32`",
+    @future_incompatible = FutureIncompatibleInfo {
+        reason: fcw!(FutureReleaseError #154024),
         report_in_deps: false,
     };
 }

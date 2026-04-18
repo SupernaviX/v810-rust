@@ -1,5 +1,5 @@
-use base_db::RootQueryDb;
-use hir_def::db::DefDatabase;
+use base_db::all_crates;
+use hir_def::signatures::ConstSignature;
 use hir_expand::EditionedFileId;
 use rustc_apfloat::{
     Float,
@@ -108,7 +108,7 @@ fn pretty_print_err(e: ConstEvalError, db: &TestDB) -> String {
     let mut err = String::new();
     let span_formatter = |file, range| format!("{file:?} {range:?}");
     let display_target =
-        DisplayTarget::from_crate(db, *db.all_crates().last().expect("no crate graph present"));
+        DisplayTarget::from_crate(db, *all_crates(db).last().expect("no crate graph present"));
     match e {
         ConstEvalError::MirLowerError(e) => {
             e.pretty_print(&mut err, db, span_formatter, display_target)
@@ -131,7 +131,11 @@ fn eval_goal(db: &TestDB, file_id: EditionedFileId) -> Result<Const<'_>, ConstEv
         .declarations()
         .find_map(|x| match x {
             hir_def::ModuleDefId::ConstId(x) => {
-                if db.const_signature(x).name.as_ref()?.display(db, file_id.edition(db)).to_string()
+                if ConstSignature::of(db, x)
+                    .name
+                    .as_ref()?
+                    .display(db, file_id.edition(db))
+                    .to_string()
                     == "GOAL"
                 {
                     Some(x)

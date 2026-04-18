@@ -893,11 +893,25 @@ fn adt_def(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::AdtDef<'_> {
 fn trait_def(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::TraitDef {
     let item = tcx.hir_expect_item(def_id);
 
-    let (constness, is_alias, is_auto, safety) = match item.kind {
-        hir::ItemKind::Trait(constness, is_auto, safety, ..) => {
-            (constness, false, is_auto == hir::IsAuto::Yes, safety)
-        }
-        hir::ItemKind::TraitAlias(constness, ..) => (constness, true, false, hir::Safety::Safe),
+    let (constness, is_alias, is_auto, safety, impl_restriction) = match item.kind {
+        hir::ItemKind::Trait(constness, is_auto, safety, impl_restriction, ..) => (
+            constness,
+            false,
+            is_auto == hir::IsAuto::Yes,
+            safety,
+            if let hir::RestrictionKind::Restricted(path) = impl_restriction.kind {
+                ty::trait_def::ImplRestrictionKind::Restricted(path.res, impl_restriction.span)
+            } else {
+                ty::trait_def::ImplRestrictionKind::Unrestricted
+            },
+        ),
+        hir::ItemKind::TraitAlias(constness, ..) => (
+            constness,
+            true,
+            false,
+            hir::Safety::Safe,
+            ty::trait_def::ImplRestrictionKind::Unrestricted,
+        ),
         _ => span_bug!(item.span, "trait_def_of_item invoked on non-trait"),
     };
 
@@ -946,6 +960,7 @@ fn trait_def(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::TraitDef {
         def_id: def_id.to_def_id(),
         safety,
         constness,
+        impl_restriction,
         paren_sugar,
         has_auto_impl: is_auto,
         is_marker,
@@ -1598,8 +1613,8 @@ fn anon_const_kind<'tcx>(tcx: TyCtxt<'tcx>, def: LocalDefId) -> ty::AnonConstKin
             let parent_hir_node = tcx.hir_node(tcx.parent_hir_id(const_arg_id));
             if tcx.features().generic_const_exprs() {
                 ty::AnonConstKind::GCE
-            } else if tcx.features().opaque_generic_const_args() {
-                // Only anon consts that are the RHS of a const item can be OGCA.
+            } else if tcx.features().generic_const_args() {
+                // Only anon consts that are the RHS of a const item can be GCA.
                 // Note: We can't just check tcx.parent because it needs to be EXACTLY
                 // the RHS, not just part of the RHS.
                 if !is_anon_const_rhs_of_const_item(tcx, def) {
@@ -1607,9 +1622,9 @@ fn anon_const_kind<'tcx>(tcx: TyCtxt<'tcx>, def: LocalDefId) -> ty::AnonConstKin
                 }
 
                 let body = tcx.hir_body_owned_by(def);
-                let mut visitor = OGCAParamVisitor(tcx);
+                let mut visitor = GCAParamVisitor(tcx);
                 match visitor.visit_body(body) {
-                    ControlFlow::Break(UsesParam) => ty::AnonConstKind::OGCA,
+                    ControlFlow::Break(UsesParam) => ty::AnonConstKind::GCA,
                     ControlFlow::Continue(()) => ty::AnonConstKind::MCG,
                 }
             } else if tcx.features().min_generic_const_args() {
@@ -1650,11 +1665,11 @@ fn is_anon_const_rhs_of_const_item<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) 
     def_id == rhs_anon.def_id
 }
 
-struct OGCAParamVisitor<'tcx>(TyCtxt<'tcx>);
+struct GCAParamVisitor<'tcx>(TyCtxt<'tcx>);
 
 struct UsesParam;
 
-impl<'tcx> Visitor<'tcx> for OGCAParamVisitor<'tcx> {
+impl<'tcx> Visitor<'tcx> for GCAParamVisitor<'tcx> {
     type NestedFilter = nested_filter::OnlyBodies;
     type Result = ControlFlow<UsesParam>;
 

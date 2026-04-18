@@ -39,8 +39,7 @@ pub use rustc_session::lint::builtin::*;
 use rustc_session::lint::fcw;
 use rustc_session::{declare_lint, declare_lint_pass, impl_lint_pass};
 use rustc_span::edition::Edition;
-use rustc_span::source_map::Spanned;
-use rustc_span::{DUMMY_SP, Ident, InnerSpan, Span, Symbol, kw, sym};
+use rustc_span::{DUMMY_SP, Ident, InnerSpan, Span, Spanned, Symbol, kw, sym};
 use rustc_target::asm::InlineAsmArch;
 use rustc_trait_selection::infer::{InferCtxtExt, TyCtxtInferExt};
 use rustc_trait_selection::traits;
@@ -313,7 +312,7 @@ impl EarlyLintPass for UnsafeCode {
                     AttributeParser::parse_limited(
                         cx.builder.sess(),
                         &it.attrs,
-                        sym::allow_internal_unsafe,
+                        &[sym::allow_internal_unsafe],
                         it.span,
                         DUMMY_NODE_ID,
                         Some(cx.builder.features()),

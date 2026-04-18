@@ -405,7 +405,8 @@ where
 
 /// Implements comparison of arrays [lexicographically](Ord#lexicographical-comparison).
 #[stable(feature = "rust1", since = "1.0.0")]
-impl<T: PartialOrd, const N: usize> PartialOrd for [T; N] {
+#[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
+impl<T: [const] PartialOrd, const N: usize> const PartialOrd for [T; N] {
     #[inline]
     fn partial_cmp(&self, other: &[T; N]) -> Option<Ordering> {
         PartialOrd::partial_cmp(&&self[..], &&other[..])
@@ -430,7 +431,8 @@ impl<T: PartialOrd, const N: usize> PartialOrd for [T; N] {
 
 /// Implements comparison of arrays [lexicographically](Ord#lexicographical-comparison).
 #[stable(feature = "rust1", since = "1.0.0")]
-impl<T: Ord, const N: usize> Ord for [T; N] {
+#[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
+impl<T: [const] Ord, const N: usize> const Ord for [T; N] {
     #[inline]
     fn cmp(&self, other: &[T; N]) -> Ordering {
         Ord::cmp(&&self[..], &&other[..])
@@ -1003,9 +1005,10 @@ impl<T: [const] Destruct> const Drop for Guard<'_, T> {
 /// dropped.
 ///
 /// Used for [`Iterator::next_chunk`].
+#[rustc_const_unstable(feature = "const_iter", issue = "92476")]
 #[inline]
-pub(crate) fn iter_next_chunk<T, const N: usize>(
-    iter: &mut impl Iterator<Item = T>,
+pub(crate) const fn iter_next_chunk<T, const N: usize>(
+    iter: &mut impl [const] Iterator<Item = T>,
 ) -> Result<[T; N], IntoIter<T, N>> {
     let mut array = [const { MaybeUninit::uninit() }; N];
     let r = iter_next_chunk_erased(&mut array, iter);
@@ -1026,10 +1029,11 @@ pub(crate) fn iter_next_chunk<T, const N: usize>(
 ///
 /// Unfortunately this loop has two exit conditions, the buffer filling up
 /// or the iterator running out of items, making it tend to optimize poorly.
+#[rustc_const_unstable(feature = "const_iter", issue = "92476")]
 #[inline]
-fn iter_next_chunk_erased<T>(
+const fn iter_next_chunk_erased<T>(
     buffer: &mut [MaybeUninit<T>],
-    iter: &mut impl Iterator<Item = T>,
+    iter: &mut impl [const] Iterator<Item = T>,
 ) -> Result<(), usize> {
     // if `Iterator::next` panics, this guard will drop already initialized items
     let mut guard = Guard { array_mut: buffer, initialized: 0 };

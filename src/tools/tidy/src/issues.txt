@@ -117,7 +117,6 @@ ui/associated-types/issue-44153.rs
 ui/associated-types/issue-47139-1.rs
 ui/associated-types/issue-47139-2.rs
 ui/associated-types/issue-47385.rs
-ui/associated-types/issue-47814.rs
 ui/associated-types/issue-48010.rs
 ui/associated-types/issue-48551.rs
 ui/associated-types/issue-50301.rs
@@ -406,7 +405,6 @@ ui/closures/2229_closure_analysis/match/issue-87097.rs
 ui/closures/2229_closure_analysis/match/issue-87426.rs
 ui/closures/2229_closure_analysis/match/issue-87988.rs
 ui/closures/2229_closure_analysis/match/issue-88331.rs
-ui/closures/2229_closure_analysis/migrations/issue-78720.rs
 ui/closures/2229_closure_analysis/migrations/issue-86753.rs
 ui/closures/2229_closure_analysis/migrations/issue-90024-adt-correct-subst.rs
 ui/closures/2229_closure_analysis/run_pass/issue-87378.rs
@@ -1001,7 +999,6 @@ ui/fmt/issue-86085.rs
 ui/fmt/issue-89173.rs
 ui/fmt/issue-91556.rs
 ui/fn/issue-1451.rs
-ui/fn/issue-1900.rs
 ui/fn/issue-3044.rs
 ui/fn/issue-3099.rs
 ui/fn/issue-3904.rs
@@ -1358,7 +1355,6 @@ ui/infinite/issue-41731-infinite-macro-print.rs
 ui/infinite/issue-41731-infinite-macro-println.rs
 ui/intrinsics/issue-28575.rs
 ui/intrinsics/issue-84297-reifying-copy.rs
-ui/invalid/issue-114435-layout-type-err.rs
 ui/iterators/issue-28098.rs
 ui/iterators/issue-58952-filter-type-length.rs
 ui/lang-items/issue-83471.rs
@@ -1476,7 +1472,6 @@ ui/lint/issue-97094.rs
 ui/lint/issue-99387.rs
 ui/lint/let_underscore/issue-119696-err-on-fn.rs
 ui/lint/let_underscore/issue-119697-extra-let.rs
-ui/lint/must_not_suspend/issue-89562.rs
 ui/lint/unused/issue-103320-must-use-ops.rs
 ui/lint/unused/issue-104397.rs
 ui/lint/unused/issue-105061-array-lint.rs

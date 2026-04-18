@@ -34,8 +34,7 @@ use rustc_session::errors::ExprParenthesesNeeded;
 use rustc_session::parse::feature_err;
 use rustc_span::edit_distance::find_best_match_for_name;
 use rustc_span::hygiene::DesugaringKind;
-use rustc_span::source_map::Spanned;
-use rustc_span::{Ident, Span, Symbol, kw, sym};
+use rustc_span::{Ident, Span, Spanned, Symbol, kw, sym};
 use rustc_trait_selection::infer::InferCtxtExt;
 use rustc_trait_selection::traits::{self, ObligationCauseCode, ObligationCtxt};
 use tracing::{debug, instrument, trace};
@@ -350,7 +349,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
         let tcx = self.tcx;
         match expr.kind {
-            ExprKind::Lit(ref lit) => self.check_expr_lit(lit, expected),
+            ExprKind::Lit(ref lit) => self.check_expr_lit(lit, expr.hir_id, expected),
             ExprKind::Binary(op, lhs, rhs) => self.check_expr_binop(expr, op, lhs, rhs, expected),
             ExprKind::Assign(lhs, rhs, span) => {
                 self.check_expr_assign(expr, expected, lhs, rhs, span)
@@ -1661,14 +1660,6 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         expr: &'tcx hir::Expr<'tcx>,
     ) -> Ty<'tcx> {
         let element_ty = if !args.is_empty() {
-            // This shouldn't happen unless there's another error
-            // (e.g., never patterns in inappropriate contexts).
-            if self.diverges.get() != Diverges::Maybe {
-                self.dcx()
-                    .struct_span_err(expr.span, "unexpected divergence state in checking array")
-                    .delay_as_bug();
-            }
-
             let coerce_to = expected
                 .to_option(self)
                 .and_then(|uty| {
@@ -2454,25 +2445,28 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             })
             .partition(|field| field.2);
         err.span_labels(used_private_fields.iter().map(|(_, span, _)| *span), "private field");
-        if !remaining_private_fields.is_empty() {
-            let names = if remaining_private_fields.len() > 6 {
-                String::new()
-            } else {
-                format!(
-                    "{} ",
-                    listify(&remaining_private_fields, |(name, _, _)| format!("`{name}`"))
-                        .expect("expected at least one private field to report")
-                )
-            };
-            err.note(format!(
-                "{}private field{s} {names}that {were} not provided",
-                if used_fields.is_empty() { "" } else { "...and other " },
-                s = pluralize!(remaining_private_fields.len()),
-                were = pluralize!("was", remaining_private_fields.len()),
-            ));
-        }
 
         if let ty::Adt(def, _) = adt_ty.kind() {
+            if (def.did().is_local() || !used_fields.is_empty())
+                && !remaining_private_fields.is_empty()
+            {
+                let names = if remaining_private_fields.len() > 6 {
+                    String::new()
+                } else {
+                    format!(
+                        "{} ",
+                        listify(&remaining_private_fields, |(name, _, _)| format!("`{name}`"))
+                            .expect("expected at least one private field to report")
+                    )
+                };
+                err.note(format!(
+                    "{}private field{s} {names}that {were} not provided",
+                    if used_fields.is_empty() { "" } else { "...and other " },
+                    s = pluralize!(remaining_private_fields.len()),
+                    were = pluralize!("was", remaining_private_fields.len()),
+                ));
+            }
+
             let def_id = def.did();
             let mut items = self
                 .tcx
@@ -2993,7 +2987,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 err.span_label(ident.span, "unknown field");
                 self.point_at_param_definition(&mut err, param_ty);
             }
-            ty::Alias(ty::Opaque, _) => {
+            ty::Alias(ty::AliasTy { kind: ty::Opaque { .. }, .. }) => {
                 self.suggest_await_on_field_access(&mut err, ident, base, base_ty.peel_refs());
             }
             _ => {
@@ -3563,6 +3557,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             // Register the impl's predicates. One of these predicates
             // must be unsatisfied, or else we wouldn't have gotten here
             // in the first place.
+            let unnormalized_predicates =
+                self.tcx.predicates_of(impl_def_id).instantiate(self.tcx, impl_args);
             ocx.register_obligations(traits::predicates_for_generics(
                 |idx, span| {
                     cause.clone().derived_cause(
@@ -3580,8 +3576,9 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         },
                     )
                 },
+                |pred| ocx.normalize(&cause, self.param_env, pred),
                 self.param_env,
-                self.tcx.predicates_of(impl_def_id).instantiate(self.tcx, impl_args),
+                unnormalized_predicates,
             ));
 
             // Normalize the output type, which we can use later on as the

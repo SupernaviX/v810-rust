@@ -645,7 +645,7 @@ impl<'a, 'tcx> Visitor<'tcx> for BoundVarContext<'a, 'tcx> {
             | hir::ItemKind::Enum(_, generics, _)
             | hir::ItemKind::Struct(_, generics, _)
             | hir::ItemKind::Union(_, generics, _)
-            | hir::ItemKind::Trait(_, _, _, _, generics, ..)
+            | hir::ItemKind::Trait(_, _, _, _, _, generics, ..)
             | hir::ItemKind::TraitAlias(_, _, generics, ..)
             | hir::ItemKind::Impl(hir::Impl { generics, .. }) => {
                 // These kinds of items have only early-bound lifetime parameters.
@@ -925,7 +925,7 @@ impl<'a, 'tcx> Visitor<'tcx> for BoundVarContext<'a, 'tcx> {
             hir::FnRetTy::Return(ty) => Some(ty),
         };
         if let Some(ty) = output
-            && let hir::TyKind::InferDelegation(sig_id, _) = ty.kind
+            && let hir::TyKind::InferDelegation(hir::InferDelegation::Sig(sig_id, _)) = ty.kind
         {
             let bound_vars: Vec<_> =
                 self.tcx.fn_sig(sig_id).skip_binder().bound_vars().iter().collect();
@@ -1523,7 +1523,7 @@ impl<'a, 'tcx> BoundVarContext<'a, 'tcx> {
                     None,
                     DefKind::LifetimeParam,
                     Some(DefPathData::OpaqueLifetime(ident.name)),
-                    &mut self.disambiguator,
+                    self.disambiguator,
                 );
                 feed.def_span(ident.span);
                 feed.def_ident_span(Some(ident.span));
@@ -2407,7 +2407,10 @@ fn is_late_bound_map(
                 ty::Param(param_ty) => {
                     self.arg_is_constrained[param_ty.index as usize] = true;
                 }
-                ty::Alias(ty::Projection | ty::Inherent, _) => return,
+                ty::Alias(ty::AliasTy {
+                    kind: ty::Projection { .. } | ty::Inherent { .. },
+                    ..
+                }) => return,
                 _ => (),
             }
             t.super_visit_with(self)

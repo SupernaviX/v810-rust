@@ -4,7 +4,7 @@ use itertools::Itertools;
 use syntax::{
     SyntaxKind::WHITESPACE,
     T,
-    ast::{self, AstNode, HasName, make},
+    ast::{self, AstNode, HasName, syntax_factory::SyntaxFactory},
     syntax_editor::{Position, SyntaxEditor},
 };
 
@@ -13,7 +13,7 @@ use crate::{
     assist_context::{AssistContext, Assists},
     utils::{
         DefaultMethods, IgnoreAssocItems, add_trait_assoc_items_to_impl, filter_assoc_items,
-        gen_trait_fn_body, generate_trait_impl,
+        gen_trait_fn_body, generate_trait_impl, generate_trait_impl_with_item,
     },
 };
 
@@ -64,9 +64,10 @@ pub(crate) fn replace_derive_with_manual_impl(
         .filter_map(|attr| attr.path())
         .collect::<Vec<_>>();
 
-    let adt = value.parent().and_then(ast::Adt::cast)?;
-    let attr = ast::Attr::cast(value)?;
-    let args = attr.token_tree()?;
+    let attr = ast::Meta::cast(value)?.parent_attr()?;
+    let adt = attr.syntax().parent().and_then(ast::Adt::cast)?;
+    let ast::Meta::TokenTreeMeta(meta) = attr.meta()? else { return None };
+    let args = meta.token_tree()?;
 
     let current_module = ctx.sema.scope(adt.syntax())?.module();
     let current_crate = current_module.krate(ctx.db());
@@ -127,6 +128,7 @@ fn add_assist(
     let label = format!("Convert to manual `impl {replace_trait_path} for {annotated_name}`");
 
     acc.add(AssistId::refactor("replace_derive_with_manual_impl"), label, target, |builder| {
+        let make = SyntaxFactory::with_mappings();
         let insert_after = Position::after(adt.syntax());
         let impl_is_unsafe = trait_.map(|s| s.is_unsafe(ctx.db())).unwrap_or(false);
         let impl_def = impl_def_from_trait(
@@ -140,9 +142,9 @@ fn add_assist(
         );
 
         let mut editor = builder.make_editor(attr.syntax());
-        update_attribute(&mut editor, old_derives, old_tree, old_trait_path, attr);
+        update_attribute(&make, &mut editor, old_derives, old_tree, old_trait_path, attr);
 
-        let trait_path = make::ty_path(replace_trait_path.clone());
+        let trait_path = make.ty_path(replace_trait_path.clone()).into();
 
         let (impl_def, first_assoc_item) = if let Some(impl_def) = impl_def {
             (
@@ -150,7 +152,7 @@ fn add_assist(
                 impl_def.assoc_item_list().and_then(|list| list.assoc_items().next()),
             )
         } else {
-            (generate_trait_impl(impl_is_unsafe, adt, trait_path), None)
+            (generate_trait_impl(&make, impl_is_unsafe, adt, trait_path), None)
         };
 
         if let Some(cap) = ctx.config.snippet_cap {
@@ -174,8 +176,9 @@ fn add_assist(
 
         editor.insert_all(
             insert_after,
-            vec![make::tokens::blank_line().into(), impl_def.syntax().clone().into()],
+            vec![make.whitespace("\n\n").into(), impl_def.syntax().clone().into()],
         );
+        editor.add_mappings(make.finish_with_mappings());
         builder.add_file_edits(ctx.vfs_file_id(), editor);
     })
 }
@@ -205,38 +208,42 @@ fn impl_def_from_trait(
     if trait_items.is_empty() {
         return None;
     }
-    let impl_def = generate_trait_impl(impl_is_unsafe, adt, make::ty_path(trait_path.clone()));
+    let make = SyntaxFactory::without_mappings();
+    let trait_ty: ast::Type = make.ty_path(trait_path.clone()).into();
+    let impl_def = generate_trait_impl(&make, impl_is_unsafe, adt, trait_ty.clone());
 
-    let assoc_items =
-        add_trait_assoc_items_to_impl(sema, config, &trait_items, trait_, &impl_def, &target_scope);
-    let assoc_item_list = if let Some((first, other)) =
-        assoc_items.split_first().map(|(first, other)| (first.clone_subtree(), other))
-    {
-        let first_item = if let ast::AssocItem::Fn(ref func) = first
-            && let Some(body) = gen_trait_fn_body(func, trait_path, adt, None)
+    let assoc_items = add_trait_assoc_items_to_impl(
+        &make,
+        sema,
+        config,
+        &trait_items,
+        trait_,
+        &impl_def,
+        &target_scope,
+    );
+    let assoc_item_list = if let Some((first, other)) = assoc_items.split_first() {
+        let first_item = if let ast::AssocItem::Fn(func) = first
+            && let Some(body) = gen_trait_fn_body(&make, func, trait_path, adt, None)
             && let Some(func_body) = func.body()
         {
-            let mut editor = SyntaxEditor::new(first.syntax().clone());
+            let (mut editor, _) = SyntaxEditor::new(first.syntax().clone());
             editor.replace(func_body.syntax(), body.syntax());
             ast::AssocItem::cast(editor.finish().new_root().clone())
         } else {
             Some(first.clone())
         };
-        let items = first_item.into_iter().chain(other.iter().cloned()).collect();
-        make::assoc_item_list(Some(items))
+        let items: Vec<ast::AssocItem> =
+            first_item.into_iter().chain(other.iter().cloned()).collect();
+        make.assoc_item_list(items)
     } else {
-        make::assoc_item_list(None)
-    }
-    .clone_for_update();
+        make.assoc_item_list_empty()
+    };
 
-    let impl_def = impl_def.clone_subtree();
-    let mut editor = SyntaxEditor::new(impl_def.syntax().clone());
-    editor.replace(impl_def.assoc_item_list()?.syntax(), assoc_item_list.syntax());
-    let impl_def = ast::Impl::cast(editor.finish().new_root().clone())?;
-    Some(impl_def)
+    Some(generate_trait_impl_with_item(&make, impl_is_unsafe, adt, trait_ty, assoc_item_list))
 }
 
 fn update_attribute(
+    make: &SyntaxFactory,
     editor: &mut SyntaxEditor,
     old_derives: &[ast::Path],
     old_tree: &ast::TokenTree,
@@ -257,13 +264,13 @@ fn update_attribute(
                 .collect::<Vec<_>>()
         });
         // ...which are interspersed with ", "
-        let tt = Itertools::intersperse(tt, vec![make::token(T![,]), make::tokens::single_space()]);
+        let tt = Itertools::intersperse(tt, vec![make.token(T![,]), make.whitespace(" ")]);
         // ...wrap them into the appropriate `NodeOrToken` variant
         let tt = tt.flatten().map(syntax::NodeOrToken::Token);
         // ...and make them into a flat list of tokens
         let tt = tt.collect::<Vec<_>>();
 
-        let new_tree = make::token_tree(T!['('], tt).clone_for_update();
+        let new_tree = make.token_tree(T!['('], tt);
         editor.replace(old_tree.syntax(), new_tree.syntax());
     } else {
         // Remove the attr and any trailing whitespace

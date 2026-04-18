@@ -716,7 +716,7 @@ impl ops::Index<ops::RangeFrom<usize>> for CStr {
     }
 }
 
-#[unstable(feature = "new_range_api", issue = "125687")]
+#[stable(feature = "new_range_from_api", since = "1.96.0")]
 impl ops::Index<range::RangeFrom<usize>> for CStr {
     type Output = CStr;
 

@@ -277,15 +277,15 @@ impl Default for MacroUseArgs {
 }
 
 #[derive(Debug, Clone, Encodable, Decodable, HashStable_Generic)]
-pub struct StrippedCfgItem<ModId = DefId> {
-    pub parent_module: ModId,
+pub struct StrippedCfgItem<ScopeId = DefId> {
+    pub parent_scope: ScopeId,
     pub ident: Ident,
     pub cfg: (CfgEntry, Span),
 }
 
-impl<ModId> StrippedCfgItem<ModId> {
-    pub fn map_mod_id<New>(self, f: impl FnOnce(ModId) -> New) -> StrippedCfgItem<New> {
-        StrippedCfgItem { parent_module: f(self.parent_module), ident: self.ident, cfg: self.cfg }
+impl<ScopeId> StrippedCfgItem<ScopeId> {
+    pub fn map_scope_id<New>(self, f: impl FnOnce(ScopeId) -> New) -> StrippedCfgItem<New> {
+        StrippedCfgItem { parent_scope: f(self.parent_scope), ident: self.ident, cfg: self.cfg }
     }
 }
 
@@ -757,12 +757,12 @@ impl IntoDiagArg for CrateType {
 }
 
 #[derive(Clone, Debug, HashStable_Generic, Encodable, Decodable, PrintAttribute)]
-pub enum RustcLayoutType {
-    Abi,
+pub enum RustcDumpLayoutKind {
     Align,
-    Size,
-    HomogenousAggregate,
+    BackendRepr,
     Debug,
+    HomogenousAggregate,
+    Size,
 }
 
 #[derive(Clone, Debug, HashStable_Generic, Encodable, Decodable, PrintAttribute, PartialEq, Eq)]
@@ -892,6 +892,14 @@ impl fmt::Display for AutoDiffItem {
         write!(f, " with inputs: {:?}", self.inputs)?;
         write!(f, " with output: {:?}", self.output)
     }
+}
+
+#[derive(Clone, Debug, HashStable_Generic, Encodable, Decodable, PrintAttribute)]
+pub struct UnstableRemovedFeature {
+    pub feature: Symbol,
+    pub reason: Symbol,
+    pub link: Symbol,
+    pub since: RustcVersion,
 }
 
 /// Represents parsed *built-in* inert attributes.
@@ -1183,8 +1191,21 @@ pub enum AttributeKind {
         directive: Option<Box<Directive>>,
     },
 
+    /// Represents `#[diagnostic::on_move]`
+    OnMove {
+        span: Span,
+        directive: Option<Box<Directive>>,
+    },
+
     /// Represents `#[rustc_on_unimplemented]` and `#[diagnostic::on_unimplemented]`.
     OnUnimplemented {
+        span: Span,
+        /// None if the directive was malformed in some way.
+        directive: Option<Box<Directive>>,
+    },
+
+    /// Represents `#[diagnostic::on_unknown]`
+    OnUnknown {
         span: Span,
         /// None if the directive was malformed in some way.
         directive: Option<Box<Directive>>,
@@ -1214,9 +1235,6 @@ pub enum AttributeKind {
 
     /// Represents `#[pin_v2]`
     PinV2(Span),
-
-    /// Represents `#[pointee]`
-    Pointee(Span),
 
     /// Represents `#[prelude_import]`
     PreludeImport,
@@ -1321,9 +1339,7 @@ pub enum AttributeKind {
 
     /// Represents `#[rustc_confusables]`.
     RustcConfusables {
-        symbols: ThinVec<Symbol>,
-        // FIXME(jdonszelmann): remove when target validation code is moved
-        first_span: Span,
+        confusables: ThinVec<Symbol>,
     },
     /// Represents `#[rustc_const_stable]` and `#[rustc_const_unstable]`.
     RustcConstStability {
@@ -1340,9 +1356,6 @@ pub enum AttributeKind {
 
     /// Represents `#[rustc_deallocator]`
     RustcDeallocator,
-
-    /// Represents `#[rustc_def_path]`
-    RustcDefPath(Span),
 
     /// Represents `#[rustc_delayed_bug_from_inside_query]`
     RustcDelayedBugFromInsideQuery,
@@ -1369,17 +1382,29 @@ pub enum AttributeKind {
     /// Represents `#[rustc_dump_def_parents]`
     RustcDumpDefParents,
 
+    /// Represents `#[rustc_dump_def_path]`
+    RustcDumpDefPath(Span),
+
+    /// Represents `#[rustc_dump_hidden_type_of_opaques]`
+    RustcDumpHiddenTypeOfOpaques,
+
     /// Represents `#[rustc_dump_inferred_outlives]`
     RustcDumpInferredOutlives,
 
     /// Represents `#[rustc_dump_item_bounds]`
     RustcDumpItemBounds,
 
+    /// Represents `#[rustc_dump_layout]`
+    RustcDumpLayout(ThinVec<RustcDumpLayoutKind>),
+
     /// Represents `#[rustc_dump_object_lifetime_defaults]`.
     RustcDumpObjectLifetimeDefaults,
 
     /// Represents `#[rustc_dump_predicates]`
     RustcDumpPredicates,
+
+    /// Represents `#[rustc_dump_symbol_name]`
+    RustcDumpSymbolName(Span),
 
     /// Represents `#[rustc_dump_user_args]`
     RustcDumpUserArgs,
@@ -1407,9 +1432,6 @@ pub enum AttributeKind {
 
     RustcHasIncoherentInherentImpls,
 
-    /// Represents `#[rustc_hidden_type_of_opaques]`
-    RustcHiddenTypeOfOpaques,
-
     /// Represents `#[rustc_if_this_changed]`
     RustcIfThisChanged(Span, Option<Symbol>),
 
@@ -1424,9 +1446,6 @@ pub enum AttributeKind {
 
     /// Represents `#[rustc_intrinsic_const_stable_indirect]`
     RustcIntrinsicConstStableIndirect,
-
-    /// Represents `#[rustc_layout]`
-    RustcLayout(ThinVec<RustcLayoutType>),
 
     /// Represents `#[rustc_layout_scalar_valid_range_end]`.
     RustcLayoutScalarValidRangeEnd(Box<u128>, Span),
@@ -1469,6 +1488,9 @@ pub enum AttributeKind {
         fn_names: ThinVec<Ident>,
     },
 
+    /// Represents `#[rustc_must_match_exhaustively]`
+    RustcMustMatchExhaustively(Span),
+
     /// Represents `#[rustc_never_returns_null_ptr]`
     RustcNeverReturnsNullPtr,
 
@@ -1486,6 +1508,9 @@ pub enum AttributeKind {
 
     /// Represents `#[rustc_no_mir_inline]`
     RustcNoMirInline,
+
+    /// Represents `#[rustc_no_writable]`
+    RustcNoWritable,
 
     /// Represents `#[rustc_non_const_trait_method]`.
     RustcNonConstTraitMethod,
@@ -1568,9 +1593,6 @@ pub enum AttributeKind {
     /// Represents `#[rustc_strict_coherence]`.
     RustcStrictCoherence(Span),
 
-    /// Represents `#[rustc_symbol_name]`
-    RustcSymbolName(Span),
-
     /// Represents `#[rustc_test_marker]`
     RustcTestMarker(Symbol),
 
@@ -1634,6 +1656,9 @@ pub enum AttributeKind {
 
     /// Represents `#[unstable_feature_bound]`.
     UnstableFeatureBound(ThinVec<(Symbol, Span)>),
+
+    /// Represents all `#![unstable_removed(...)]` features
+    UnstableRemoved(ThinVec<UnstableRemovedFeature>),
 
     /// Represents `#[used]`
     Used {

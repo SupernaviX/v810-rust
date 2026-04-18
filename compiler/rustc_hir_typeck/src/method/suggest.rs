@@ -14,9 +14,9 @@ use rustc_data_structures::sorted_map::SortedMap;
 use rustc_data_structures::unord::UnordSet;
 use rustc_errors::codes::*;
 use rustc_errors::{
-    Applicability, Diag, MultiSpan, StashKey, listify, pluralize, struct_span_code_err,
+    Applicability, Diag, MultiSpan, StashKey, StringPart, listify, pluralize, struct_span_code_err,
 };
-use rustc_hir::attrs::diagnostic::OnUnimplementedNote;
+use rustc_hir::attrs::diagnostic::CustomDiagnostic;
 use rustc_hir::def::{CtorKind, DefKind, Res};
 use rustc_hir::def_id::DefId;
 use rustc_hir::intravisit::{self, Visitor};
@@ -175,7 +175,9 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     }
                 }
             }
-            ty::Slice(..) | ty::Adt(..) | ty::Alias(ty::Opaque, _) => {
+            ty::Slice(..)
+            | ty::Adt(..)
+            | ty::Alias(ty::AliasTy { kind: ty::Opaque { .. }, .. }) => {
                 for unsatisfied in unsatisfied_predicates.iter() {
                     if is_iterator_predicate(unsatisfied.0) {
                         return true;
@@ -1177,15 +1179,10 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         let is_method = mode == Mode::MethodCall;
         let item_kind = if is_method {
             "method"
-        } else if rcvr_ty.is_enum() {
-            "variant or associated item"
+        } else if rcvr_ty.is_enum() || rcvr_ty.is_fresh_ty() {
+            "variant, associated function, or constant"
         } else {
-            match (item_ident.as_str().chars().next(), rcvr_ty.is_fresh_ty()) {
-                (Some(name), false) if name.is_lowercase() => "function or associated item",
-                (Some(_), false) => "associated item",
-                (Some(_), true) | (None, false) => "variant or associated item",
-                (None, true) => "variant",
-            }
+            "associated function or constant"
         };
 
         if let Err(guar) = self.report_failed_method_call_on_numerical_infer_var(
@@ -1219,6 +1216,13 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 unsatisfied_predicates,
             )
         };
+        if let SelfSource::MethodCall(rcvr_expr) = source {
+            self.err_ctxt().note_field_shadowed_by_private_candidate(
+                &mut err,
+                rcvr_expr.hir_id,
+                self.param_env,
+            );
+        }
 
         self.set_label_for_method_error(
             &mut err,
@@ -1413,33 +1417,45 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         }
                     })
                     .collect::<Vec<_>>();
-                if !inherent_impls_candidate.is_empty() {
-                    inherent_impls_candidate.sort_by_key(|&id| self.tcx.def_path_str(id));
-                    inherent_impls_candidate.dedup();
-
-                    // number of types to show at most
-                    let limit = if inherent_impls_candidate.len() == 5 { 5 } else { 4 };
-                    let type_candidates = inherent_impls_candidate
-                        .iter()
-                        .take(limit)
-                        .map(|impl_item| {
-                            format!(
-                                "- `{}`",
-                                self.tcx.at(span).type_of(*impl_item).instantiate_identity()
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    let additional_types = if inherent_impls_candidate.len() > limit {
-                        format!("\nand {} more types", inherent_impls_candidate.len() - limit)
-                    } else {
-                        "".to_string()
-                    };
-                    err.note(format!(
-                        "the {item_kind} was found for\n{type_candidates}{additional_types}"
-                    ));
-                    *find_candidate_for_method = mode == Mode::MethodCall;
-                }
+                inherent_impls_candidate.sort_by_key(|&id| self.tcx.def_path_str(id));
+                inherent_impls_candidate.dedup();
+                let msg = match &inherent_impls_candidate[..] {
+                    [] => return,
+                    [only] => {
+                        vec![
+                            StringPart::normal(format!("the {item_kind} was found for `")),
+                            StringPart::highlighted(
+                                self.tcx.at(span).type_of(*only).instantiate_identity().to_string(),
+                            ),
+                            StringPart::normal(format!("`")),
+                        ]
+                    }
+                    candidates => {
+                        // number of types to show at most
+                        let limit = if candidates.len() == 5 { 5 } else { 4 };
+                        let type_candidates = candidates
+                            .iter()
+                            .take(limit)
+                            .map(|impl_item| {
+                                format!(
+                                    "- `{}`",
+                                    self.tcx.at(span).type_of(*impl_item).instantiate_identity()
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let additional_types = if candidates.len() > limit {
+                            format!("\nand {} more types", candidates.len() - limit)
+                        } else {
+                            "".to_string()
+                        };
+                        vec![StringPart::normal(format!(
+                            "the {item_kind} was found for\n{type_candidates}{additional_types}"
+                        ))]
+                    }
+                };
+                err.highlighted_note(msg);
+                *find_candidate_for_method = mode == Mode::MethodCall;
             }
         } else {
             let ty_str = if ty_str.len() > 50 { String::new() } else { format!("on `{ty_str}` ") };
@@ -1882,7 +1898,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 Some(
                     Node::Item(hir::Item {
                         kind:
-                            hir::ItemKind::Trait(_, _, _, ident, ..)
+                            hir::ItemKind::Trait(_, _, _, _, ident, ..)
                             | hir::ItemKind::TraitAlias(_, ident, ..),
                         ..
                     })
@@ -2053,7 +2069,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                             // Avoid crashing.
                             return (None, None, Vec::new());
                         }
-                        let OnUnimplementedNote { message, label, notes, .. } = self
+                        let CustomDiagnostic { message, label, notes, .. } = self
                             .err_ctxt()
                             .on_unimplemented_note(trait_ref, &obligation, err.long_ty_path());
                         (message, label, notes)
@@ -2260,8 +2276,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 for inherent_method in
                     self.tcx.associated_items(inherent_impl_did).in_definition_order()
                 {
-                    if let Some(candidates) = find_attr!(self.tcx, inherent_method.def_id, RustcConfusables{symbols, ..} => symbols)
-                        && candidates.contains(&item_name.name)
+                    if let Some(confusables) = find_attr!(self.tcx, inherent_method.def_id, RustcConfusables{confusables} => confusables)
+                        && confusables.contains(&item_name.name)
                         && inherent_method.is_fn()
                     {
                         let args =
@@ -2279,8 +2295,11 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                             fn_sig,
                         );
                         let name = inherent_method.name();
+                        let inputs = fn_sig.inputs();
+                        let expected_inputs =
+                            if inherent_method.is_method() { &inputs[1..] } else { inputs };
                         if let Some(ref args) = call_args
-                            && fn_sig.inputs()[1..]
+                            && expected_inputs
                                 .iter()
                                 .eq_by(args, |expected, found| self.may_coerce(*expected, *found))
                         {
@@ -3448,13 +3467,13 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         let diagnostic_name = self.tcx.get_diagnostic_name(trait_pred.def_id())?;
 
         let can_derive = match diagnostic_name {
+            sym::Copy | sym::Clone => true,
+            _ if adt.is_union() => false,
             sym::Default
             | sym::Eq
             | sym::PartialEq
             | sym::Ord
             | sym::PartialOrd
-            | sym::Clone
-            | sym::Copy
             | sym::Hash
             | sym::Debug => true,
             _ => false,
@@ -3615,7 +3634,10 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         | ty::Float(_)
                         | ty::Adt(_, _)
                         | ty::Str
-                        | ty::Alias(ty::Projection | ty::Inherent, _)
+                        | ty::Alias(ty::AliasTy {
+                            kind: ty::Projection { .. } | ty::Inherent { .. },
+                            ..
+                        })
                         | ty::Param(_) => format!("{deref_ty}"),
                         // we need to test something like  <&[_]>::len or <(&[u32])>::len
                         // and Vec::function();
@@ -4523,7 +4545,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                             return;
                         }
                         Node::Item(hir::Item {
-                            kind: hir::ItemKind::Trait(_, _, _, ident, _, bounds, _),
+                            kind: hir::ItemKind::Trait(_, _, _, _, ident, _, bounds, _),
                             ..
                         }) => {
                             let (sp, sep, article) = if bounds.is_empty() {

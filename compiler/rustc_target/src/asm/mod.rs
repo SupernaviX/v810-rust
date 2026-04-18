@@ -5,7 +5,7 @@ use rustc_data_structures::fx::{FxHashMap, FxIndexSet};
 use rustc_macros::{Decodable, Encodable, HashStable_Generic};
 use rustc_span::Symbol;
 
-use crate::spec::{Abi, Arch, RelocModel, Target};
+use crate::spec::{Arch, CfgAbi, RelocModel, Target};
 
 pub struct ModifierInfo {
     pub modifier: char,
@@ -639,7 +639,7 @@ impl InlineAsmRegClass {
             Self::Hexagon(r) => r.supported_types(arch),
             Self::LoongArch(r) => r.supported_types(arch),
             Self::Mips(r) => r.supported_types(arch),
-            Self::S390x(r) => r.supported_types(arch, allow_experimental_reg),
+            Self::S390x(r) => r.supported_types(arch),
             Self::Sparc(r) => r.supported_types(arch),
             Self::SpirV(r) => r.supported_types(arch),
             Self::V810(r) => r.supported_types(arch),
@@ -1025,7 +1025,7 @@ impl InlineAsmClobberAbi {
                 _ => Err(&["C", "system", "efiapi"]),
             },
             InlineAsmArch::PowerPC | InlineAsmArch::PowerPC64 => match name {
-                "C" | "system" => Ok(if target.abi == Abi::Spe {
+                "C" | "system" => Ok(if target.cfg_abi == CfgAbi::Spe {
                     InlineAsmClobberAbi::PowerPCSPE
                 } else {
                     InlineAsmClobberAbi::PowerPC

@@ -111,9 +111,9 @@ mod attr_impl {
 
     // The subset of llvm::Attribute needed for arguments, packed into a bitfield.
     #[derive(Clone, Copy, Default, Hash, PartialEq, Eq, HashStable_Generic)]
-    pub struct ArgAttribute(u8);
+    pub struct ArgAttribute(u16);
     bitflags::bitflags! {
-        impl ArgAttribute: u8 {
+        impl ArgAttribute: u16 {
             const CapturesNone     = 0b111;
             const CapturesAddress  = 0b110;
             const CapturesReadOnly = 0b100;
@@ -122,6 +122,7 @@ mod attr_impl {
             const ReadOnly = 1 << 5;
             const InReg    = 1 << 6;
             const NoUndef  = 1 << 7;
+            const Writable = 1 << 8;
         }
     }
     rustc_data_structures::external_bitflags_debug! { ArgAttribute }
@@ -393,7 +394,7 @@ impl<'a, Ty> ArgAbi<'a, Ty> {
             ),
             BackendRepr::SimdVector { .. } => PassMode::Direct(ArgAttributes::new()),
             BackendRepr::Memory { .. } => Self::indirect_pass_mode(&layout),
-            BackendRepr::ScalableVector { .. } => PassMode::Direct(ArgAttributes::new()),
+            BackendRepr::SimdScalableVector { .. } => PassMode::Direct(ArgAttributes::new()),
         };
         ArgAbi { layout, mode }
     }
@@ -880,7 +881,7 @@ where
                 matches!(layout.variants, Variants::Single { .. }) && fields_are_noundef(layout, cx)
             }
         },
-        BackendRepr::SimdVector { .. } | BackendRepr::ScalableVector { .. } => false,
+        BackendRepr::SimdVector { .. } | BackendRepr::SimdScalableVector { .. } => false,
     }
 }
 

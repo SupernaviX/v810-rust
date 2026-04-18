@@ -1,8 +1,5 @@
-use std::debug_assert_matches;
-
 use either::{Left, Right};
 use rustc_abi::{Align, HasDataLayout, Size, TargetDataLayout};
-use rustc_errors::{DiagCtxtHandle, format_diag_message, msg};
 use rustc_hir::def_id::DefId;
 use rustc_hir::limit::Limit;
 use rustc_middle::mir::interpret::{ErrorHandled, InvalidMetaKind, ReportedErrorInfo};
@@ -12,9 +9,10 @@ use rustc_middle::ty::layout::{
     LayoutOfHelpers, TyAndLayout,
 };
 use rustc_middle::ty::{
-    self, GenericArgsRef, Ty, TyCtxt, TypeFoldable, TypeVisitableExt, TypingEnv, Variance,
+    self, GenericArgsRef, Ty, TyCtxt, TypeFoldable, TypeVisitableExt, TypingEnv, TypingMode,
+    Variance,
 };
-use rustc_middle::{mir, span_bug};
+use rustc_middle::{bug, mir, span_bug};
 use rustc_span::Span;
 use rustc_target::callconv::FnAbi;
 use tracing::{debug, trace};
@@ -22,9 +20,9 @@ use tracing::{debug, trace};
 use super::{
     Frame, FrameInfo, GlobalId, InterpErrorInfo, InterpErrorKind, InterpResult, MPlaceTy, Machine,
     MemPlaceMeta, Memory, OpTy, Place, PlaceTy, PointerArithmetic, Projectable, Provenance,
-    err_inval, interp_ok, throw_inval, throw_ub, throw_ub_custom,
+    err_inval, interp_ok, throw_inval, throw_ub, throw_ub_format,
 };
-use crate::{ReportErrorExt, enter_trace_span, util};
+use crate::{enter_trace_span, util};
 
 pub struct InterpCx<'tcx, M: Machine<'tcx>> {
     /// Stores the `Machine` instance.
@@ -108,8 +106,7 @@ impl<'tcx, M: Machine<'tcx>> LayoutOfHelpers<'tcx> for InterpCx<'tcx, M> {
             | LayoutError::SizeOverflow(_)
             | LayoutError::InvalidSimd { .. }
             | LayoutError::TooGeneric(_)
-            | LayoutError::ReferencesError(_)
-            | LayoutError::Cycle(_) => {}
+            | LayoutError::ReferencesError(_) => {}
         }
         err_inval!(Layout(err))
     }
@@ -228,17 +225,10 @@ pub(super) fn from_known_layout<'tcx>(
 ///
 /// This is NOT the preferred way to render an error; use `report` from `const_eval` instead.
 /// However, this is useful when error messages appear in ICEs.
-pub fn format_interp_error<'tcx>(dcx: DiagCtxtHandle<'_>, e: InterpErrorInfo<'tcx>) -> String {
+pub fn format_interp_error<'tcx>(e: InterpErrorInfo<'tcx>) -> String {
     let (e, backtrace) = e.into_parts();
     backtrace.print_backtrace();
-    // FIXME(fee1-dead), HACK: we want to use the error as title therefore we can just extract the
-    // label and arguments from the InterpError.
-    let mut diag = dcx.struct_allow("");
-    let msg = e.diagnostic_message();
-    e.add_args(&mut diag);
-    let msg = format_diag_message(&msg, &diag.args).into_owned();
-    diag.cancel();
-    msg
+    e.to_string()
 }
 
 impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
@@ -252,7 +242,18 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
         // opaque types. This is needed for trivial things like `size_of`, but also for using associated
         // types that are not specified in the opaque type. We also use MIR bodies whose opaque types have
         // already been revealed, so we'd be able to at least partially observe the hidden types anyways.
-        debug_assert_matches!(typing_env.typing_mode, ty::TypingMode::PostAnalysis);
+        if cfg!(debug_assertions) {
+            match typing_env.typing_mode() {
+                TypingMode::PostAnalysis => {}
+                TypingMode::Coherence
+                | TypingMode::Analysis { .. }
+                | TypingMode::Borrowck { .. }
+                | TypingMode::PostBorrowckAnalysis { .. } => {
+                    bug!("Const eval should always happens in PostAnalysis mode.");
+                }
+            }
+        }
+
         InterpCx {
             machine,
             tcx: tcx.at(root_span),
@@ -556,9 +557,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
             mir::UnwindAction::Cleanup(block) => Left(mir::Location { block, statement_index: 0 }),
             mir::UnwindAction::Continue => Right(self.frame_mut().body.span),
             mir::UnwindAction::Unreachable => {
-                throw_ub_custom!(msg!(
-                    "unwinding past a stack frame that does not allow unwinding"
-                ));
+                throw_ub_format!("unwinding past a stack frame that does not allow unwinding");
             }
             mir::UnwindAction::Terminate(reason) => {
                 self.frame_mut().loc = Right(self.frame_mut().body.span);

@@ -268,7 +268,7 @@ pub(crate) fn relevance_score(
                         hir::Adt::Union(it) => it.ty(ctx.db()),
                         hir::Adt::Enum(it) => it.ty(ctx.db()),
                     }),
-                    hir::ModuleDef::Variant(variant) => Some(variant.constructor_ty(ctx.db())),
+                    hir::ModuleDef::EnumVariant(variant) => Some(variant.constructor_ty(ctx.db())),
                     hir::ModuleDef::Const(it) => Some(it.ty(ctx.db())),
                     hir::ModuleDef::Static(it) => Some(it.ty(ctx.db())),
                     hir::ModuleDef::TypeAlias(it) => Some(it.ty(ctx.db())),
@@ -1927,5 +1927,34 @@ fn f() {
 }
         "#;
         check_auto_import_order(before, &["Import `foo::wanted`", "Import `quux::wanted`"]);
+    }
+
+    #[test]
+    fn consider_definition_kind() {
+        check_assist(
+            auto_import,
+            r#"
+//- /eyre.rs crate:eyre
+#[macro_export]
+macro_rules! eyre {
+    () => {};
+}
+
+//- /color-eyre.rs crate:color-eyre deps:eyre
+pub use eyre;
+
+//- /main.rs crate:main deps:color-eyre
+fn main() {
+    ey$0re!();
+}
+        "#,
+            r#"
+use color_eyre::eyre::eyre;
+
+fn main() {
+    eyre!();
+}
+        "#,
+        );
     }
 }

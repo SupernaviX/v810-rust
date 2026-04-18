@@ -14,7 +14,6 @@ use rustc_type_ir::{CollectAndApply, Interner, TypeFoldable, search_graph};
 
 use crate::dep_graph::{DepKind, DepNodeIndex};
 use crate::infer::canonical::CanonicalVarKinds;
-use crate::query::IntoQueryParam;
 use crate::traits::cache::WithDepNode;
 use crate::traits::solve::{
     self, CanonicalInput, ExternalConstraints, ExternalConstraintsData, QueryResult, inspect,
@@ -188,18 +187,17 @@ impl<'tcx> Interner for TyCtxt<'tcx> {
         self.adt_def(adt_def_id)
     }
 
-    fn alias_ty_kind(self, alias: ty::AliasTy<'tcx>) -> ty::AliasTyKind {
-        match self.def_kind(alias.def_id) {
-            DefKind::AssocTy => {
-                if let DefKind::Impl { of_trait: false } = self.def_kind(self.parent(alias.def_id))
-                {
-                    ty::Inherent
-                } else {
-                    ty::Projection
-                }
+    fn alias_ty_kind_from_def_id(self, def_id: DefId) -> ty::AliasTyKind<'tcx> {
+        match self.def_kind(def_id) {
+            DefKind::AssocTy
+                if let DefKind::Impl { of_trait: false } = self.def_kind(self.parent(def_id)) =>
+            {
+                ty::Inherent { def_id }
             }
-            DefKind::OpaqueTy => ty::Opaque,
-            DefKind::TyAlias => ty::Free,
+            DefKind::AssocTy => ty::Projection { def_id },
+
+            DefKind::OpaqueTy => ty::Opaque { def_id },
+            DefKind::TyAlias => ty::Free { def_id },
             kind => bug!("unexpected DefKind in AliasTy: {kind:?}"),
         }
     }
@@ -402,6 +400,11 @@ impl<'tcx> Interner for TyCtxt<'tcx> {
         self.is_conditionally_const(def_id)
     }
 
+    fn closure_is_const(self, def_id: DefId) -> bool {
+        debug_assert_matches!(self.def_kind(def_id), DefKind::Closure);
+        self.constness(def_id) == hir::Constness::Const
+    }
+
     fn alias_has_const_conditions(self, def_id: DefId) -> bool {
         debug_assert_matches!(self.def_kind(def_id), DefKind::AssocTy | DefKind::OpaqueTy);
         self.is_conditionally_const(def_id)
@@ -583,7 +586,7 @@ impl<'tcx> Interner for TyCtxt<'tcx> {
             //
             // Impls which apply to an alias after normalization are handled by
             // `assemble_candidates_after_normalizing_self_ty`.
-            ty::Alias(_, _) | ty::Placeholder(..) | ty::Error(_) => (),
+            ty::Alias(_) | ty::Placeholder(..) | ty::Error(_) => (),
 
             // FIXME: These should ideally not exist as a self type. It would be nice for
             // the builtin auto trait impls of coroutines to instead directly recurse
@@ -715,7 +718,6 @@ impl<'tcx> Interner for TyCtxt<'tcx> {
     }
 
     fn item_name(self, id: DefId) -> Symbol {
-        let id = id.into_query_param();
         self.opt_item_name(id).unwrap_or_else(|| {
             bug!("item_name: no name for {:?}", self.def_path(id));
         })

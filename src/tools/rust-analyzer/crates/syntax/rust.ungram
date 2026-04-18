@@ -126,9 +126,41 @@ MacroStmts =
 Attr =
   '#' '!'? '[' Meta ']'
 
+CfgAttrMeta =
+  'cfg_attr' '(' CfgPredicate ',' (Meta (',' Meta)* ','?) ')'
+
+CfgMeta =
+  'cfg' '(' CfgPredicate ','? ')'
+
+CfgPredicate =
+  CfgAtom
+| CfgComposite
+
+CfgAtom =
+  ('#ident' | 'true' | 'false') ('=' '@string')?
+
+CfgComposite =
+  keyword:'#ident' '(' (CfgPredicate (',' CfgPredicate)* ','?) ')'
+
 Meta =
-  'unsafe' '(' Path ('=' Expr | TokenTree)? ')'
-| Path ('=' Expr | TokenTree)?
+  CfgAttrMeta
+| CfgMeta
+| UnsafeMeta
+| PathMeta
+| KeyValueMeta
+| TokenTreeMeta
+
+UnsafeMeta =
+  'unsafe' '(' Meta ')'
+
+PathMeta =
+  Path
+
+KeyValueMeta =
+  Path '=' Expr
+
+TokenTreeMeta =
+  Path TokenTree
 
 //*************************//
 //          Items          //
@@ -245,7 +277,7 @@ RecordFieldList =
 
 RecordField =
   Attr* Visibility? 'unsafe'?
-  Name ':' Type ('=' Expr)?
+  Name ':' Type ('=' default_val:ConstArg)?
 
 TupleFieldList =
   '(' fields:(TupleField (',' TupleField)* ','?)? ')'
@@ -268,7 +300,7 @@ VariantList =
 
 Variant =
   Attr* Visibility?
-  Name FieldList? ('=' Expr)?
+  Name FieldList? ('=' ConstArg)?
 
 Union =
   Attr* Visibility?

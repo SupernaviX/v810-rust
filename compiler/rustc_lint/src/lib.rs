@@ -129,7 +129,7 @@ use unused::*;
 #[rustfmt::skip]
 pub use builtin::{MissingDoc, SoftLints};
 pub use context::{CheckLintNameResult, EarlyContext, LateContext, LintContext, LintStore};
-pub use early::diagnostics::{DecorateAttrLint, DecorateBuiltinLint};
+pub use early::diagnostics::{DecorateAttrLint, DiagAndSess};
 pub use early::{EarlyCheckNode, check_ast_node};
 pub use late::{check_crate, late_lint_mod, unerased_lint_store};
 pub use levels::LintLevelsBuilder;
@@ -642,6 +642,7 @@ fn register_builtins(store: &mut LintStore) {
          see <https://github.com/rust-lang/rust/issues/40107> for more information",
     );
     store.register_removed("wasm_c_abi", "the wasm C ABI has been fixed");
+    store.register_removed("soft_unstable", "the general soft-unstable mechanism has been removed");
 }
 
 fn register_internals(store: &mut LintStore) {
@@ -667,6 +668,8 @@ fn register_internals(store: &mut LintStore) {
     store.register_early_pass(|| Box::new(ImplicitSysrootCrateImport));
     store.register_lints(&BadUseOfFindAttr::lint_vec());
     store.register_early_pass(|| Box::new(BadUseOfFindAttr));
+    store.register_lints(&RustcMustMatchExhaustively::lint_vec());
+    store.register_late_pass(|_| Box::new(RustcMustMatchExhaustively));
     store.register_group(
         false,
         "rustc::internal",
@@ -687,6 +690,7 @@ fn register_internals(store: &mut LintStore) {
             LintId::of(DIRECT_USE_OF_RUSTC_TYPE_IR),
             LintId::of(IMPLICIT_SYSROOT_CRATE_IMPORT),
             LintId::of(BAD_USE_OF_FIND_ATTR),
+            LintId::of(RUSTC_MUST_MATCH_EXHAUSTIVELY),
         ],
     );
 }

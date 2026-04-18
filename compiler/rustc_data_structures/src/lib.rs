@@ -25,6 +25,8 @@
 #![feature(min_specialization)]
 #![feature(negative_impls)]
 #![feature(never_type)]
+#![feature(pattern_type_macro)]
+#![feature(pattern_types)]
 #![feature(ptr_alignment_type)]
 #![feature(rustc_attrs)]
 #![feature(sized_hierarchy)]
@@ -78,7 +80,6 @@ pub mod svh;
 pub mod sync;
 pub mod tagged_ptr;
 pub mod temp_dir;
-pub mod thinvec;
 pub mod thousands;
 pub mod transitive_relation;
 pub mod unhash;

@@ -318,6 +318,14 @@ pub(crate) struct ConstParamTyImplOnNonAdt {
 }
 
 #[derive(Diagnostic)]
+#[diag("the trait `ConstParamTy` may not be implemented for this struct")]
+pub(crate) struct ConstParamTyFieldVisMismatch {
+    #[primary_span]
+    #[label("struct fields are less visible than the struct")]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
 #[diag("at least one trait is required for an object type", code = E0224)]
 pub(crate) struct TraitObjectDeclaredWithNoTraits {
     #[primary_span]
@@ -1025,6 +1033,16 @@ pub(crate) struct TooLargeStatic {
 pub(crate) struct SpecializationTrait {
     #[primary_span]
     pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag("trait cannot be implemented outside `{$restriction_path}`")]
+pub(crate) struct ImplOfRestrictedTrait {
+    #[primary_span]
+    pub impl_span: Span,
+    #[note("trait restricted here")]
+    pub restriction_span: Span,
+    pub restriction_path: String,
 }
 
 #[derive(Diagnostic)]
@@ -1807,6 +1825,13 @@ pub(crate) struct CmseImplTrait {
 pub(crate) struct BadReturnTypeNotation {
     #[primary_span]
     pub span: Span,
+    #[suggestion(
+        "furthermore, argument types not allowed with return type notation",
+        applicability = "maybe-incorrect",
+        code = "(..)",
+        style = "verbose"
+    )]
+    pub suggestion: Option<Span>,
 }
 
 #[derive(Diagnostic)]
@@ -1907,4 +1932,29 @@ pub(crate) struct ImplUnpinForPinProjectedType {
     #[help("`{$adt_name}` is structurally pinned because it is marked as `#[pin_v2]`")]
     pub adt_span: Span,
     pub adt_name: Symbol,
+}
+
+#[derive(Diagnostic)]
+#[diag("`#[{$eii_name}]` must be used on a {$expected_kind}")]
+pub(crate) struct EiiDefkindMismatch {
+    #[primary_span]
+    pub span: Span,
+    pub eii_name: Symbol,
+    pub expected_kind: &'static str,
+}
+
+#[derive(Diagnostic)]
+#[diag("mutability does not match with the definition of`#[{$eii_name}]`")]
+pub(crate) struct EiiDefkindMismatchStaticMutability {
+    #[primary_span]
+    pub span: Span,
+    pub eii_name: Symbol,
+}
+
+#[derive(Diagnostic)]
+#[diag("safety does not match with the definition of`#[{$eii_name}]`")]
+pub(crate) struct EiiDefkindMismatchStaticSafety {
+    #[primary_span]
+    pub span: Span,
+    pub eii_name: Symbol,
 }

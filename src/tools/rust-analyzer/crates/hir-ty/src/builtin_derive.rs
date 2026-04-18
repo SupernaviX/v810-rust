@@ -80,7 +80,7 @@ pub(crate) fn generics_of<'db>(interner: DbInterner<'db>, id: BuiltinDeriveImplI
 
 pub fn generic_params_count(db: &dyn HirDatabase, id: BuiltinDeriveImplId) -> usize {
     let loc = id.loc(db);
-    let adt_params = GenericParams::new(db, loc.adt.into());
+    let adt_params = GenericParams::of(db, loc.adt.into());
     let extra_params_count = match loc.trait_ {
         BuiltinDeriveImplTrait::Copy
         | BuiltinDeriveImplTrait::Clone
@@ -128,12 +128,12 @@ pub fn impl_trait<'db>(
             ))
         }
         BuiltinDeriveImplTrait::CoerceUnsized | BuiltinDeriveImplTrait::DispatchFromDyn => {
-            let generic_params = GenericParams::new(db, loc.adt.into());
+            let generic_params = GenericParams::of(db, loc.adt.into());
             let interner = DbInterner::new_no_crate(db);
             let args = GenericArgs::identity_for_item(interner, loc.adt.into());
             let self_ty = Ty::new_adt(interner, loc.adt, args);
             let Some((pointee_param_idx, _, new_param_ty)) =
-                coerce_pointee_params(interner, loc, &generic_params, trait_id)
+                coerce_pointee_params(interner, loc, generic_params, trait_id)
             else {
                 // Malformed derive.
                 return EarlyBinder::bind(TraitRef::new(
@@ -152,7 +152,7 @@ pub fn impl_trait<'db>(
 #[salsa::tracked(returns(ref))]
 pub fn predicates<'db>(db: &'db dyn HirDatabase, impl_: BuiltinDeriveImplId) -> GenericPredicates {
     let loc = impl_.loc(db);
-    let generic_params = GenericParams::new(db, loc.adt.into());
+    let generic_params = GenericParams::of(db, loc.adt.into());
     let interner = DbInterner::new_with(db, loc.module(db).krate(db));
     let adt_predicates = GenericPredicates::query(db, loc.adt.into());
     let trait_id = loc
@@ -168,22 +168,25 @@ pub fn predicates<'db>(db: &'db dyn HirDatabase, impl_: BuiltinDeriveImplId) -> 
         | BuiltinDeriveImplTrait::PartialOrd
         | BuiltinDeriveImplTrait::Eq
         | BuiltinDeriveImplTrait::PartialEq => {
-            simple_trait_predicates(interner, loc, &generic_params, adt_predicates, trait_id)
+            simple_trait_predicates(interner, loc, generic_params, adt_predicates, trait_id)
         }
         BuiltinDeriveImplTrait::Default => {
             if matches!(loc.adt, AdtId::EnumId(_)) {
                 // Enums don't have extra bounds.
                 GenericPredicates::from_explicit_own_predicates(StoredEarlyBinder::bind(
-                    Clauses::new_from_slice(adt_predicates.explicit_predicates().skip_binder())
-                        .store(),
+                    Clauses::new_from_iter(
+                        interner,
+                        adt_predicates.own_explicit_predicates().skip_binder(),
+                    )
+                    .store(),
                 ))
             } else {
-                simple_trait_predicates(interner, loc, &generic_params, adt_predicates, trait_id)
+                simple_trait_predicates(interner, loc, generic_params, adt_predicates, trait_id)
             }
         }
         BuiltinDeriveImplTrait::CoerceUnsized | BuiltinDeriveImplTrait::DispatchFromDyn => {
             let Some((pointee_param_idx, pointee_param_id, new_param_ty)) =
-                coerce_pointee_params(interner, loc, &generic_params, trait_id)
+                coerce_pointee_params(interner, loc, generic_params, trait_id)
             else {
                 // Malformed derive.
                 return GenericPredicates::from_explicit_own_predicates(StoredEarlyBinder::bind(
@@ -191,7 +194,7 @@ pub fn predicates<'db>(db: &'db dyn HirDatabase, impl_: BuiltinDeriveImplId) -> 
                 ));
             };
             let duplicated_bounds =
-                adt_predicates.explicit_predicates().iter_identity_copied().filter_map(|pred| {
+                adt_predicates.explicit_predicates().iter_identity().filter_map(|pred| {
                     let mentions_pointee =
                         pred.visit_with(&mut MentionsPointee { pointee_param_idx }).is_break();
                     if !mentions_pointee {
@@ -212,7 +215,7 @@ pub fn predicates<'db>(db: &'db dyn HirDatabase, impl_: BuiltinDeriveImplId) -> 
                     interner,
                     adt_predicates
                         .explicit_predicates()
-                        .iter_identity_copied()
+                        .iter_identity()
                         .chain(duplicated_bounds)
                         .chain(unsize_bound),
                 )
@@ -313,7 +316,7 @@ fn simple_trait_predicates<'db>(
             interner,
             adt_predicates
                 .explicit_predicates()
-                .iter_identity_copied()
+                .iter_identity()
                 .chain(extra_predicates)
                 .chain(assoc_type_bounds),
         )
@@ -440,7 +443,7 @@ mod tests {
                     format_to!(
                         predicates,
                         "{}\n\n",
-                        preds.iter().format_with("\n", |pred, formatter| formatter(&format_args!(
+                        preds.format_with("\n", |pred, formatter| formatter(&format_args!(
                             "{pred:?}"
                         ))),
                     );

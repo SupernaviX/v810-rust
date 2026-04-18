@@ -1,5 +1,5 @@
 /*
- * TODO(antoyo): implement equality in libgccjit based on https://zpz.github.io/blog/overloading-equality-operator-in-cpp-class-hierarchy/ (for type equality?)
+ * FIXME(antoyo): implement equality in libgccjit based on https://zpz.github.io/blog/overloading-equality-operator-in-cpp-class-hierarchy/ (for type equality?)
  * For Thin LTO, this might be helpful:
 // cspell:disable-next-line
  * In gcc 4.6 -fwhopr was removed and became default with -flto. The non-whopr path can still be executed via -flto-partition=none.
@@ -8,9 +8,9 @@
  * Maybe some missing optimizations enabled by rustc's LTO is in there: https://gcc.gnu.org/onlinedocs/gcc/Optimize-Options.html
 // cspell:disable-next-line
  * Like -fipa-icf (should be already enabled) and maybe -fdevirtualize-at-ltrans.
- * TODO: disable debug info always being emitted. Perhaps this slows down things?
+ * FIXME: disable debug info always being emitted. Perhaps this slows down things?
  *
- * TODO(antoyo): remove the patches.
+ * FIXME(antoyo): remove the patches.
  */
 
 #![feature(rustc_private)]
@@ -81,9 +81,9 @@ use gccjit::{CType, Context, OptimizationLevel};
 #[cfg(feature = "master")]
 use gccjit::{TargetInfo, Version};
 use rustc_ast::expand::allocator::AllocatorMethod;
-use rustc_codegen_ssa::back::lto::{SerializedModule, ThinModule};
+use rustc_codegen_ssa::back::lto::ThinModule;
 use rustc_codegen_ssa::back::write::{
-    CodegenContext, FatLtoInput, ModuleConfig, SharedEmitter, TargetMachineFactoryFn,
+    CodegenContext, FatLtoInput, ModuleConfig, SharedEmitter, TargetMachineFactoryFn, ThinLtoInput,
 };
 use rustc_codegen_ssa::base::codegen_crate;
 use rustc_codegen_ssa::target_features::cfg_target_feature;
@@ -328,7 +328,7 @@ fn new_context<'gcc, 'tcx>(tcx: TyCtxt<'tcx>) -> Context<'gcc> {
             version,
         ));
     }
-    // TODO(antoyo): check if this should only be added when using -Cforce-unwind-tables=n.
+    // FIXME(antoyo): check if this should only be added when using -Cforce-unwind-tables=n.
     context.add_command_line_option("-fno-asynchronous-unwind-tables");
     context
 }
@@ -425,7 +425,7 @@ impl WriteBackendMethods for GccCodegenBackend {
         _opt_level: OptLevel,
         _features: &[String],
     ) -> TargetMachineFactoryFn<Self> {
-        // TODO(antoyo): set opt level.
+        // FIXME(antoyo): set opt level.
         Arc::new(|_, _| ())
     }
 
@@ -449,8 +449,7 @@ impl WriteBackendMethods for GccCodegenBackend {
         // FIXME(bjorn3): Limit LTO exports to these symbols
         _exported_symbols_for_lto: &[String],
         _each_linked_rlib_for_lto: &[PathBuf],
-        _modules: Vec<(String, Self::ModuleBuffer)>,
-        _cached_modules: Vec<(SerializedModule<Self::ModuleBuffer>, WorkProduct)>,
+        _modules: Vec<ThinLtoInput<Self>>,
     ) -> (Vec<ThinModule<Self>>, Vec<WorkProduct>) {
         unreachable!()
     }
@@ -531,7 +530,7 @@ fn target_config(sess: &Session, target_info: &LockedTargetInfo) -> TargetConfig
         sess,
         |feature| to_gcc_features(sess, feature),
         |feature| {
-            // TODO: we disable Neon for now since we don't support the LLVM intrinsics for it.
+            // FIXME: we disable Neon for now since we don't support the LLVM intrinsics for it.
             if feature == "neon" {
                 return false;
             }

@@ -1,12 +1,11 @@
 use rustc_errors::codes::*;
 use rustc_errors::formatting::DiagMessageAddArg;
 use rustc_errors::{
-    Applicability, Diag, DiagCtxtHandle, DiagMessage, Diagnostic, ElidedLifetimeInPathSubdiag,
+    Applicability, Diag, DiagArgValue, DiagCtxtHandle, Diagnostic, ElidedLifetimeInPathSubdiag,
     EmissionGuarantee, IntoDiagArg, Level, MultiSpan, Subdiagnostic, msg,
 };
 use rustc_macros::{Diagnostic, Subdiagnostic};
-use rustc_span::source_map::Spanned;
-use rustc_span::{Ident, Span, Symbol};
+use rustc_span::{Ident, Span, Spanned, Symbol};
 
 use crate::Res;
 use crate::late::PatternSource;
@@ -408,7 +407,7 @@ pub(crate) struct SelfInConstGenericTy {
 
 #[derive(Diagnostic)]
 #[diag(
-    "{$is_ogca ->
+    "{$is_gca ->
     [true] generic parameters in const blocks are only allowed as the direct value of a `type const`
     *[false] generic parameters may not be used in const operations
 }"
@@ -422,11 +421,11 @@ pub(crate) struct ParamInNonTrivialAnonConst {
     pub(crate) param_kind: ParamKindInNonTrivialAnonConst,
     #[help("add `#![feature(generic_const_exprs)]` to allow generic const expressions")]
     pub(crate) help: bool,
-    pub(crate) is_ogca: bool,
+    pub(crate) is_gca: bool,
     #[help(
         "consider factoring the expression into a `type const` item and use it as the const argument instead"
     )]
-    pub(crate) help_ogca: bool,
+    pub(crate) help_gca: bool,
 }
 
 #[derive(Debug)]
@@ -560,6 +559,10 @@ pub(crate) struct ExpectedModuleFound {
 #[derive(Diagnostic)]
 #[diag("cannot determine resolution for the visibility", code = E0578)]
 pub(crate) struct Indeterminate(#[primary_span] pub(crate) Span);
+
+#[derive(Diagnostic)]
+#[diag("trait implementation can only be restricted to ancestor modules")]
+pub(crate) struct RestrictionAncestorOnly(#[primary_span] pub(crate) Span);
 
 #[derive(Diagnostic)]
 #[diag("cannot use a tool module through an import")]
@@ -885,6 +888,21 @@ pub(crate) struct UnexpectedResChangeTyToConstParamSugg {
 }
 
 #[derive(Subdiagnostic)]
+#[suggestion(
+    "you might have meant to introduce a const parameter `{$item_name}` on the {$item_location}",
+    code = "{snippet}",
+    applicability = "machine-applicable",
+    style = "verbose"
+)]
+pub(crate) struct UnexpectedMissingConstParameter {
+    #[primary_span]
+    pub span: Span,
+    pub snippet: String,
+    pub item_name: String,
+    pub item_location: String,
+}
+
+#[derive(Subdiagnostic)]
 #[multipart_suggestion(
     "you might have meant to write a const parameter here",
     applicability = "has-placeholders",
@@ -1181,6 +1199,15 @@ pub(crate) struct AttributesStartingWithRustcAreReserved {
 }
 
 #[derive(Diagnostic)]
+#[diag(
+    "attributes containing a segment starting with `rustc` are reserved for use by the `rustc` compiler"
+)]
+pub(crate) struct AttributesContainingRustcAreReserved {
+    #[primary_span]
+    pub(crate) span: Span,
+}
+
+#[derive(Diagnostic)]
 #[diag("cannot use {$article} {$descr} through an import")]
 pub(crate) struct CannotUseThroughAnImport {
     #[primary_span]
@@ -1454,17 +1481,6 @@ pub(crate) struct MacroRuleNeverUsed {
     pub name: Symbol,
 }
 
-pub(crate) struct UnstableFeature {
-    pub msg: DiagMessage,
-}
-
-impl<'a> Diagnostic<'a, ()> for UnstableFeature {
-    fn into_diag(self, dcx: DiagCtxtHandle<'a>, level: Level) -> Diag<'a, ()> {
-        let Self { msg } = self;
-        Diag::new(dcx, level, msg)
-    }
-}
-
 #[derive(Diagnostic)]
 #[diag("`extern crate` is not idiomatic in the new edition")]
 pub(crate) struct ExternCrateNotIdiomatic {
@@ -1505,20 +1521,24 @@ pub(crate) struct RedundantImportVisibility {
 #[diag("unknown diagnostic attribute")]
 pub(crate) struct UnknownDiagnosticAttribute {
     #[subdiagnostic]
-    pub typo: Option<UnknownDiagnosticAttributeTypoSugg>,
+    pub help: Option<UnknownDiagnosticAttributeHelp>,
 }
 
 #[derive(Subdiagnostic)]
-#[suggestion(
-    "an attribute with a similar name exists",
-    style = "verbose",
-    code = "{typo_name}",
-    applicability = "machine-applicable"
-)]
-pub(crate) struct UnknownDiagnosticAttributeTypoSugg {
-    #[primary_span]
-    pub span: Span,
-    pub typo_name: Symbol,
+pub(crate) enum UnknownDiagnosticAttributeHelp {
+    #[suggestion(
+        "an attribute with a similar name exists",
+        style = "verbose",
+        code = "{typo_name}",
+        applicability = "machine-applicable"
+    )]
+    Typo {
+        #[primary_span]
+        span: Span,
+        typo_name: Symbol,
+    },
+    #[help("add `#![feature({$feature})]` to the crate attributes to enable")]
+    UseFeature { feature: Symbol },
 }
 
 // FIXME: Make this properly translatable.
@@ -1575,4 +1595,203 @@ impl<'a, G: EmissionGuarantee> Diagnostic<'a, G> for Ambiguity {
         }
         diag
     }
+}
+
+#[derive(Diagnostic)]
+#[diag("lifetime parameter `{$ident}` never used")]
+pub(crate) struct UnusedLifetime {
+    #[suggestion("elide the unused lifetime", code = "", applicability = "machine-applicable")]
+    pub deletion_span: Option<Span>,
+
+    pub ident: Ident,
+}
+
+#[derive(Diagnostic)]
+#[diag("ambiguous glob re-exports")]
+pub(crate) struct AmbiguousGlobReexports {
+    #[label("the name `{$name}` in the {$namespace} namespace is first re-exported here")]
+    pub first_reexport: Span,
+    #[label("but the name `{$name}` in the {$namespace} namespace is also re-exported here")]
+    pub duplicate_reexport: Span,
+
+    pub name: String,
+    pub namespace: String,
+}
+
+#[derive(Diagnostic)]
+#[diag("private item shadows public glob re-export")]
+pub(crate) struct HiddenGlobReexports {
+    #[note(
+        "the name `{$name}` in the {$namespace} namespace is supposed to be publicly re-exported here"
+    )]
+    pub glob_reexport: Span,
+    #[note("but the private item here shadows it")]
+    pub private_item: Span,
+
+    pub name: String,
+    pub namespace: String,
+}
+
+#[derive(Diagnostic)]
+#[diag("the item `{$ident}` is imported redundantly")]
+pub(crate) struct RedundantImport {
+    #[subdiagnostic]
+    pub subs: Vec<RedundantImportSub>,
+    pub ident: Ident,
+}
+
+#[derive(Subdiagnostic)]
+pub(crate) enum RedundantImportSub {
+    #[label("the item `{$ident}` is already imported here")]
+    ImportedHere {
+        #[primary_span]
+        span: Span,
+        ident: Ident,
+    },
+    #[label("the item `{$ident}` is already defined here")]
+    DefinedHere {
+        #[primary_span]
+        span: Span,
+        ident: Ident,
+    },
+    #[label("the item `{$ident}` is already imported by the extern prelude")]
+    ImportedPrelude {
+        #[primary_span]
+        span: Span,
+        ident: Ident,
+    },
+    #[label("the item `{$ident}` is already defined by the extern prelude")]
+    DefinedPrelude {
+        #[primary_span]
+        span: Span,
+        ident: Ident,
+    },
+}
+
+#[derive(Diagnostic)]
+#[diag("unnecessary qualification")]
+pub(crate) struct UnusedQualifications {
+    #[suggestion(
+        "remove the unnecessary path segments",
+        style = "verbose",
+        code = "",
+        applicability = "machine-applicable"
+    )]
+    pub removal_span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(
+    "{$elided ->
+        [true] `&` without an explicit lifetime name cannot be used here
+        *[false] `'_` cannot be used here
+    }"
+)]
+pub(crate) struct AssociatedConstElidedLifetime {
+    #[suggestion(
+        "use the `'static` lifetime",
+        style = "verbose",
+        code = "{code}",
+        applicability = "machine-applicable"
+    )]
+    pub span: Span,
+
+    pub code: &'static str,
+    pub elided: bool,
+    #[note("cannot automatically infer `'static` because of other lifetimes in scope")]
+    pub lifetimes_in_scope: MultiSpan,
+}
+
+#[derive(Diagnostic)]
+#[diag("lifetime parameter `{$ident}` only used once")]
+pub(crate) struct SingleUseLifetime {
+    #[label("this lifetime...")]
+    pub param_span: Span,
+    #[label("...is used only here")]
+    pub use_span: Span,
+    #[subdiagnostic]
+    pub suggestion: Option<SingleUseLifetimeSugg>,
+
+    pub ident: Ident,
+}
+
+#[derive(Subdiagnostic)]
+#[multipart_suggestion("elide the single-use lifetime", applicability = "machine-applicable")]
+pub(crate) struct SingleUseLifetimeSugg {
+    #[suggestion_part(code = "")]
+    pub deletion_span: Option<Span>,
+    #[suggestion_part(code = "{replace_lt}")]
+    pub use_span: Span,
+
+    pub replace_lt: String,
+}
+
+#[derive(Diagnostic)]
+#[diag(
+    "absolute paths must start with `self`, `super`, `crate`, or an external crate name in the 2018 edition"
+)]
+pub(crate) struct AbsPathWithModule {
+    #[subdiagnostic]
+    pub sugg: AbsPathWithModuleSugg,
+}
+
+#[derive(Subdiagnostic)]
+#[suggestion("use `crate`", code = "{replacement}")]
+pub(crate) struct AbsPathWithModuleSugg {
+    #[primary_span]
+    pub span: Span,
+    #[applicability]
+    pub applicability: Applicability,
+    pub replacement: String,
+}
+
+#[derive(Diagnostic)]
+#[diag("hidden lifetime parameters in types are deprecated")]
+pub(crate) struct ElidedLifetimesInPaths {
+    #[subdiagnostic]
+    pub subdiag: rustc_errors::ElidedLifetimeInPathSubdiag,
+}
+
+#[derive(Diagnostic)]
+#[diag(
+    "{$num_snippets ->
+        [one] unused import: {$span_snippets}
+        *[other] unused imports: {$span_snippets}
+    }"
+)]
+pub(crate) struct UnusedImports {
+    #[subdiagnostic]
+    pub sugg: UnusedImportsSugg,
+    #[help("if this is a test module, consider adding a `#[cfg(test)]` to the containing module")]
+    pub test_module_span: Option<Span>,
+
+    pub span_snippets: DiagArgValue,
+    pub num_snippets: usize,
+}
+
+#[derive(Subdiagnostic)]
+pub(crate) enum UnusedImportsSugg {
+    #[suggestion(
+        "remove the whole `use` item",
+        applicability = "machine-applicable",
+        code = "",
+        style = "tool-only"
+    )]
+    RemoveWholeUse {
+        #[primary_span]
+        span: Span,
+    },
+    #[multipart_suggestion(
+        "{$num_to_remove ->
+            [one] remove the unused import
+            *[other] remove the unused imports
+        }",
+        applicability = "machine-applicable",
+        style = "tool-only"
+    )]
+    RemoveImports {
+        #[suggestion_part(code = "")]
+        remove_spans: Vec<Span>,
+        num_to_remove: usize,
+    },
 }

@@ -232,14 +232,13 @@ macro_rules! uint_impl {
         /// # Examples
         ///
         /// ```
-        /// #![feature(uint_bit_width)]
-        ///
         #[doc = concat!("assert_eq!(0_", stringify!($SelfT), ".bit_width(), 0);")]
         #[doc = concat!("assert_eq!(0b111_", stringify!($SelfT), ".bit_width(), 3);")]
         #[doc = concat!("assert_eq!(0b1110_", stringify!($SelfT), ".bit_width(), 4);")]
         #[doc = concat!("assert_eq!(", stringify!($SelfT), "::MAX.bit_width(), ", stringify!($BITS), ");")]
         /// ```
-        #[unstable(feature = "uint_bit_width", issue = "142326")]
+        #[stable(feature = "uint_bit_width", since = "CURRENT_RUSTC_VERSION")]
+        #[rustc_const_stable(feature = "uint_bit_width", since = "CURRENT_RUSTC_VERSION")]
         #[must_use = "this returns the result of the operation, \
                       without modifying the original"]
         #[inline(always)]
@@ -253,14 +252,13 @@ macro_rules! uint_impl {
         /// # Examples
         ///
         /// ```
-        /// #![feature(isolate_most_least_significant_one)]
-        ///
         #[doc = concat!("let n: ", stringify!($SelfT), " = 0b_01100100;")]
         ///
         /// assert_eq!(n.isolate_highest_one(), 0b_01000000);
         #[doc = concat!("assert_eq!(0_", stringify!($SelfT), ".isolate_highest_one(), 0);")]
         /// ```
-        #[unstable(feature = "isolate_most_least_significant_one", issue = "136909")]
+        #[stable(feature = "isolate_most_least_significant_one", since = "CURRENT_RUSTC_VERSION")]
+        #[rustc_const_stable(feature = "isolate_most_least_significant_one", since = "CURRENT_RUSTC_VERSION")]
         #[must_use = "this returns the result of the operation, \
                       without modifying the original"]
         #[inline(always)]
@@ -274,14 +272,13 @@ macro_rules! uint_impl {
         /// # Examples
         ///
         /// ```
-        /// #![feature(isolate_most_least_significant_one)]
-        ///
         #[doc = concat!("let n: ", stringify!($SelfT), " = 0b_01100100;")]
         ///
         /// assert_eq!(n.isolate_lowest_one(), 0b_00000100);
         #[doc = concat!("assert_eq!(0_", stringify!($SelfT), ".isolate_lowest_one(), 0);")]
         /// ```
-        #[unstable(feature = "isolate_most_least_significant_one", issue = "136909")]
+        #[stable(feature = "isolate_most_least_significant_one", since = "CURRENT_RUSTC_VERSION")]
+        #[rustc_const_stable(feature = "isolate_most_least_significant_one", since = "CURRENT_RUSTC_VERSION")]
         #[must_use = "this returns the result of the operation, \
                       without modifying the original"]
         #[inline(always)]
@@ -295,14 +292,13 @@ macro_rules! uint_impl {
         /// # Examples
         ///
         /// ```
-        /// #![feature(int_lowest_highest_one)]
-        ///
         #[doc = concat!("assert_eq!(0b0_", stringify!($SelfT), ".highest_one(), None);")]
         #[doc = concat!("assert_eq!(0b1_", stringify!($SelfT), ".highest_one(), Some(0));")]
         #[doc = concat!("assert_eq!(0b1_0000_", stringify!($SelfT), ".highest_one(), Some(4));")]
         #[doc = concat!("assert_eq!(0b1_1111_", stringify!($SelfT), ".highest_one(), Some(4));")]
         /// ```
-        #[unstable(feature = "int_lowest_highest_one", issue = "145203")]
+        #[stable(feature = "int_lowest_highest_one", since = "CURRENT_RUSTC_VERSION")]
+        #[rustc_const_stable(feature = "int_lowest_highest_one", since = "CURRENT_RUSTC_VERSION")]
         #[must_use = "this returns the result of the operation, \
                       without modifying the original"]
         #[inline(always)]
@@ -319,14 +315,13 @@ macro_rules! uint_impl {
         /// # Examples
         ///
         /// ```
-        /// #![feature(int_lowest_highest_one)]
-        ///
         #[doc = concat!("assert_eq!(0b0_", stringify!($SelfT), ".lowest_one(), None);")]
         #[doc = concat!("assert_eq!(0b1_", stringify!($SelfT), ".lowest_one(), Some(0));")]
         #[doc = concat!("assert_eq!(0b1_0000_", stringify!($SelfT), ".lowest_one(), Some(4));")]
         #[doc = concat!("assert_eq!(0b1_1111_", stringify!($SelfT), ".lowest_one(), Some(0));")]
         /// ```
-        #[unstable(feature = "int_lowest_highest_one", issue = "145203")]
+        #[stable(feature = "int_lowest_highest_one", since = "CURRENT_RUSTC_VERSION")]
+        #[rustc_const_stable(feature = "int_lowest_highest_one", since = "CURRENT_RUSTC_VERSION")]
         #[must_use = "this returns the result of the operation, \
                       without modifying the original"]
         #[inline(always)]
@@ -447,7 +442,7 @@ macro_rules! uint_impl {
         pub const fn funnel_shl(self, rhs: Self, n: u32) -> Self {
             assert!(n < Self::BITS, "attempt to funnel shift left with overflow");
             // SAFETY: just checked that `shift` is in-range
-            unsafe { intrinsics::unchecked_funnel_shl(self, rhs, n) }
+            unsafe { self.unchecked_funnel_shl(rhs, n) }
         }
 
         /// Performs a right funnel shift (concatenates `self` and `rhs`, with `self`
@@ -482,7 +477,61 @@ macro_rules! uint_impl {
         pub const fn funnel_shr(self, rhs: Self, n: u32) -> Self {
             assert!(n < Self::BITS, "attempt to funnel shift right with overflow");
             // SAFETY: just checked that `shift` is in-range
-            unsafe { intrinsics::unchecked_funnel_shr(self, rhs, n) }
+            unsafe { self.unchecked_funnel_shr(rhs, n) }
+        }
+
+        /// Unchecked funnel shift left.
+        ///
+        /// # Safety
+        ///
+        /// This results in undefined behavior if `n` is greater than or equal to
+        #[doc = concat!("`", stringify!($SelfT) , "::BITS`,")]
+        /// i.e. when [`funnel_shl`](Self::funnel_shl) would panic.
+        ///
+        #[rustc_const_unstable(feature = "funnel_shifts", issue = "145686")]
+        #[unstable(feature = "funnel_shifts", issue = "145686")]
+        #[must_use = "this returns the result of the operation, \
+                      without modifying the original"]
+        #[inline(always)]
+        #[track_caller]
+        pub const unsafe fn unchecked_funnel_shl(self, low: Self, n: u32) -> Self {
+            assert_unsafe_precondition!(
+                check_language_ub,
+                concat!(stringify!($SelfT), "::unchecked_funnel_shl cannot overflow"),
+                (n: u32 = n) => n < <$ActualT>::BITS,
+            );
+
+            // SAFETY: this is guaranteed to be safe by the caller.
+            unsafe {
+                intrinsics::unchecked_funnel_shl(self, low, n)
+            }
+        }
+
+        /// Unchecked funnel shift right.
+        ///
+        /// # Safety
+        ///
+        /// This results in undefined behavior if `n` is greater than or equal to
+        #[doc = concat!("`", stringify!($SelfT) , "::BITS`,")]
+        /// i.e. when [`funnel_shr`](Self::funnel_shr) would panic.
+        ///
+        #[rustc_const_unstable(feature = "funnel_shifts", issue = "145686")]
+        #[unstable(feature = "funnel_shifts", issue = "145686")]
+        #[must_use = "this returns the result of the operation, \
+                      without modifying the original"]
+        #[inline(always)]
+        #[track_caller]
+        pub const unsafe fn unchecked_funnel_shr(self, low: Self, n: u32) -> Self {
+            assert_unsafe_precondition!(
+                check_language_ub,
+                concat!(stringify!($SelfT), "::unchecked_funnel_shr cannot overflow"),
+                (n: u32 = n) => n < <$ActualT>::BITS,
+            );
+
+            // SAFETY: this is guaranteed to be safe by the caller.
+            unsafe {
+                intrinsics::unchecked_funnel_shr(self, low, n)
+            }
         }
 
         /// Performs a carry-less multiplication, returning the lower bits.
@@ -4053,5 +4102,83 @@ macro_rules! uint_impl {
         #[deprecated(since = "TBD", note = "replaced by the `MAX` associated constant on this type")]
         #[rustc_diagnostic_item = concat!(stringify!($SelfT), "_legacy_fn_max_value")]
         pub const fn max_value() -> Self { Self::MAX }
+
+        /// Truncate an integer to an integer of the same size or smaller, preserving the least
+        /// significant bits.
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// #![feature(integer_extend_truncate)]
+        #[doc = concat!("assert_eq!(120u8, 120", stringify!($SelfT), ".truncate());")]
+        /// assert_eq!(120u8, 376u32.truncate());
+        /// ```
+        #[must_use = "this returns the truncated value and does not modify the original"]
+        #[unstable(feature = "integer_extend_truncate", issue = "154330")]
+        #[rustc_const_unstable(feature = "integer_extend_truncate", issue = "154330")]
+        #[inline]
+        pub const fn truncate<Target>(self) -> Target
+            where Self: [const] traits::TruncateTarget<Target>
+        {
+            traits::TruncateTarget::internal_truncate(self)
+        }
+
+        /// Truncate an integer to an integer of the same size or smaller, saturating at numeric bounds
+        /// instead of truncating.
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// #![feature(integer_extend_truncate)]
+        #[doc = concat!("assert_eq!(120u8, 120", stringify!($SelfT), ".saturating_truncate());")]
+        /// assert_eq!(255u8, 376u32.saturating_truncate());
+        /// ```
+        #[must_use = "this returns the truncated value and does not modify the original"]
+        #[unstable(feature = "integer_extend_truncate", issue = "154330")]
+        #[rustc_const_unstable(feature = "integer_extend_truncate", issue = "154330")]
+        #[inline]
+        pub const fn saturating_truncate<Target>(self) -> Target
+            where Self: [const] traits::TruncateTarget<Target>
+        {
+            traits::TruncateTarget::internal_saturating_truncate(self)
+        }
+
+        /// Truncate an integer to an integer of the same size or smaller, returning `None` if the value
+        /// is outside the bounds of the smaller type.
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// #![feature(integer_extend_truncate)]
+        #[doc = concat!("assert_eq!(Some(120u8), 120", stringify!($SelfT), ".checked_truncate());")]
+        /// assert_eq!(None, 376u32.checked_truncate::<u8>());
+        /// ```
+        #[must_use = "this returns the truncated value and does not modify the original"]
+        #[unstable(feature = "integer_extend_truncate", issue = "154330")]
+        #[rustc_const_unstable(feature = "integer_extend_truncate", issue = "154330")]
+        #[inline]
+        pub const fn checked_truncate<Target>(self) -> Option<Target>
+            where Self: [const] traits::TruncateTarget<Target>
+        {
+            traits::TruncateTarget::internal_checked_truncate(self)
+        }
+
+        /// Extend to an integer of the same size or larger, preserving its value.
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// #![feature(integer_extend_truncate)]
+        #[doc = concat!("assert_eq!(120u128, 120u8.extend());")]
+        /// ```
+        #[must_use = "this returns the extended value and does not modify the original"]
+        #[unstable(feature = "integer_extend_truncate", issue = "154330")]
+        #[rustc_const_unstable(feature = "integer_extend_truncate", issue = "154330")]
+        #[inline]
+        pub const fn extend<Target>(self) -> Target
+            where Self: [const] traits::ExtendTarget<Target>
+        {
+            traits::ExtendTarget::internal_extend(self)
+        }
     }
 }

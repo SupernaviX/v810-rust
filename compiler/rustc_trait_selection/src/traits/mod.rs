@@ -34,8 +34,8 @@ use rustc_middle::query::Providers;
 use rustc_middle::span_bug;
 use rustc_middle::ty::error::{ExpectedFound, TypeError};
 use rustc_middle::ty::{
-    self, GenericArgs, GenericArgsRef, Ty, TyCtxt, TypeFoldable, TypeFolder, TypeSuperFoldable,
-    TypeSuperVisitable, TypeVisitable, TypeVisitableExt, TypingMode, Upcast,
+    self, Clause, GenericArgs, GenericArgsRef, Ty, TyCtxt, TypeFoldable, TypeFolder,
+    TypeSuperFoldable, TypeSuperVisitable, TypeVisitable, TypeVisitableExt, TypingMode, Upcast,
 };
 use rustc_span::Span;
 use rustc_span::def_id::DefId;
@@ -177,9 +177,10 @@ pub enum TraitQueryMode {
 }
 
 /// Creates predicate obligations from the generic bounds.
-#[instrument(level = "debug", skip(cause, param_env))]
+#[instrument(level = "debug", skip(cause, param_env, normalize_predicate))]
 pub fn predicates_for_generics<'tcx>(
     cause: impl Fn(usize, Span) -> ObligationCause<'tcx>,
+    mut normalize_predicate: impl FnMut(Clause<'tcx>) -> Clause<'tcx>,
     param_env: ty::ParamEnv<'tcx>,
     generic_bounds: ty::InstantiatedPredicates<'tcx>,
 ) -> impl Iterator<Item = PredicateObligation<'tcx>> {
@@ -187,7 +188,7 @@ pub fn predicates_for_generics<'tcx>(
         cause: cause(idx, span),
         recursion_depth: 0,
         param_env,
-        predicate: clause.as_predicate(),
+        predicate: normalize_predicate(clause).as_predicate(),
     })
 }
 
@@ -300,19 +301,14 @@ fn do_normalize_predicates<'tcx>(
         Ok(predicates) => Ok(predicates),
         Err(fixup_err) => {
             // If we encounter a fixup error, it means that some type
-            // variable wound up unconstrained. I actually don't know
-            // if this can happen, and I certainly don't expect it to
-            // happen often, but if it did happen it probably
-            // represents a legitimate failure due to some kind of
-            // unconstrained variable.
-            //
-            // @lcnr: Let's still ICE here for now. I want a test case
-            // for that.
-            span_bug!(
+            // variable wound up unconstrained. That can happen for
+            // ill-formed impls, so we delay a bug here instead of
+            // immediately ICEing and let type checking report the
+            // actual user-facing errors.
+            Err(tcx.dcx().span_delayed_bug(
                 span,
-                "inference variables in normalized parameter environment: {}",
-                fixup_err
-            );
+                format!("inference variables in normalized parameter environment: {fixup_err}"),
+            ))
         }
     }
 }
@@ -681,21 +677,10 @@ pub fn try_evaluate_const<'tcx>(
 
                     (args, typing_env)
                 }
-                Some(ty::AnonConstKind::OGCA) => {
-                    if infcx.typing_mode() != TypingMode::PostAnalysis {
-                        // OGCA anon consts should be treated as always having generics
-                        // during anything before codegen (or maybe MIR opts too).
-                        return Err(EvaluateConstErr::HasGenericsOrInfers);
-                    }
-
-                    if uv.args.has_non_region_param() || uv.args.has_non_region_infer() {
-                        return Err(EvaluateConstErr::HasGenericsOrInfers);
-                    }
-
-                    let typing_env = ty::TypingEnv::fully_monomorphized();
-                    (uv.args, typing_env)
-                }
-                Some(ty::AnonConstKind::MCG) | Some(ty::AnonConstKind::NonTypeSystem) | None => {
+                Some(ty::AnonConstKind::GCA)
+                | Some(ty::AnonConstKind::MCG)
+                | Some(ty::AnonConstKind::NonTypeSystem)
+                | None => {
                     // We are only dealing with "truly" generic/uninferred constants here:
                     // - GCEConsts have been handled separately
                     // - Repeat expr count back compat consts have also been handled separately

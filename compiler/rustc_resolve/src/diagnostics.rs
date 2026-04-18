@@ -11,19 +11,18 @@ use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_data_structures::unord::{UnordMap, UnordSet};
 use rustc_errors::codes::*;
 use rustc_errors::{
-    Applicability, Diag, DiagCtxtHandle, ErrorGuaranteed, MultiSpan, SuggestionStyle,
+    Applicability, Diag, DiagCtxtHandle, Diagnostic, ErrorGuaranteed, MultiSpan, SuggestionStyle,
     struct_span_code_err,
 };
 use rustc_feature::BUILTIN_ATTRIBUTES;
 use rustc_hir::attrs::{CfgEntry, StrippedCfgItem};
 use rustc_hir::def::Namespace::{self, *};
-use rustc_hir::def::{self, CtorKind, CtorOf, DefKind, MacroKinds, NonMacroAttrKind, PerNS};
+use rustc_hir::def::{CtorKind, CtorOf, DefKind, MacroKinds, NonMacroAttrKind, PerNS};
 use rustc_hir::def_id::{CRATE_DEF_ID, DefId};
 use rustc_hir::{PrimTy, Stability, StabilityLevel, find_attr};
 use rustc_middle::bug;
-use rustc_middle::ty::TyCtxt;
+use rustc_middle::ty::{TyCtxt, Visibility};
 use rustc_session::Session;
-use rustc_session::lint::BuiltinLintDiag;
 use rustc_session::lint::builtin::{
     ABSOLUTE_PATHS_NOT_STARTING_WITH_CRATE, AMBIGUOUS_GLOB_IMPORTS, AMBIGUOUS_IMPORT_VISIBILITIES,
     AMBIGUOUS_PANIC_IMPORTS, MACRO_EXPANDED_MACRO_EXPORTS_ACCESSED_BY_ABSOLUTE_PATHS,
@@ -32,8 +31,10 @@ use rustc_session::utils::was_invoked_from_cargo;
 use rustc_span::edit_distance::find_best_match_for_name;
 use rustc_span::edition::Edition;
 use rustc_span::hygiene::MacroKind;
-use rustc_span::source_map::{SourceMap, Spanned};
-use rustc_span::{BytePos, Ident, RemapPathScopeComponents, Span, Symbol, SyntaxContext, kw, sym};
+use rustc_span::source_map::SourceMap;
+use rustc_span::{
+    BytePos, Ident, RemapPathScopeComponents, Span, Spanned, Symbol, SyntaxContext, kw, sym,
+};
 use thin_vec::{ThinVec, thin_vec};
 use tracing::{debug, instrument};
 
@@ -48,12 +49,10 @@ use crate::late::{DiagMetadata, PatternSource, Rib};
 use crate::{
     AmbiguityError, AmbiguityKind, AmbiguityWarning, BindingError, BindingKey, Decl, DeclKind,
     Finalize, ForwardGenericParamBanReason, HasGenericParams, IdentKey, LateDecl, MacroRulesScope,
-    Module, ModuleKind, ModuleOrUniformRoot, ParentScope, PathResult, PrivacyError,
+    Module, ModuleKind, ModuleOrUniformRoot, ParentScope, PathResult, PrivacyError, Res,
     ResolutionError, Resolver, Scope, ScopeSet, Segment, UseError, Used, VisResolutionError,
     errors as errs, path_names_to_string,
 };
-
-type Res = def::Res<ast::NodeId>;
 
 /// A vector of spans and replacements, a message and applicability.
 pub(crate) type Suggestion = (Vec<(Span, String)>, String, Applicability);
@@ -61,6 +60,19 @@ pub(crate) type Suggestion = (Vec<(Span, String)>, String, Applicability);
 /// Potential candidate for an undeclared or out-of-scope label - contains the ident of a
 /// similarly named label and whether or not it is reachable.
 pub(crate) type LabelSuggestion = (Ident, bool);
+
+#[derive(Clone)]
+pub(crate) struct StructCtor {
+    pub res: Res,
+    pub vis: Visibility<DefId>,
+    pub field_visibilities: Vec<Visibility<DefId>>,
+}
+
+impl StructCtor {
+    pub(crate) fn has_private_fields<'ra>(&self, m: Module<'ra>, r: &Resolver<'ra, '_>) -> bool {
+        self.field_visibilities.iter().any(|&vis| !r.is_accessible_from(vis, m))
+    }
+}
 
 #[derive(Debug)]
 pub(crate) enum SuggestionTarget {
@@ -508,12 +520,35 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
             return;
         }
 
-        let diag = BuiltinLintDiag::AbsPathWithModule(root_span);
-        self.lint_buffer.buffer_lint(
+        self.lint_buffer.dyn_buffer_lint_any(
             ABSOLUTE_PATHS_NOT_STARTING_WITH_CRATE,
             node_id,
             root_span,
-            diag,
+            move |dcx, level, sess| {
+                let (replacement, applicability) = match sess
+                    .downcast_ref::<Session>()
+                    .expect("expected a `Session`")
+                    .source_map()
+                    .span_to_snippet(root_span)
+                {
+                    Ok(ref s) => {
+                        // FIXME(Manishearth) ideally the emitting code
+                        // can tell us whether or not this is global
+                        let opt_colon = if s.trim_start().starts_with("::") { "" } else { "::" };
+
+                        (format!("crate{opt_colon}{s}"), Applicability::MachineApplicable)
+                    }
+                    Err(_) => ("crate::<path>".to_string(), Applicability::HasPlaceholders),
+                };
+                errors::AbsPathWithModule {
+                    sugg: errors::AbsPathWithModuleSugg {
+                        span: root_span,
+                        applicability,
+                        replacement,
+                    },
+                }
+                .into_diag(dcx, level)
+            },
         );
     }
 
@@ -1009,14 +1044,14 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
             ResolutionError::ParamInTyOfConstParam { name } => {
                 self.dcx().create_err(errs::ParamInTyOfConstParam { span, name })
             }
-            ResolutionError::ParamInNonTrivialAnonConst { is_ogca, name, param_kind: is_type } => {
+            ResolutionError::ParamInNonTrivialAnonConst { is_gca, name, param_kind: is_type } => {
                 self.dcx().create_err(errs::ParamInNonTrivialAnonConst {
                     span,
                     name,
                     param_kind: is_type,
                     help: self.tcx.sess.is_nightly_build(),
-                    is_ogca,
-                    help_ogca: is_ogca,
+                    is_gca,
+                    help_gca: is_gca,
                 })
             }
             ResolutionError::ParamInEnumDiscriminant { name, param_kind: is_type } => self
@@ -1550,7 +1585,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
             lookup_ident,
             namespace,
             parent_scope,
-            self.graph_root,
+            self.graph_root.to_module(),
             crate_path,
             &filter_fn,
         );
@@ -1738,8 +1773,8 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                 Res::Def(DefKind::Macro(kinds), _) => {
                     format!("{} {}", kinds.article(), kinds.descr())
                 }
-                Res::ToolMod => {
-                    // Don't confuse the user with tool modules.
+                Res::ToolMod | Res::OpenMod(..) => {
+                    // Don't confuse the user with tool modules or open modules.
                     continue;
                 }
                 Res::Def(DefKind::Trait, _) if macro_kind == MacroKind::Derive => {
@@ -1976,7 +2011,8 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
             let (built_in, from) = match scope {
                 Scope::StdLibPrelude | Scope::MacroUsePrelude => ("", " from prelude"),
                 Scope::ExternPreludeFlags
-                    if self.tcx.sess.opts.externs.get(ident.as_str()).is_some() =>
+                    if self.tcx.sess.opts.externs.get(ident.as_str()).is_some()
+                        || matches!(res, Res::OpenMod(..)) =>
                 {
                     ("", " passed with `--extern`")
                 }
@@ -2038,7 +2074,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
 
             if kind != AmbiguityKind::GlobVsGlob {
                 if let Scope::ModuleNonGlobs(module, _) | Scope::ModuleGlobs(module, _) = scope {
-                    if module == self.graph_root {
+                    if module == self.graph_root.to_module() {
                         help_msgs.push(format!(
                             "use `crate::{ident}` to refer to this {thing} unambiguously"
                         ));
@@ -2416,7 +2452,8 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                 self.local_module_map
                     .iter()
                     .filter(|(_, module)| {
-                        current_module.is_ancestor_of(**module) && current_module != **module
+                        let module = module.to_module();
+                        current_module.is_ancestor_of(module) && current_module != module
                     })
                     .flat_map(|(_, module)| module.kind.name()),
             )
@@ -2425,7 +2462,8 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                     .borrow()
                     .iter()
                     .filter(|(_, module)| {
-                        current_module.is_ancestor_of(**module) && current_module != **module
+                        let module = module.to_module();
+                        current_module.is_ancestor_of(module) && current_module != module
                     })
                     .flat_map(|(_, module)| module.kind.name()),
             )
@@ -2958,7 +2996,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
         }
 
         let binding_key = BindingKey::new(IdentKey::new(ident), MacroNS);
-        let binding = self.resolution(crate_module, binding_key)?.binding()?;
+        let binding = self.resolution(crate_module, binding_key)?.best_decl()?;
         let Res::Def(DefKind::Macro(kinds), _) = binding.res() else {
             return None;
         };
@@ -3081,12 +3119,8 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                 .stripped_cfg_items
                 .iter()
                 .filter_map(|item| {
-                    let parent_module = self.opt_local_def_id(item.parent_module)?.to_def_id();
-                    Some(StrippedCfgItem {
-                        parent_module,
-                        ident: item.ident,
-                        cfg: item.cfg.clone(),
-                    })
+                    let parent_scope = self.opt_local_def_id(item.parent_scope)?.to_def_id();
+                    Some(StrippedCfgItem { parent_scope, ident: item.ident, cfg: item.cfg.clone() })
                 })
                 .collect::<Vec<_>>();
             local_items.as_slice()
@@ -3094,10 +3128,12 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
             self.tcx.stripped_cfg_items(module.krate)
         };
 
-        for &StrippedCfgItem { parent_module, ident, ref cfg } in symbols {
+        for &StrippedCfgItem { parent_scope, ident, ref cfg } in symbols {
             if ident.name != *segment {
                 continue;
             }
+
+            let parent_module = self.get_nearest_non_block_module(parent_scope).def_id();
 
             fn comes_from_same_module_for_glob(
                 r: &Resolver<'_, '_>,
@@ -3151,6 +3187,25 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
             };
             let note = errors::FoundItemConfigureOut { span: ident.span, item_was };
             err.subdiagnostic(note);
+        }
+    }
+
+    pub(crate) fn struct_ctor(&self, def_id: DefId) -> Option<StructCtor> {
+        match def_id.as_local() {
+            Some(def_id) => self.struct_ctors.get(&def_id).cloned(),
+            None => {
+                self.cstore().ctor_untracked(self.tcx, def_id).map(|(ctor_kind, ctor_def_id)| {
+                    let res = Res::Def(DefKind::Ctor(CtorOf::Struct, ctor_kind), ctor_def_id);
+                    let vis = self.tcx.visibility(ctor_def_id);
+                    let field_visibilities = self
+                        .tcx
+                        .associated_item_def_ids(def_id)
+                        .iter()
+                        .map(|&field_id| self.tcx.visibility(field_id))
+                        .collect();
+                    StructCtor { res, vis, field_visibilities }
+                })
+            }
         }
     }
 }
