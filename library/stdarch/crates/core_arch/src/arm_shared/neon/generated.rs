@@ -25891,7 +25891,15 @@ pub fn vmaxq_u32(a: uint32x4_t, b: uint32x4_t) -> uint32x4_t {
 )]
 #[cfg(not(target_arch = "arm64ec"))]
 pub fn vmaxnm_f16(a: float16x4_t, b: float16x4_t) -> float16x4_t {
-    unsafe { simd_fmax(a, b) }
+    unsafe extern "unadjusted" {
+        #[cfg_attr(target_arch = "arm", link_name = "llvm.arm.neon.vmaxnm.v4f16")]
+        #[cfg_attr(
+            any(target_arch = "aarch64", target_arch = "arm64ec"),
+            link_name = "llvm.aarch64.neon.fmaxnm.v4f16"
+        )]
+        fn _vmaxnm_f16(a: float16x4_t, b: float16x4_t) -> float16x4_t;
+    }
+    unsafe { _vmaxnm_f16(a, b) }
 }
 #[doc = "Floating-point Maximum Number (vector)"]
 #[doc = "[Arm's documentation](https://developer.arm.com/architectures/instruction-sets/intrinsics/vmaxnmq_f16)"]
@@ -25913,7 +25921,15 @@ pub fn vmaxnm_f16(a: float16x4_t, b: float16x4_t) -> float16x4_t {
 )]
 #[cfg(not(target_arch = "arm64ec"))]
 pub fn vmaxnmq_f16(a: float16x8_t, b: float16x8_t) -> float16x8_t {
-    unsafe { simd_fmax(a, b) }
+    unsafe extern "unadjusted" {
+        #[cfg_attr(target_arch = "arm", link_name = "llvm.arm.neon.vmaxnm.v8f16")]
+        #[cfg_attr(
+            any(target_arch = "aarch64", target_arch = "arm64ec"),
+            link_name = "llvm.aarch64.neon.fmaxnm.v8f16"
+        )]
+        fn _vmaxnmq_f16(a: float16x8_t, b: float16x8_t) -> float16x8_t;
+    }
+    unsafe { _vmaxnmq_f16(a, b) }
 }
 #[doc = "Floating-point Maximum Number (vector)"]
 #[doc = "[Arm's documentation](https://developer.arm.com/architectures/instruction-sets/intrinsics/vmaxnm_f32)"]
@@ -25934,7 +25950,15 @@ pub fn vmaxnmq_f16(a: float16x8_t, b: float16x8_t) -> float16x8_t {
     unstable(feature = "stdarch_arm_neon_intrinsics", issue = "111800")
 )]
 pub fn vmaxnm_f32(a: float32x2_t, b: float32x2_t) -> float32x2_t {
-    unsafe { simd_fmax(a, b) }
+    unsafe extern "unadjusted" {
+        #[cfg_attr(target_arch = "arm", link_name = "llvm.arm.neon.vmaxnm.v2f32")]
+        #[cfg_attr(
+            any(target_arch = "aarch64", target_arch = "arm64ec"),
+            link_name = "llvm.aarch64.neon.fmaxnm.v2f32"
+        )]
+        fn _vmaxnm_f32(a: float32x2_t, b: float32x2_t) -> float32x2_t;
+    }
+    unsafe { _vmaxnm_f32(a, b) }
 }
 #[doc = "Floating-point Maximum Number (vector)"]
 #[doc = "[Arm's documentation](https://developer.arm.com/architectures/instruction-sets/intrinsics/vmaxnmq_f32)"]
@@ -25955,7 +25979,15 @@ pub fn vmaxnm_f32(a: float32x2_t, b: float32x2_t) -> float32x2_t {
     unstable(feature = "stdarch_arm_neon_intrinsics", issue = "111800")
 )]
 pub fn vmaxnmq_f32(a: float32x4_t, b: float32x4_t) -> float32x4_t {
-    unsafe { simd_fmax(a, b) }
+    unsafe extern "unadjusted" {
+        #[cfg_attr(target_arch = "arm", link_name = "llvm.arm.neon.vmaxnm.v4f32")]
+        #[cfg_attr(
+            any(target_arch = "aarch64", target_arch = "arm64ec"),
+            link_name = "llvm.aarch64.neon.fmaxnm.v4f32"
+        )]
+        fn _vmaxnmq_f32(a: float32x4_t, b: float32x4_t) -> float32x4_t;
+    }
+    unsafe { _vmaxnmq_f32(a, b) }
 }
 #[doc = "Minimum (vector)"]
 #[doc = "[Arm's documentation](https://developer.arm.com/architectures/instruction-sets/intrinsics/vmin_f16)"]
@@ -26383,7 +26415,15 @@ pub fn vminq_u32(a: uint32x4_t, b: uint32x4_t) -> uint32x4_t {
 )]
 #[cfg(not(target_arch = "arm64ec"))]
 pub fn vminnm_f16(a: float16x4_t, b: float16x4_t) -> float16x4_t {
-    unsafe { simd_fmin(a, b) }
+    unsafe extern "unadjusted" {
+        #[cfg_attr(target_arch = "arm", link_name = "llvm.arm.neon.vminnm.v4f16")]
+        #[cfg_attr(
+            any(target_arch = "aarch64", target_arch = "arm64ec"),
+            link_name = "llvm.aarch64.neon.fminnm.v4f16"
+        )]
+        fn _vminnm_f16(a: float16x4_t, b: float16x4_t) -> float16x4_t;
+    }
+    unsafe { _vminnm_f16(a, b) }
 }
 #[doc = "Floating-point Minimum Number (vector)"]
 #[doc = "[Arm's documentation](https://developer.arm.com/architectures/instruction-sets/intrinsics/vminnmq_f16)"]
@@ -26405,7 +26445,15 @@ pub fn vminnm_f16(a: float16x4_t, b: float16x4_t) -> float16x4_t {
 )]
 #[cfg(not(target_arch = "arm64ec"))]
 pub fn vminnmq_f16(a: float16x8_t, b: float16x8_t) -> float16x8_t {
-    unsafe { simd_fmin(a, b) }
+    unsafe extern "unadjusted" {
+        #[cfg_attr(target_arch = "arm", link_name = "llvm.arm.neon.vminnm.v8f16")]
+        #[cfg_attr(
+            any(target_arch = "aarch64", target_arch = "arm64ec"),
+            link_name = "llvm.aarch64.neon.fminnm.v8f16"
+        )]
+        fn _vminnmq_f16(a: float16x8_t, b: float16x8_t) -> float16x8_t;
+    }
+    unsafe { _vminnmq_f16(a, b) }
 }
 #[doc = "Floating-point Minimum Number (vector)"]
 #[doc = "[Arm's documentation](https://developer.arm.com/architectures/instruction-sets/intrinsics/vminnm_f32)"]
@@ -26426,7 +26474,15 @@ pub fn vminnmq_f16(a: float16x8_t, b: float16x8_t) -> float16x8_t {
     unstable(feature = "stdarch_arm_neon_intrinsics", issue = "111800")
 )]
 pub fn vminnm_f32(a: float32x2_t, b: float32x2_t) -> float32x2_t {
-    unsafe { simd_fmin(a, b) }
+    unsafe extern "unadjusted" {
+        #[cfg_attr(target_arch = "arm", link_name = "llvm.arm.neon.vminnm.v2f32")]
+        #[cfg_attr(
+            any(target_arch = "aarch64", target_arch = "arm64ec"),
+            link_name = "llvm.aarch64.neon.fminnm.v2f32"
+        )]
+        fn _vminnm_f32(a: float32x2_t, b: float32x2_t) -> float32x2_t;
+    }
+    unsafe { _vminnm_f32(a, b) }
 }
 #[doc = "Floating-point Minimum Number (vector)"]
 #[doc = "[Arm's documentation](https://developer.arm.com/architectures/instruction-sets/intrinsics/vminnmq_f32)"]
@@ -26447,7 +26503,15 @@ pub fn vminnm_f32(a: float32x2_t, b: float32x2_t) -> float32x2_t {
     unstable(feature = "stdarch_arm_neon_intrinsics", issue = "111800")
 )]
 pub fn vminnmq_f32(a: float32x4_t, b: float32x4_t) -> float32x4_t {
-    unsafe { simd_fmin(a, b) }
+    unsafe extern "unadjusted" {
+        #[cfg_attr(target_arch = "arm", link_name = "llvm.arm.neon.vminnm.v4f32")]
+        #[cfg_attr(
+            any(target_arch = "aarch64", target_arch = "arm64ec"),
+            link_name = "llvm.aarch64.neon.fminnm.v4f32"
+        )]
+        fn _vminnmq_f32(a: float32x4_t, b: float32x4_t) -> float32x4_t;
+    }
+    unsafe { _vminnmq_f32(a, b) }
 }
 #[doc = "Floating-point multiply-add to accumulator"]
 #[doc = "[Arm's documentation](https://developer.arm.com/architectures/instruction-sets/intrinsics/vmla_f32)"]
@@ -67094,14 +67158,7 @@ pub unsafe fn vst3q_s32(a: *mut i32, b: int32x4x3_t) {
 #[stable(feature = "neon_intrinsics", since = "1.59.0")]
 #[cfg_attr(test, assert_instr(st3))]
 pub unsafe fn vst3_f32(a: *mut f32, b: float32x2x3_t) {
-    unsafe extern "unadjusted" {
-        #[cfg_attr(
-            any(target_arch = "aarch64", target_arch = "arm64ec"),
-            link_name = "llvm.aarch64.neon.st3.v2f32.p0"
-        )]
-        fn _vst3_f32(a: float32x2_t, b: float32x2_t, c: float32x2_t, ptr: *mut i8);
-    }
-    _vst3_f32(b.0, b.1, b.2, a as _)
+    crate::core_arch::macros::interleaving_store!(f32, 2, 3, a, b)
 }
 #[doc = "Store multiple 3-element structures from three registers"]
 #[doc = "[Arm's documentation](https://developer.arm.com/architectures/instruction-sets/intrinsics/vst3q_f32)"]
@@ -67113,14 +67170,7 @@ pub unsafe fn vst3_f32(a: *mut f32, b: float32x2x3_t) {
 #[stable(feature = "neon_intrinsics", since = "1.59.0")]
 #[cfg_attr(test, assert_instr(st3))]
 pub unsafe fn vst3q_f32(a: *mut f32, b: float32x4x3_t) {
-    unsafe extern "unadjusted" {
-        #[cfg_attr(
-            any(target_arch = "aarch64", target_arch = "arm64ec"),
-            link_name = "llvm.aarch64.neon.st3.v4f32.p0"
-        )]
-        fn _vst3q_f32(a: float32x4_t, b: float32x4_t, c: float32x4_t, ptr: *mut i8);
-    }
-    _vst3q_f32(b.0, b.1, b.2, a as _)
+    crate::core_arch::macros::interleaving_store!(f32, 4, 3, a, b)
 }
 #[doc = "Store multiple 3-element structures from three registers"]
 #[doc = "[Arm's documentation](https://developer.arm.com/architectures/instruction-sets/intrinsics/vst3_s8)"]
@@ -67132,14 +67182,7 @@ pub unsafe fn vst3q_f32(a: *mut f32, b: float32x4x3_t) {
 #[stable(feature = "neon_intrinsics", since = "1.59.0")]
 #[cfg_attr(test, assert_instr(st3))]
 pub unsafe fn vst3_s8(a: *mut i8, b: int8x8x3_t) {
-    unsafe extern "unadjusted" {
-        #[cfg_attr(
-            any(target_arch = "aarch64", target_arch = "arm64ec"),
-            link_name = "llvm.aarch64.neon.st3.v8i8.p0"
-        )]
-        fn _vst3_s8(a: int8x8_t, b: int8x8_t, c: int8x8_t, ptr: *mut i8);
-    }
-    _vst3_s8(b.0, b.1, b.2, a as _)
+    crate::core_arch::macros::interleaving_store!(i8, 8, 3, a, b)
 }
 #[doc = "Store multiple 3-element structures from three registers"]
 #[doc = "[Arm's documentation](https://developer.arm.com/architectures/instruction-sets/intrinsics/vst3q_s8)"]
@@ -67151,14 +67194,7 @@ pub unsafe fn vst3_s8(a: *mut i8, b: int8x8x3_t) {
 #[stable(feature = "neon_intrinsics", since = "1.59.0")]
 #[cfg_attr(test, assert_instr(st3))]
 pub unsafe fn vst3q_s8(a: *mut i8, b: int8x16x3_t) {
-    unsafe extern "unadjusted" {
-        #[cfg_attr(
-            any(target_arch = "aarch64", target_arch = "arm64ec"),
-            link_name = "llvm.aarch64.neon.st3.v16i8.p0"
-        )]
-        fn _vst3q_s8(a: int8x16_t, b: int8x16_t, c: int8x16_t, ptr: *mut i8);
-    }
-    _vst3q_s8(b.0, b.1, b.2, a as _)
+    crate::core_arch::macros::interleaving_store!(i8, 16, 3, a, b)
 }
 #[doc = "Store multiple 3-element structures from three registers"]
 #[doc = "[Arm's documentation](https://developer.arm.com/architectures/instruction-sets/intrinsics/vst3_s16)"]
@@ -67170,14 +67206,7 @@ pub unsafe fn vst3q_s8(a: *mut i8, b: int8x16x3_t) {
 #[stable(feature = "neon_intrinsics", since = "1.59.0")]
 #[cfg_attr(test, assert_instr(st3))]
 pub unsafe fn vst3_s16(a: *mut i16, b: int16x4x3_t) {
-    unsafe extern "unadjusted" {
-        #[cfg_attr(
-            any(target_arch = "aarch64", target_arch = "arm64ec"),
-            link_name = "llvm.aarch64.neon.st3.v4i16.p0"
-        )]
-        fn _vst3_s16(a: int16x4_t, b: int16x4_t, c: int16x4_t, ptr: *mut i8);
-    }
-    _vst3_s16(b.0, b.1, b.2, a as _)
+    crate::core_arch::macros::interleaving_store!(i16, 4, 3, a, b)
 }
 #[doc = "Store multiple 3-element structures from three registers"]
 #[doc = "[Arm's documentation](https://developer.arm.com/architectures/instruction-sets/intrinsics/vst3q_s16)"]
@@ -67189,14 +67218,7 @@ pub unsafe fn vst3_s16(a: *mut i16, b: int16x4x3_t) {
 #[stable(feature = "neon_intrinsics", since = "1.59.0")]
 #[cfg_attr(test, assert_instr(st3))]
 pub unsafe fn vst3q_s16(a: *mut i16, b: int16x8x3_t) {
-    unsafe extern "unadjusted" {
-        #[cfg_attr(
-            any(target_arch = "aarch64", target_arch = "arm64ec"),
-            link_name = "llvm.aarch64.neon.st3.v8i16.p0"
-        )]
-        fn _vst3q_s16(a: int16x8_t, b: int16x8_t, c: int16x8_t, ptr: *mut i8);
-    }
-    _vst3q_s16(b.0, b.1, b.2, a as _)
+    crate::core_arch::macros::interleaving_store!(i16, 8, 3, a, b)
 }
 #[doc = "Store multiple 3-element structures from three registers"]
 #[doc = "[Arm's documentation](https://developer.arm.com/architectures/instruction-sets/intrinsics/vst3_s32)"]
@@ -67208,14 +67230,7 @@ pub unsafe fn vst3q_s16(a: *mut i16, b: int16x8x3_t) {
 #[stable(feature = "neon_intrinsics", since = "1.59.0")]
 #[cfg_attr(test, assert_instr(st3))]
 pub unsafe fn vst3_s32(a: *mut i32, b: int32x2x3_t) {
-    unsafe extern "unadjusted" {
-        #[cfg_attr(
-            any(target_arch = "aarch64", target_arch = "arm64ec"),
-            link_name = "llvm.aarch64.neon.st3.v2i32.p0"
-        )]
-        fn _vst3_s32(a: int32x2_t, b: int32x2_t, c: int32x2_t, ptr: *mut i8);
-    }
-    _vst3_s32(b.0, b.1, b.2, a as _)
+    crate::core_arch::macros::interleaving_store!(i32, 2, 3, a, b)
 }
 #[doc = "Store multiple 3-element structures from three registers"]
 #[doc = "[Arm's documentation](https://developer.arm.com/architectures/instruction-sets/intrinsics/vst3q_s32)"]
@@ -67227,14 +67242,7 @@ pub unsafe fn vst3_s32(a: *mut i32, b: int32x2x3_t) {
 #[stable(feature = "neon_intrinsics", since = "1.59.0")]
 #[cfg_attr(test, assert_instr(st3))]
 pub unsafe fn vst3q_s32(a: *mut i32, b: int32x4x3_t) {
-    unsafe extern "unadjusted" {
-        #[cfg_attr(
-            any(target_arch = "aarch64", target_arch = "arm64ec"),
-            link_name = "llvm.aarch64.neon.st3.v4i32.p0"
-        )]
-        fn _vst3q_s32(a: int32x4_t, b: int32x4_t, c: int32x4_t, ptr: *mut i8);
-    }
-    _vst3q_s32(b.0, b.1, b.2, a as _)
+    crate::core_arch::macros::interleaving_store!(i32, 4, 3, a, b)
 }
 #[doc = "Store multiple 3-element structures from three registers"]
 #[doc = "[Arm's documentation](https://developer.arm.com/architectures/instruction-sets/intrinsics/vst3_lane_f16)"]

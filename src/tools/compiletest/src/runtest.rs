@@ -106,7 +106,7 @@ fn dylib_name(name: &str) -> String {
     format!("{}{name}.{}", std::env::consts::DLL_PREFIX, std::env::consts::DLL_EXTENSION)
 }
 
-pub fn run(
+pub(crate) fn run(
     config: &Config,
     stdout: &dyn ConsoleOut,
     stderr: &dyn ConsoleOut,
@@ -181,7 +181,7 @@ pub fn run(
     cx.create_stamp();
 }
 
-pub fn compute_stamp_hash(config: &Config) -> String {
+pub(crate) fn compute_stamp_hash(config: &Config) -> String {
     let mut hash = DefaultHasher::new();
     config.stage_id.hash(&mut hash);
     config.run.hash(&mut hash);
@@ -266,28 +266,26 @@ impl<'test> TestCx<'test> {
     /// Code executed for each revision in turn (or, if there are no
     /// revisions, exactly once, with revision == None).
     fn run_revision(&self) {
-        if self.props.should_ice
-            && self.config.mode != TestMode::Incremental
-            && self.config.mode != TestMode::Crashes
-        {
-            self.fatal("cannot use should-ice in a test that is not cfail");
-        }
-        match self.config.mode {
-            TestMode::Pretty => self.run_pretty_test(),
-            TestMode::DebugInfo => self.run_debuginfo_test(),
-            TestMode::Codegen => self.run_codegen_test(),
-            TestMode::RustdocHtml => self.run_rustdoc_html_test(),
-            TestMode::RustdocJson => self.run_rustdoc_json_test(),
-            TestMode::CodegenUnits => self.run_codegen_units_test(),
-            TestMode::Incremental => self.run_incremental_test(),
-            TestMode::RunMake => self.run_rmake_test(),
-            TestMode::Ui => self.run_ui_test(),
-            TestMode::MirOpt => self.run_mir_opt_test(),
-            TestMode::Assembly => self.run_assembly_test(),
-            TestMode::RustdocJs => self.run_rustdoc_js_test(),
-            TestMode::CoverageMap => self.run_coverage_map_test(), // see self::coverage
-            TestMode::CoverageRun => self.run_coverage_run_test(), // see self::coverage
-            TestMode::Crashes => self.run_crash_test(),
+        // Run the test multiple times if requested.
+        // This is useful for catching flaky tests under the parallel frontend.
+        for _ in 0..self.config.iteration_count {
+            match self.config.mode {
+                TestMode::Pretty => self.run_pretty_test(),
+                TestMode::DebugInfo => self.run_debuginfo_test(),
+                TestMode::Codegen => self.run_codegen_test(),
+                TestMode::RustdocHtml => self.run_rustdoc_html_test(),
+                TestMode::RustdocJson => self.run_rustdoc_json_test(),
+                TestMode::CodegenUnits => self.run_codegen_units_test(),
+                TestMode::Incremental => self.run_incremental_test(),
+                TestMode::RunMake => self.run_rmake_test(),
+                TestMode::Ui => self.run_ui_test(),
+                TestMode::MirOpt => self.run_mir_opt_test(),
+                TestMode::Assembly => self.run_assembly_test(),
+                TestMode::RustdocJs => self.run_rustdoc_js_test(),
+                TestMode::CoverageMap => self.run_coverage_map_test(), // see self::coverage
+                TestMode::CoverageRun => self.run_coverage_run_test(), // see self::coverage
+                TestMode::Crashes => self.run_crash_test(),
+            }
         }
     }
 
@@ -329,15 +327,12 @@ impl<'test> TestCx<'test> {
             TestMode::Incremental => {
                 let revision =
                     self.revision.expect("incremental tests require a list of revisions");
-                if revision.starts_with("cpass")
-                    || revision.starts_with("rpass")
-                    || revision.starts_with("rfail")
-                {
+                if revision.starts_with("cpass") || revision.starts_with("rpass") {
                     true
                 } else if revision.starts_with("cfail") {
                     pm.is_some()
                 } else {
-                    panic!("revision name must begin with cpass, rpass, rfail, or cfail");
+                    panic!("revision name must begin with `cfail`, `cpass`, or `rpass`");
                 }
             }
             mode => panic!("unimplemented for mode {:?}", mode),
@@ -451,6 +446,7 @@ impl<'test> TestCx<'test> {
         rustc
             .arg(input)
             .args(&["-Z", &format!("unpretty={}", pretty_type)])
+            .arg("-Zunstable-options")
             .args(&["--target", &self.config.target])
             .arg("-L")
             .arg(&aux_dir)
@@ -556,6 +552,7 @@ impl<'test> TestCx<'test> {
         rustc
             .arg("-")
             .arg("-Zno-codegen")
+            .arg("-Zunstable-options")
             .arg("--out-dir")
             .arg(&out_dir)
             .arg(&format!("--target={}", target))
@@ -666,16 +663,6 @@ impl<'test> TestCx<'test> {
             } else {
                 missing_patterns.push(pattern.to_string());
             }
-        }
-    }
-
-    fn check_no_compiler_crash(&self, proc_res: &ProcRes, should_ice: bool) {
-        match proc_res.status.code() {
-            Some(101) if !should_ice => {
-                self.fatal_proc_rec("compiler encountered internal error", proc_res)
-            }
-            None => self.fatal_proc_rec("compiler terminated by signal", proc_res),
-            _ => (),
         }
     }
 
@@ -992,6 +979,7 @@ impl<'test> TestCx<'test> {
                     AllowUnused::No
                 }
             }
+            TestMode::Incremental => AllowUnused::Yes,
             _ => AllowUnused::No,
         };
 
@@ -1752,6 +1740,14 @@ impl<'test> TestCx<'test> {
                 compiler.arg("-Zwrite-long-types-to-disk=no");
                 // FIXME: use this for other modes too, for perf?
                 compiler.arg("-Cstrip=debuginfo");
+
+                if self.config.parallel_frontend_enabled() {
+                    // Currently, we only use multiple threads for the UI test suite,
+                    // because UI tests can effectively verify the parallel frontend and
+                    // require minimal modification. The option will later be extended to
+                    // other test suites.
+                    compiler.arg(&format!("-Zthreads={}", self.config.parallel_frontend_threads));
+                }
             }
             TestMode::MirOpt => {
                 // We check passes under test to minimize the mir-opt test dump
@@ -1907,8 +1903,9 @@ impl<'test> TestCx<'test> {
             compiler.args(&["-A", "unused", "-W", "unused_attributes"]);
         }
 
-        // Allow tests to use internal features.
+        // Allow tests to use internal and incomplete features.
         compiler.args(&["-A", "internal_features"]);
+        compiler.args(&["-A", "incomplete_features"]);
 
         // Allow tests to have unused parens and braces.
         // Add #![deny(unused_parens, unused_braces)] to the test file if you want to
@@ -2109,7 +2106,7 @@ impl<'test> TestCx<'test> {
     }
 
     /// Prints a message to (captured) stdout if `config.verbose` is true.
-    /// The message is also logged to `tracing::debug!` regardles of verbosity.
+    /// The message is also logged to `tracing::debug!` regardless of verbosity.
     ///
     /// Use `format_args!` as the argument to perform formatting if required.
     fn logv(&self, message: impl fmt::Display) {
@@ -2718,28 +2715,40 @@ impl<'test> TestCx<'test> {
         // Wrapper tools set by `runner` might provide extra output on failure,
         // for example a WebAssembly runtime might print the stack trace of an
         // `unreachable` instruction by default.
-        //
+        let compare_output_by_lines_subset = self.config.runner.is_some();
+
         // Also, some tests like `ui/parallel-rustc` have non-deterministic
         // orders of output, so we need to compare by lines.
-        let compare_output_by_lines =
-            self.props.compare_output_by_lines || self.config.runner.is_some();
+        let compare_output_by_lines = self.props.compare_output_by_lines;
 
         let tmp;
-        let (expected, actual): (&str, &str) = if compare_output_by_lines {
+        let (expected, actual): (&str, &str) = if compare_output_by_lines_subset {
             let actual_lines: HashSet<_> = actual.lines().collect();
             let expected_lines: Vec<_> = expected.lines().collect();
             let mut used = expected_lines.clone();
             used.retain(|line| actual_lines.contains(line));
+
             // check if `expected` contains a subset of the lines of `actual`
             if used.len() == expected_lines.len() && (expected.is_empty() == actual.is_empty()) {
                 return CompareOutcome::Same;
             }
             if expected_lines.is_empty() {
-                // if we have no lines to check, force a full overwite
+                // if we have no lines to check, force a full overwrite
                 ("", actual)
             } else {
+                // this prints/blesses the subset, not the actual
                 tmp = (expected_lines.join("\n"), used.join("\n"));
                 (&tmp.0, &tmp.1)
+            }
+        } else if compare_output_by_lines {
+            let mut actual_lines: Vec<&str> = actual.lines().collect();
+            let mut expected_lines: Vec<&str> = expected.lines().collect();
+            actual_lines.sort_unstable();
+            expected_lines.sort_unstable();
+            if actual_lines == expected_lines {
+                return CompareOutcome::Same;
+            } else {
+                (expected, actual)
             }
         } else {
             (expected, actual)
@@ -2960,7 +2969,7 @@ struct ProcArgs {
 }
 
 #[derive(Debug)]
-pub struct ProcRes {
+pub(crate) struct ProcRes {
     status: ExitStatus,
     stdout: String,
     stderr: String,
@@ -2970,7 +2979,7 @@ pub struct ProcRes {
 
 impl ProcRes {
     #[must_use]
-    pub fn format_info(&self) -> String {
+    pub(crate) fn format_info(&self) -> String {
         fn render(name: &str, contents: &str) -> String {
             let contents = json::extract_rendered(contents);
             let contents = contents.trim_end();

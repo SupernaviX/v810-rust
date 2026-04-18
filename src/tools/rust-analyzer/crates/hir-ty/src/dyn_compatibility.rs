@@ -4,8 +4,10 @@ use std::ops::ControlFlow;
 
 use hir_def::{
     AssocItemId, ConstId, FunctionId, GenericDefId, HasModule, TraitId, TypeAliasId,
-    TypeOrConstParamId, TypeParamId, hir::generics::LocalTypeOrConstParamId,
-    nameres::crate_def_map, signatures::TraitFlags,
+    TypeOrConstParamId, TypeParamId,
+    hir::generics::{GenericParams, LocalTypeOrConstParamId},
+    nameres::crate_def_map,
+    signatures::{FunctionSignature, TraitFlags, TraitSignature},
 };
 use rustc_hash::FxHashSet;
 use rustc_type_ir::{
@@ -139,7 +141,7 @@ pub fn generics_require_sized_self(db: &dyn HirDatabase, def: GenericDefId) -> b
     // FIXME: We should use `explicit_predicates_of` here, which hasn't been implemented to
     // rust-analyzer yet
     // https://github.com/rust-lang/rust/blob/ddaf12390d3ffb7d5ba74491a48f3cd528e5d777/compiler/rustc_hir_analysis/src/collect/predicates_of.rs#L490
-    elaborate::elaborate(interner, predicates.iter_identity_copied()).any(|pred| {
+    elaborate::elaborate(interner, predicates.iter_identity()).any(|pred| {
         match pred.kind().skip_binder() {
             ClauseKind::Trait(trait_pred) => {
                 if sized == trait_pred.def_id().0
@@ -162,7 +164,7 @@ pub fn generics_require_sized_self(db: &dyn HirDatabase, def: GenericDefId) -> b
 // So, just return single boolean value for existence of such `Self` reference
 fn predicates_reference_self(db: &dyn HirDatabase, trait_: TraitId) -> bool {
     GenericPredicates::query_explicit(db, trait_.into())
-        .iter_identity_copied()
+        .iter_identity()
         .any(|pred| predicate_references_self(db, trait_, pred, AllowSelfProjection::No))
 }
 
@@ -298,7 +300,7 @@ where
             if def_map.is_unstable_feature_enabled(&intern::sym::generic_associated_type_extended) {
                 ControlFlow::Continue(())
             } else {
-                let generic_params = db.generic_params(item.into());
+                let generic_params = GenericParams::of(db, item.into());
                 if !generic_params.is_empty() {
                     cb(DynCompatibilityViolation::GAT(it))
                 } else {
@@ -318,7 +320,7 @@ fn virtual_call_violations_for_method<F>(
 where
     F: FnMut(MethodViolationCode) -> ControlFlow<()>,
 {
-    let func_data = db.function_signature(func);
+    let func_data = FunctionSignature::of(db, func);
     if !func_data.has_self_param() {
         cb(MethodViolationCode::StaticMethod)?;
     }
@@ -349,7 +351,7 @@ where
         cb(mvc)?;
     }
 
-    let generic_params = db.generic_params(func.into());
+    let generic_params = GenericParams::of(db, func.into());
     if generic_params.len_type_or_consts() > 0 {
         cb(MethodViolationCode::Generic)?;
     }
@@ -358,8 +360,8 @@ where
         cb(MethodViolationCode::UndispatchableReceiver)?;
     }
 
-    let predicates = GenericPredicates::query_own(db, func.into());
-    for pred in predicates.iter_identity_copied() {
+    let predicates = GenericPredicates::query_own_explicit(db, func.into());
+    for pred in predicates.iter_identity() {
         let pred = pred.kind().skip_binder();
 
         if matches!(pred, ClauseKind::TypeOutlives(_)) {
@@ -371,7 +373,7 @@ where
             trait_ref: pred_trait_ref,
             polarity: PredicatePolarity::Positive,
         }) = pred
-            && let trait_data = db.trait_signature(pred_trait_ref.def_id.0)
+            && let trait_data = TraitSignature::of(db, pred_trait_ref.def_id.0)
             && trait_data.flags.contains(TraitFlags::AUTO)
             && let rustc_type_ir::TyKind::Param(ParamTy { index: 0, .. }) =
                 pred_trait_ref.self_ty().kind()
@@ -457,7 +459,7 @@ fn receiver_is_dispatchable<'db>(
             clauses: Clauses::new_from_iter(
                 interner,
                 generic_predicates
-                    .iter_identity_copied()
+                    .iter_identity()
                     .chain([unsize_predicate.upcast(interner), trait_predicate.upcast(interner)])
                     .chain(meta_sized_predicate),
             ),

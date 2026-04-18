@@ -7,9 +7,8 @@ use rustc_abi::{
     PointerKind, Primitive, ReprFlags, ReprOptions, Scalar, Size, TagEncoding, TargetDataLayout,
     TyAbiInterface, VariantIdx, Variants,
 };
-use rustc_error_messages::DiagMessage;
 use rustc_errors::{
-    Diag, DiagArgValue, DiagCtxtHandle, Diagnostic, EmissionGuarantee, IntoDiagArg, Level, msg,
+    Diag, DiagArgValue, DiagCtxtHandle, Diagnostic, EmissionGuarantee, IntoDiagArg, Level,
 };
 use rustc_hir as hir;
 use rustc_hir::LangItem;
@@ -261,57 +260,8 @@ pub enum LayoutError<'tcx> {
     NormalizationFailure(Ty<'tcx>, NormalizationError<'tcx>),
     /// A non-layout error is reported elsewhere.
     ReferencesError(ErrorGuaranteed),
-    /// A type has cyclic layout, i.e. the type contains itself without indirection.
-    Cycle(ErrorGuaranteed),
 }
 
-impl<'tcx> LayoutError<'tcx> {
-    pub fn diagnostic_message(&self) -> DiagMessage {
-        use LayoutError::*;
-
-        match self {
-            Unknown(_) => msg!("the type `{$ty}` has an unknown layout"),
-            SizeOverflow(_) => {
-                msg!("values of the type `{$ty}` are too big for the target architecture")
-            }
-            InvalidSimd { kind: SimdLayoutError::TooManyLanes(_), .. } => {
-                msg!("the SIMD type `{$ty}` has more elements than the limit {$max_lanes}")
-            }
-            InvalidSimd { kind: SimdLayoutError::ZeroLength, .. } => {
-                msg!("the SIMD type `{$ty}` has zero elements")
-            }
-            TooGeneric(_) => msg!("the type `{$ty}` does not have a fixed layout"),
-            NormalizationFailure(_, _) => msg!(
-                "unable to determine layout for `{$ty}` because `{$failure_ty}` cannot be normalized"
-            ),
-            Cycle(_) => msg!("a cycle occurred during layout computation"),
-            ReferencesError(_) => msg!("the type has an unknown layout"),
-        }
-    }
-
-    pub fn into_diagnostic(self) -> crate::error::LayoutError<'tcx> {
-        use LayoutError::*;
-
-        use crate::error::LayoutError as E;
-        match self {
-            Unknown(ty) => E::Unknown { ty },
-            SizeOverflow(ty) => E::Overflow { ty },
-            InvalidSimd { ty, kind: SimdLayoutError::TooManyLanes(max_lanes) } => {
-                E::SimdTooManyLanes { ty, max_lanes }
-            }
-            InvalidSimd { ty, kind: SimdLayoutError::ZeroLength } => E::SimdZeroLength { ty },
-            TooGeneric(ty) => E::TooGeneric { ty },
-            NormalizationFailure(ty, e) => {
-                E::NormalizationFailure { ty, failure_ty: e.get_type_for_failure() }
-            }
-            Cycle(_) => E::Cycle,
-            ReferencesError(_) => E::ReferencesError,
-        }
-    }
-}
-
-// FIXME: Once the other errors that embed this error have been converted to translatable
-// diagnostics, this Display impl should be removed.
 impl<'tcx> fmt::Display for LayoutError<'tcx> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
@@ -334,7 +284,6 @@ impl<'tcx> fmt::Display for LayoutError<'tcx> {
                 t,
                 e.get_type_for_failure()
             ),
-            LayoutError::Cycle(_) => write!(f, "a cycle occurred during layout computation"),
             LayoutError::ReferencesError(_) => write!(f, "the type has an unknown layout"),
         }
     }
@@ -406,8 +355,7 @@ impl<'tcx> SizeSkeleton<'tcx> {
             Err(err @ LayoutError::TooGeneric(_)) => err,
             // We can't extract SizeSkeleton info from other layout errors
             Err(
-                e @ LayoutError::Cycle(_)
-                | e @ LayoutError::Unknown(_)
+                e @ LayoutError::Unknown(_)
                 | e @ LayoutError::SizeOverflow(_)
                 | e @ LayoutError::InvalidSimd { .. }
                 | e @ LayoutError::NormalizationFailure(..)
@@ -437,7 +385,11 @@ impl<'tcx> SizeSkeleton<'tcx> {
                 );
 
                 match tail.kind() {
-                    ty::Param(_) | ty::Alias(ty::Projection | ty::Inherent, _) => {
+                    ty::Param(_)
+                    | ty::Alias(ty::AliasTy {
+                        kind: ty::Projection { .. } | ty::Inherent { .. },
+                        ..
+                    }) => {
                         debug_assert!(tail.has_non_region_param());
                         Ok(SizeSkeleton::Pointer {
                             non_zero,
@@ -556,8 +508,21 @@ impl<'tcx> SizeSkeleton<'tcx> {
                 }
             }
 
-            // Pattern types are always the same size as their base.
-            ty::Pat(base, _) => SizeSkeleton::compute(base, tcx, typing_env),
+            ty::Pat(base, pat) => {
+                // Pattern types are always the same size as their base.
+                let base = SizeSkeleton::compute(base, tcx, typing_env);
+                match *pat {
+                    ty::PatternKind::Range { .. } | ty::PatternKind::Or(_) => base,
+                    // But in the case of `!null` patterns we need to note that in the
+                    // raw pointer.
+                    ty::PatternKind::NotNull => match base? {
+                        SizeSkeleton::Known(..) | SizeSkeleton::Generic(_) => base,
+                        SizeSkeleton::Pointer { non_zero: _, tail } => {
+                            Ok(SizeSkeleton::Pointer { non_zero: true, tail })
+                        }
+                    },
+                }
+            }
 
             _ => Err(err),
         }
@@ -1333,7 +1298,7 @@ pub enum FnAbiError<'tcx> {
 impl<'a, 'b, G: EmissionGuarantee> Diagnostic<'a, G> for FnAbiError<'b> {
     fn into_diag(self, dcx: DiagCtxtHandle<'a>, level: Level) -> Diag<'a, G> {
         match self {
-            Self::Layout(e) => e.into_diagnostic().into_diag(dcx, level),
+            Self::Layout(e) => Diag::new(dcx, level, e.to_string()),
         }
     }
 }

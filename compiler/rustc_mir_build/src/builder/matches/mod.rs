@@ -944,6 +944,9 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     visit_subpat(self, subpattern, user_tys, f);
                 }
             }
+            PatKind::Guard { ref subpattern, .. } => {
+                visit_subpat(self, subpattern, user_tys, f);
+            }
         }
     }
 }
@@ -1274,7 +1277,7 @@ enum PatConstKind {
 /// tested, and a test to perform on that place.
 ///
 /// Each node also has a list of subpairs (possibly empty) that must also match,
-/// and a reference to the THIR pattern it represents.
+/// and some additional information from the THIR pattern it represents.
 #[derive(Debug, Clone)]
 pub(crate) struct MatchPairTree<'tcx> {
     /// This place...
@@ -1298,9 +1301,7 @@ pub(crate) struct MatchPairTree<'tcx> {
     /// that tests its field for the value `3`.
     subpairs: Vec<Self>,
 
-    /// Type field of the pattern this node was created from.
-    pattern_ty: Ty<'tcx>,
-    /// Span field of the pattern this node was created from.
+    /// Span field of the THIR pattern this node was created from.
     pattern_span: Span,
 }
 

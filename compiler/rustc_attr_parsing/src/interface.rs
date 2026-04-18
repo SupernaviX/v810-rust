@@ -3,18 +3,19 @@ use std::convert::identity;
 use rustc_ast as ast;
 use rustc_ast::token::DocFragmentKind;
 use rustc_ast::{AttrItemKind, AttrStyle, NodeId, Safety};
-use rustc_errors::DiagCtxtHandle;
+use rustc_errors::{DiagCtxtHandle, MultiSpan};
 use rustc_feature::{AttributeTemplate, Features};
 use rustc_hir::attrs::AttributeKind;
 use rustc_hir::lints::AttributeLintKind;
 use rustc_hir::{AttrArgs, AttrItem, AttrPath, Attribute, HashIgnoredAttrId, Target};
 use rustc_session::Session;
-use rustc_session::lint::{BuiltinLintDiag, LintId};
+use rustc_session::lint::LintId;
 use rustc_span::{DUMMY_SP, Span, Symbol, sym};
 
+use crate::attributes::AttributeSafety;
 use crate::context::{AcceptContext, FinalizeContext, FinalizeFn, SharedContext, Stage};
 use crate::early_parsed::{EARLY_PARSED_ATTRIBUTES, EarlyParsedState};
-use crate::parser::{ArgParser, PathParser, RefPathParser};
+use crate::parser::{AllowExprMetavar, ArgParser, PathParser, RefPathParser};
 use crate::session_diagnostics::ParsedDescription;
 use crate::{Early, Late, OmitDoc, ShouldEmit};
 
@@ -29,7 +30,7 @@ pub struct AttributeParser<'sess, S: Stage = Late> {
     /// *Only* parse attributes with this symbol.
     ///
     /// Used in cases where we want the lowering infrastructure for parse just a single attribute.
-    parse_only: Option<Symbol>,
+    parse_only: Option<&'static [Symbol]>,
 }
 
 impl<'sess> AttributeParser<'sess, Early> {
@@ -50,7 +51,7 @@ impl<'sess> AttributeParser<'sess, Early> {
     pub fn parse_limited(
         sess: &'sess Session,
         attrs: &[ast::Attribute],
-        sym: Symbol,
+        sym: &'static [Symbol],
         target_span: Span,
         target_node_id: NodeId,
         features: Option<&'sess Features>,
@@ -61,6 +62,7 @@ impl<'sess> AttributeParser<'sess, Early> {
             sym,
             target_span,
             target_node_id,
+            Target::Crate, // Does not matter, we're not going to emit errors anyways
             features,
             ShouldEmit::Nothing,
         )
@@ -71,9 +73,10 @@ impl<'sess> AttributeParser<'sess, Early> {
     pub fn parse_limited_should_emit(
         sess: &'sess Session,
         attrs: &[ast::Attribute],
-        sym: Symbol,
+        sym: &'static [Symbol],
         target_span: Span,
         target_node_id: NodeId,
+        target: Target,
         features: Option<&'sess Features>,
         should_emit: ShouldEmit,
     ) -> Option<Attribute> {
@@ -81,7 +84,7 @@ impl<'sess> AttributeParser<'sess, Early> {
             sess,
             attrs,
             Some(sym),
-            Target::Crate, // Does not matter, we're not going to emit errors anyways
+            target,
             target_span,
             target_node_id,
             features,
@@ -101,7 +104,7 @@ impl<'sess> AttributeParser<'sess, Early> {
     pub fn parse_limited_all(
         sess: &'sess Session,
         attrs: &[ast::Attribute],
-        parse_only: Option<Symbol>,
+        parse_only: Option<&'static [Symbol]>,
         target: Target,
         target_span: Span,
         target_node_id: NodeId,
@@ -116,14 +119,7 @@ impl<'sess> AttributeParser<'sess, Early> {
             target,
             OmitDoc::Skip,
             std::convert::identity,
-            |lint_id, span, kind| {
-                sess.psess.buffer_lint(
-                    lint_id.lint,
-                    span,
-                    target_node_id,
-                    BuiltinLintDiag::AttributeLint(kind),
-                )
-            },
+            |lint_id, span, kind| sess.psess.buffer_lint(lint_id.lint, span, target_node_id, kind),
         )
     }
 
@@ -139,6 +135,8 @@ impl<'sess> AttributeParser<'sess, Early> {
         emit_errors: ShouldEmit,
         parse_fn: fn(cx: &mut AcceptContext<'_, '_, Early>, item: &ArgParser) -> Option<T>,
         template: &AttributeTemplate,
+        allow_expr_metavar: AllowExprMetavar,
+        expected_safety: AttributeSafety,
     ) -> Option<T> {
         let ast::AttrKind::Normal(normal_attr) = &attr.kind else {
             panic!("parse_single called on a doc attr")
@@ -152,6 +150,7 @@ impl<'sess> AttributeParser<'sess, Early> {
             &parts,
             &sess.psess,
             emit_errors,
+            allow_expr_metavar,
         )?;
         Self::parse_single_args(
             sess,
@@ -160,6 +159,7 @@ impl<'sess> AttributeParser<'sess, Early> {
             attr.style,
             path,
             Some(normal_attr.item.unsafety),
+            expected_safety,
             ParsedDescription::Attribute,
             target_span,
             target_node_id,
@@ -181,6 +181,7 @@ impl<'sess> AttributeParser<'sess, Early> {
         attr_style: AttrStyle,
         attr_path: AttrPath,
         attr_safety: Option<Safety>,
+        expected_safety: AttributeSafety,
         parsed_description: ParsedDescription,
         target_span: Span,
         target_node_id: NodeId,
@@ -198,16 +199,17 @@ impl<'sess> AttributeParser<'sess, Early> {
             sess,
             stage: Early { emit_errors },
         };
-        let mut emit_lint = |lint_id: LintId, span: Span, kind: AttributeLintKind| {
-            sess.psess.buffer_lint(
-                lint_id.lint,
-                span,
-                target_node_id,
-                BuiltinLintDiag::AttributeLint(kind),
-            )
+        let mut emit_lint = |lint_id: LintId, span: MultiSpan, kind: AttributeLintKind| {
+            sess.psess.buffer_lint(lint_id.lint, span, target_node_id, kind)
         };
         if let Some(safety) = attr_safety {
-            parser.check_attribute_safety(&attr_path, inner_span, safety, &mut emit_lint)
+            parser.check_attribute_safety(
+                &attr_path,
+                inner_span,
+                safety,
+                expected_safety,
+                &mut emit_lint,
+            )
         }
         let mut cx: AcceptContext<'_, 'sess, Early> = AcceptContext {
             shared: SharedContext {
@@ -264,9 +266,14 @@ impl<'sess, S: Stage> AttributeParser<'sess, S> {
         target: Target,
         omit_doc: OmitDoc,
         lower_span: impl Copy + Fn(Span) -> Span,
-        mut emit_lint: impl FnMut(LintId, Span, AttributeLintKind),
+        mut emit_lint: impl FnMut(LintId, MultiSpan, AttributeLintKind),
     ) -> Vec<Attribute> {
         let mut attributes = Vec::new();
+        // We store the attributes we intend to discard at the end of this function in order to
+        // check they are applied to the right target and error out if necessary. In practice, we
+        // end up dropping only derive attributes and derive helpers, both being fully processed
+        // at macro expansion.
+        let mut dropped_attributes = Vec::new();
         let mut attr_paths: Vec<RefPathParser<'_>> = Vec::new();
         let mut early_parsed_state = EarlyParsedState::default();
 
@@ -275,7 +282,7 @@ impl<'sess, S: Stage> AttributeParser<'sess, S> {
         for attr in attrs {
             // If we're only looking for a single attribute, skip all the ones we don't care about.
             if let Some(expected) = self.parse_only {
-                if !attr.has_name(expected) {
+                if !attr.path_matches(expected) {
                     continue;
                 }
             }
@@ -302,7 +309,7 @@ impl<'sess, S: Stage> AttributeParser<'sess, S> {
                         kind: DocFragmentKind::Sugared(*comment_kind),
                         span: attr_span,
                         comment: *symbol,
-                    }))
+                    }));
                 }
                 ast::AttrKind::Normal(n) => {
                     attr_paths.push(PathParser(&n.item.path));
@@ -317,22 +324,24 @@ impl<'sess, S: Stage> AttributeParser<'sess, S> {
                         }
                     };
 
-                    self.check_attribute_safety(
-                        &attr_path,
-                        lower_span(n.item.span()),
-                        n.item.unsafety,
-                        &mut emit_lint,
-                    );
-
                     let parts =
                         n.item.path.segments.iter().map(|seg| seg.ident.name).collect::<Vec<_>>();
 
                     if let Some(accept) = S::parsers().accepters.get(parts.as_slice()) {
+                        self.check_attribute_safety(
+                            &attr_path,
+                            lower_span(n.item.span()),
+                            n.item.unsafety,
+                            accept.safety,
+                            &mut emit_lint,
+                        );
+
                         let Some(args) = ArgParser::from_attr_args(
                             args,
                             &parts,
                             &self.sess.psess,
                             self.stage.should_emit(),
+                            AllowExprMetavar::No,
                         ) else {
                             continue;
                         };
@@ -390,29 +399,41 @@ impl<'sess, S: Stage> AttributeParser<'sess, S> {
                             Self::check_target(&accept.allowed_targets, target, &mut cx);
                         }
                     } else {
-                        // If we're here, we must be compiling a tool attribute... Or someone
-                        // forgot to parse their fancy new attribute. Let's warn them in any case.
-                        // If you are that person, and you really think your attribute should
-                        // remain unparsed, carefully read the documentation in this module and if
-                        // you still think so you can add an exception to this assertion.
-
-                        // FIXME(jdonszelmann): convert other attributes, and check with this that
-                        // we caught em all
-                        // const FIXME_TEMPORARY_ATTR_ALLOWLIST: &[Symbol] = &[sym::cfg];
-                        // assert!(
-                        //     self.tools.contains(&parts[0]) || true,
-                        //     // || FIXME_TEMPORARY_ATTR_ALLOWLIST.contains(&parts[0]),
-                        //     "attribute {path} wasn't parsed and isn't a know tool attribute",
-                        // );
-
-                        attributes.push(Attribute::Unparsed(Box::new(AttrItem {
+                        let attr = AttrItem {
                             path: attr_path.clone(),
                             args: self
                                 .lower_attr_args(n.item.args.unparsed_ref().unwrap(), lower_span),
                             id: HashIgnoredAttrId { attr_id: attr.id },
                             style: attr.style,
                             span: attr_span,
-                        })));
+                        };
+
+                        self.check_attribute_safety(
+                            &attr_path,
+                            lower_span(n.item.span()),
+                            n.item.unsafety,
+                            AttributeSafety::Normal,
+                            &mut emit_lint,
+                        );
+
+                        if !matches!(self.stage.should_emit(), ShouldEmit::Nothing)
+                            && target == Target::Crate
+                        {
+                            self.check_invalid_crate_level_attr_item(&attr, n.item.span());
+                        }
+
+                        let attr = Attribute::Unparsed(Box::new(attr));
+
+                        if self.tools.contains(&parts[0])
+                            // FIXME: this can be removed once #152369 has been merged.
+                            // https://github.com/rust-lang/rust/pull/152369
+                            || [sym::allow, sym::deny, sym::expect, sym::forbid, sym::warn]
+                                .contains(&parts[0])
+                        {
+                            attributes.push(attr);
+                        } else {
+                            dropped_attributes.push(attr);
+                        }
                     }
                 }
             }
@@ -426,6 +447,12 @@ impl<'sess, S: Stage> AttributeParser<'sess, S> {
             }) {
                 attributes.push(Attribute::Parsed(attr));
             }
+        }
+
+        if !matches!(self.stage.should_emit(), ShouldEmit::Nothing)
+            && target == Target::WherePredicate
+        {
+            self.check_invalid_where_predicate_attrs(attributes.iter().chain(&dropped_attributes));
         }
 
         attributes

@@ -169,8 +169,8 @@ impl<'a, 'ra, 'tcx> visit::Visitor<'a> for DefCollector<'a, 'ra, 'tcx> {
                 DefKind::Macro(macro_kinds)
             }
             ItemKind::GlobalAsm(..) => DefKind::GlobalAsm,
-            ItemKind::Use(use_tree) => {
-                self.create_def(i.id, None, DefKind::Use, use_tree.span);
+            ItemKind::Use(_) => {
+                self.create_def(i.id, None, DefKind::Use, i.span);
                 return visit::walk_item(self, i);
             }
             ItemKind::MacCall(..) | ItemKind::DelegationMac(..) => {
@@ -209,12 +209,15 @@ impl<'a, 'ra, 'tcx> visit::Visitor<'a> for DefCollector<'a, 'ra, 'tcx> {
     fn visit_fn(&mut self, fn_kind: FnKind<'a>, _: &AttrVec, span: Span, _: NodeId) {
         match fn_kind {
             FnKind::Fn(
-                _ctxt,
+                ctxt,
                 _vis,
                 Fn {
                     sig: FnSig { header, decl, span: _ }, ident, generics, contract, body, ..
                 },
-            ) if let Some(coroutine_kind) = header.coroutine_kind => {
+            ) if let Some(coroutine_kind) = header.coroutine_kind
+                // Foreign ones are denied, so don't create them here.
+                && ctxt != visit::FnCtxt::Foreign =>
+            {
                 self.visit_ident(ident);
                 self.visit_fn_header(header);
                 self.visit_generics(generics);
@@ -258,7 +261,7 @@ impl<'a, 'ra, 'tcx> visit::Visitor<'a> for DefCollector<'a, 'ra, 'tcx> {
     }
 
     fn visit_nested_use_tree(&mut self, use_tree: &'a UseTree, id: NodeId) {
-        self.create_def(id, None, DefKind::Use, use_tree.span);
+        self.create_def(id, None, DefKind::Use, use_tree.span());
         visit::walk_use_tree(self, use_tree);
     }
 
@@ -271,6 +274,7 @@ impl<'a, 'ra, 'tcx> visit::Visitor<'a> for DefCollector<'a, 'ra, 'tcx> {
                 expr: _,
                 safety,
                 define_opaque: _,
+                eii_impls: _,
             }) => {
                 let safety = match safety {
                     ast::Safety::Unsafe(_) | ast::Safety::Default => hir::Safety::Unsafe,
@@ -358,8 +362,11 @@ impl<'a, 'ra, 'tcx> visit::Visitor<'a> for DefCollector<'a, 'ra, 'tcx> {
                 },
             ),
             AssocItemKind::Type(box TyAlias { ident, .. }) => (*ident, DefKind::AssocTy),
-            AssocItemKind::MacCall(..) | AssocItemKind::DelegationMac(..) => {
+            AssocItemKind::MacCall(..) => {
                 return self.visit_macro_invoc(i.id);
+            }
+            AssocItemKind::DelegationMac(..) => {
+                span_bug!(i.span, "degation mac invoc should have already been handled")
             }
         };
 

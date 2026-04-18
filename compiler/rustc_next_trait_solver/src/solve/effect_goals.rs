@@ -84,13 +84,13 @@ where
         let cx = ecx.cx();
         let mut candidates = vec![];
 
-        if !ecx.cx().alias_has_const_conditions(alias_ty.def_id) {
+        if !ecx.cx().alias_has_const_conditions(alias_ty.kind.def_id()) {
             return vec![];
         }
 
         for clause in elaborate::elaborate(
             cx,
-            cx.explicit_implied_const_bounds(alias_ty.def_id)
+            cx.explicit_implied_const_bounds(alias_ty.kind.def_id())
                 .iter_instantiated(cx, alias_ty.args)
                 .map(|trait_ref| trait_ref.to_host_effect_clause(cx, goal.predicate.constness)),
         ) {
@@ -103,7 +103,7 @@ where
                     // Const conditions must hold for the implied const bound to hold.
                     ecx.add_goals(
                         GoalSource::AliasBoundConstCondition,
-                        cx.const_conditions(alias_ty.def_id)
+                        cx.const_conditions(alias_ty.kind.def_id())
                             .iter_instantiated(cx, alias_ty.args)
                             .map(|trait_ref| {
                                 goal.with(
@@ -272,6 +272,7 @@ where
         todo!("Fn* are not yet const")
     }
 
+    #[instrument(level = "trace", skip_all, ret)]
     fn consider_builtin_fn_trait_candidates(
         ecx: &mut EvalCtxt<'_, D>,
         goal: Goal<I, Self>,
@@ -289,7 +290,7 @@ where
         let output_is_sized_pred =
             ty::TraitRef::new(cx, cx.require_trait_lang_item(SolverTraitLangItem::Sized), [output]);
         let requirements = cx
-            .const_conditions(def_id.into())
+            .const_conditions(def_id)
             .iter_instantiated(cx, args)
             .map(|trait_ref| {
                 (

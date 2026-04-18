@@ -10,11 +10,15 @@ pub use tls_db::{attach_db, attach_db_allow_change, with_attached_db};
 
 use base_db::Crate;
 use hir_def::{
-    AdtId, CallableDefId, DefWithBodyId, EnumVariantId, HasModule, ItemContainerId, StructId,
-    UnionId, VariantId,
+    AdtId, CallableDefId, DefWithBodyId, EnumVariantId, ExpressionStoreOwnerId, HasModule,
+    ItemContainerId, StructId, UnionId, VariantId,
     attrs::AttrFlags,
+    expr_store::{Body, ExpressionStore},
     lang_item::LangItems,
-    signatures::{FieldData, FnFlags, ImplFlags, StructFlags, TraitFlags},
+    signatures::{
+        EnumSignature, FieldData, FnFlags, FunctionSignature, ImplFlags, ImplSignature,
+        StructFlags, StructSignature, TraitFlags, TraitSignature, UnionSignature,
+    },
 };
 use la_arena::Idx;
 use rustc_abi::{ReprFlags, ReprOptions};
@@ -548,7 +552,7 @@ impl AdtDef {
         let db = interner.db();
         let (flags, variants, repr) = match def_id {
             AdtId::StructId(struct_id) => {
-                let data = db.struct_signature(struct_id);
+                let data = StructSignature::of(db, struct_id);
 
                 let flags = AdtFlags {
                     is_enum: false,
@@ -775,15 +779,15 @@ impl fmt::Debug for AdtDef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         crate::with_attached_db(|db| match self.inner().id {
             AdtId::StructId(struct_id) => {
-                let data = db.struct_signature(struct_id);
+                let data = StructSignature::of(db, struct_id);
                 f.write_str(data.name.as_str())
             }
             AdtId::UnionId(union_id) => {
-                let data = db.union_signature(union_id);
+                let data = UnionSignature::of(db, union_id);
                 f.write_str(data.name.as_str())
             }
             AdtId::EnumId(enum_id) => {
-                let data = db.enum_signature(enum_id);
+                let data = EnumSignature::of(db, enum_id);
                 f.write_str(data.name.as_str())
             }
         })
@@ -1193,7 +1197,8 @@ impl<'db> Interner for DbInterner<'db> {
             | SolverDefId::ImplId(_)
             | SolverDefId::BuiltinDeriveImplId(_)
             | SolverDefId::InternedClosureId(_)
-            | SolverDefId::InternedCoroutineId(_) => {
+            | SolverDefId::InternedCoroutineId(_)
+            | SolverDefId::AnonConstId(_) => {
                 return VariancesOf::empty(self);
             }
         };
@@ -1230,7 +1235,7 @@ impl<'db> Interner for DbInterner<'db> {
             SolverDefId::InternedOpaqueTyId(_) => AliasTyKind::Opaque,
             SolverDefId::TypeAliasId(type_alias) => match type_alias.loc(self.db).container {
                 ItemContainerId::ImplId(impl_)
-                    if self.db.impl_signature(impl_).target_trait.is_none() =>
+                    if ImplSignature::of(self.db, impl_).target_trait.is_none() =>
                 {
                     AliasTyKind::Inherent
                 }
@@ -1249,7 +1254,7 @@ impl<'db> Interner for DbInterner<'db> {
             SolverDefId::InternedOpaqueTyId(_) => AliasTermKind::OpaqueTy,
             SolverDefId::TypeAliasId(type_alias) => match type_alias.loc(self.db).container {
                 ItemContainerId::ImplId(impl_)
-                    if self.db.impl_signature(impl_).target_trait.is_none() =>
+                    if ImplSignature::of(self.db, impl_).target_trait.is_none() =>
                 {
                     AliasTermKind::InherentTy
                 }
@@ -1260,7 +1265,9 @@ impl<'db> Interner for DbInterner<'db> {
             },
             // rustc creates an `AnonConst` for consts, and evaluates them with CTFE (normalizing projections
             // via selection, similar to ours `find_matching_impl()`, and not with the trait solver), so mimic it.
-            SolverDefId::ConstId(_) => AliasTermKind::UnevaluatedConst,
+            SolverDefId::ConstId(_) | SolverDefId::AnonConstId(_) => {
+                AliasTermKind::UnevaluatedConst
+            }
             _ => unimplemented!("Unexpected alias: {:?}", alias.def_id),
         }
     }
@@ -1308,22 +1315,10 @@ impl<'db> Interner for DbInterner<'db> {
             SolverDefId::TypeAliasId(it) => it.lookup(self.db()).container,
             SolverDefId::ConstId(it) => it.lookup(self.db()).container,
             SolverDefId::InternedClosureId(it) => {
-                return self
-                    .db()
-                    .lookup_intern_closure(it)
-                    .0
-                    .as_generic_def_id(self.db())
-                    .unwrap()
-                    .into();
+                return self.db().lookup_intern_closure(it).0.generic_def(self.db()).into();
             }
             SolverDefId::InternedCoroutineId(it) => {
-                return self
-                    .db()
-                    .lookup_intern_coroutine(it)
-                    .0
-                    .as_generic_def_id(self.db())
-                    .unwrap()
-                    .into();
+                return self.db().lookup_intern_coroutine(it).0.generic_def(self.db()).into();
             }
             SolverDefId::StaticId(_)
             | SolverDefId::AdtId(_)
@@ -1332,7 +1327,8 @@ impl<'db> Interner for DbInterner<'db> {
             | SolverDefId::BuiltinDeriveImplId(_)
             | SolverDefId::EnumVariantId(..)
             | SolverDefId::Ctor(..)
-            | SolverDefId::InternedOpaqueTyId(..) => panic!(),
+            | SolverDefId::InternedOpaqueTyId(..)
+            | SolverDefId::AnonConstId(_) => panic!(),
         };
 
         match container {
@@ -1361,8 +1357,8 @@ impl<'db> Interner for DbInterner<'db> {
         // FIXME: Make this a query? I don't believe this can be accessed from bodies other than
         // the current infer query, except with revealed opaques - is it rare enough to not matter?
         let InternedCoroutine(owner, expr_id) = def_id.0.loc(self.db);
-        let body = self.db.body(owner);
-        let expr = &body[expr_id];
+        let store = ExpressionStore::of(self.db, owner);
+        let expr = &store[expr_id];
         match *expr {
             hir_def::hir::Expr::Closure { closure_kind, .. } => match closure_kind {
                 hir_def::hir::ClosureKind::Coroutine(movability) => match movability {
@@ -1443,81 +1439,55 @@ impl<'db> Interner for DbInterner<'db> {
         }
     }
 
-    #[tracing::instrument(level = "debug", skip(self), ret)]
     fn predicates_of(
         self,
         def_id: Self::DefId,
     ) -> EarlyBinder<Self, impl IntoIterator<Item = Self::Clause>> {
-        predicates_of(self.db, def_id).all_predicates().map_bound(|it| it.iter().copied())
+        predicates_of(self.db, def_id).all_predicates()
     }
 
-    #[tracing::instrument(level = "debug", skip(self), ret)]
     fn own_predicates_of(
         self,
         def_id: Self::DefId,
     ) -> EarlyBinder<Self, impl IntoIterator<Item = Self::Clause>> {
-        predicates_of(self.db, def_id).own_predicates().map_bound(|it| it.iter().copied())
+        predicates_of(self.db, def_id).own_explicit_predicates()
     }
 
-    #[tracing::instrument(skip(self), ret)]
     fn explicit_super_predicates_of(
         self,
         def_id: Self::TraitId,
     ) -> EarlyBinder<Self, impl IntoIterator<Item = (Self::Clause, Self::Span)>> {
-        let is_self = |ty: Ty<'db>| match ty.kind() {
-            rustc_type_ir::TyKind::Param(param) => param.index == 0,
-            _ => false,
-        };
-
-        GenericPredicates::query_explicit(self.db, def_id.0.into()).map_bound(move |predicates| {
-            predicates
-                .iter()
-                .copied()
-                .filter(move |p| match p.kind().skip_binder() {
-                    // rustc has the following assertion:
-                    // https://github.com/rust-lang/rust/blob/52618eb338609df44978b0ca4451ab7941fd1c7a/compiler/rustc_hir_analysis/src/hir_ty_lowering/bounds.rs#L525-L608
-                    ClauseKind::Trait(it) => is_self(it.self_ty()),
-                    ClauseKind::TypeOutlives(it) => is_self(it.0),
-                    ClauseKind::Projection(it) => is_self(it.self_ty()),
-                    ClauseKind::HostEffect(it) => is_self(it.self_ty()),
-                    _ => false,
-                })
-                .map(|p| (p, Span::dummy()))
-        })
+        GenericPredicates::query(self.db, def_id.0.into())
+            .explicit_non_assoc_types_predicates()
+            .map_bound(move |predicates| {
+                predicates.filter(|p| is_clause_at_ty(p, is_ty_self)).map(|p| (p, Span::dummy()))
+            })
     }
 
-    #[tracing::instrument(skip(self), ret)]
     fn explicit_implied_predicates_of(
         self,
         def_id: Self::DefId,
     ) -> EarlyBinder<Self, impl IntoIterator<Item = (Self::Clause, Self::Span)>> {
-        fn is_self_or_assoc(ty: Ty<'_>) -> bool {
-            match ty.kind() {
-                rustc_type_ir::TyKind::Param(param) => param.index == 0,
-                rustc_type_ir::TyKind::Alias(rustc_type_ir::AliasTyKind::Projection, alias) => {
-                    is_self_or_assoc(alias.self_ty())
-                }
-                _ => false,
+        fn is_ty_assoc_of_self(ty: Ty<'_>) -> bool {
+            // FIXME: Is this correct wrt. combined kind of assoc type bounds, i.e. `where Self::Assoc: Trait<Assoc2: Trait>`
+            // wrt. `Assoc2`, which we should exclude?
+            if let TyKind::Alias(AliasTyKind::Projection, alias) = ty.kind() {
+                is_ty_assoc_of_self(alias.self_ty())
+            } else {
+                is_ty_self(ty)
             }
         }
 
-        predicates_of(self.db, def_id).explicit_implied_predicates().map_bound(|predicates| {
-            predicates
-                .iter()
-                .copied()
-                .filter(|p| match p.kind().skip_binder() {
-                    ClauseKind::Trait(it) => is_self_or_assoc(it.self_ty()),
-                    ClauseKind::TypeOutlives(it) => is_self_or_assoc(it.0),
-                    ClauseKind::Projection(it) => is_self_or_assoc(it.self_ty()),
-                    ClauseKind::HostEffect(it) => is_self_or_assoc(it.self_ty()),
-                    // FIXME: Not sure is this correct to allow other clauses but we might replace
-                    // `generic_predicates_ns` query here with something closer to rustc's
-                    // `implied_bounds_with_filter`, which is more granular lowering than this
-                    // "lower at once and then filter" implementation.
-                    _ => true,
-                })
-                .map(|p| (p, Span::dummy()))
-        })
+        let predicates = predicates_of(self.db, def_id);
+        let non_assoc_types = predicates
+            .explicit_non_assoc_types_predicates()
+            .skip_binder()
+            .filter(|p| is_clause_at_ty(p, is_ty_self));
+        let assoc_types = predicates
+            .explicit_assoc_types_predicates()
+            .skip_binder()
+            .filter(|p| is_clause_at_ty(p, is_ty_assoc_of_self));
+        EarlyBinder::bind(non_assoc_types.chain(assoc_types).map(|it| (it, Span::dummy())))
     }
 
     fn impl_super_outlives(
@@ -1795,6 +1765,7 @@ impl<'db> Interner for DbInterner<'db> {
                     | SolverDefId::InternedCoroutineId(_)
                     | SolverDefId::InternedOpaqueTyId(_)
                     | SolverDefId::EnumVariantId(_)
+                    | SolverDefId::AnonConstId(_)
                     | SolverDefId::Ctor(_) => return None,
                 };
                 module.block(self.db)
@@ -1933,7 +1904,7 @@ impl<'db> Interner for DbInterner<'db> {
 
     fn impl_is_default(self, impl_def_id: Self::ImplId) -> bool {
         match impl_def_id {
-            AnyImplId::ImplId(impl_id) => self.db.impl_signature(impl_id).is_default(),
+            AnyImplId::ImplId(impl_id) => ImplSignature::of(self.db, impl_id).is_default(),
             AnyImplId::BuiltinDeriveImplId(_) => false,
         }
     }
@@ -1960,7 +1931,7 @@ impl<'db> Interner for DbInterner<'db> {
         let AnyImplId::ImplId(impl_id) = impl_id else {
             return ImplPolarity::Positive;
         };
-        let impl_data = self.db().impl_signature(impl_id);
+        let impl_data = ImplSignature::of(self.db(), impl_id);
         if impl_data.flags.contains(ImplFlags::NEGATIVE) {
             ImplPolarity::Negative
         } else {
@@ -1969,12 +1940,12 @@ impl<'db> Interner for DbInterner<'db> {
     }
 
     fn trait_is_auto(self, trait_: Self::TraitId) -> bool {
-        let trait_data = self.db().trait_signature(trait_.0);
+        let trait_data = TraitSignature::of(self.db(), trait_.0);
         trait_data.flags.contains(TraitFlags::AUTO)
     }
 
     fn trait_is_alias(self, trait_: Self::TraitId) -> bool {
-        let trait_data = self.db().trait_signature(trait_.0);
+        let trait_data = TraitSignature::of(self.db(), trait_.0);
         trait_data.flags.contains(TraitFlags::ALIAS)
     }
 
@@ -1983,7 +1954,7 @@ impl<'db> Interner for DbInterner<'db> {
     }
 
     fn trait_is_fundamental(self, trait_: Self::TraitId) -> bool {
-        let trait_data = self.db().trait_signature(trait_.0);
+        let trait_data = TraitSignature::of(self.db(), trait_.0);
         trait_data.flags.contains(TraitFlags::FUNDAMENTAL)
     }
 
@@ -2006,9 +1977,9 @@ impl<'db> Interner for DbInterner<'db> {
         // FIXME: Make this a query? I don't believe this can be accessed from bodies other than
         // the current infer query, except with revealed opaques - is it rare enough to not matter?
         let InternedCoroutine(owner, expr_id) = def_id.0.loc(self.db);
-        let body = self.db.body(owner);
+        let store = ExpressionStore::of(self.db, owner);
         matches!(
-            body[expr_id],
+            store[expr_id],
             hir_def::hir::Expr::Closure {
                 closure_kind: hir_def::hir::ClosureKind::Coroutine(_),
                 ..
@@ -2020,9 +1991,9 @@ impl<'db> Interner for DbInterner<'db> {
         // FIXME: Make this a query? I don't believe this can be accessed from bodies other than
         // the current infer query, except with revealed opaques - is it rare enough to not matter?
         let InternedCoroutine(owner, expr_id) = def_id.0.loc(self.db);
-        let body = self.db.body(owner);
+        let store = ExpressionStore::of(self.db, owner);
         matches!(
-            body[expr_id],
+            store[expr_id],
             hir_def::hir::Expr::Closure { closure_kind: hir_def::hir::ClosureKind::Async, .. }
                 | hir_def::hir::Expr::Async { .. }
         )
@@ -2143,7 +2114,7 @@ impl<'db> Interner for DbInterner<'db> {
         crate::opaques::opaque_types_defined_by(self.db, def_id, &mut result);
 
         // Collect coroutines.
-        let body = self.db.body(def_id);
+        let body = Body::of(self.db, def_id);
         body.exprs().for_each(|(expr_id, expr)| {
             if matches!(
                 expr,
@@ -2154,8 +2125,10 @@ impl<'db> Interner for DbInterner<'db> {
                         ..
                     }
             ) {
-                let coroutine =
-                    InternedCoroutineId::new(self.db, InternedCoroutine(def_id, expr_id));
+                let coroutine = InternedCoroutineId::new(
+                    self.db,
+                    InternedCoroutine(ExpressionStoreOwnerId::Body(def_id), expr_id),
+                );
                 result.push(coroutine.into());
             }
         });
@@ -2184,7 +2157,7 @@ impl<'db> Interner for DbInterner<'db> {
             CallableDefId::FunctionId(id) => id,
             _ => return false,
         };
-        self.db().function_signature(id).flags.contains(FnFlags::CONST)
+        FunctionSignature::of(self.db(), id).flags.contains(FnFlags::CONST)
     }
 
     fn impl_is_const(self, _def_id: Self::ImplId) -> bool {
@@ -2232,11 +2205,11 @@ impl<'db> Interner for DbInterner<'db> {
     }
 
     fn trait_is_coinductive(self, trait_: Self::TraitId) -> bool {
-        self.db().trait_signature(trait_.0).flags.contains(TraitFlags::COINDUCTIVE)
+        TraitSignature::of(self.db(), trait_.0).flags.contains(TraitFlags::COINDUCTIVE)
     }
 
     fn trait_is_unsafe(self, trait_: Self::TraitId) -> bool {
-        self.db().trait_signature(trait_.0).flags.contains(TraitFlags::UNSAFE)
+        TraitSignature::of(self.db(), trait_.0).flags.contains(TraitFlags::UNSAFE)
     }
 
     fn impl_self_is_guaranteed_unsized(self, _def_id: Self::ImplId) -> bool {
@@ -2292,6 +2265,24 @@ impl<'db> Interner for DbInterner<'db> {
             self,
             UnevaluatedConst { def: GeneralConstIdWrapper(id), args: GenericArgs::empty(self) },
         ))
+    }
+}
+
+fn is_ty_self(ty: Ty<'_>) -> bool {
+    match ty.kind() {
+        TyKind::Param(param) => param.index == 0,
+        _ => false,
+    }
+}
+fn is_clause_at_ty(p: &Clause<'_>, filter: impl FnOnce(Ty<'_>) -> bool) -> bool {
+    match p.kind().skip_binder() {
+        // rustc has the following assertion:
+        // https://github.com/rust-lang/rust/blob/52618eb338609df44978b0ca4451ab7941fd1c7a/compiler/rustc_hir_analysis/src/hir_ty_lowering/bounds.rs#L525-L608
+        ClauseKind::Trait(it) => filter(it.self_ty()),
+        ClauseKind::TypeOutlives(it) => filter(it.0),
+        ClauseKind::Projection(it) => filter(it.self_ty()),
+        ClauseKind::HostEffect(it) => filter(it.self_ty()),
+        _ => false,
     }
 }
 

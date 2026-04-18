@@ -72,7 +72,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         debug!(?bound_sig, ?liberated_sig);
 
         let parent_args =
-            GenericArgs::identity_for_item(tcx, tcx.typeck_root_def_id(expr_def_id.to_def_id()));
+            GenericArgs::identity_for_item(tcx, tcx.typeck_root_def_id_local(expr_def_id));
 
         let tupled_upvars_ty = self.next_ty_var(expr_span);
 
@@ -305,7 +305,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         closure_kind: hir::ClosureKind,
     ) -> (Option<ExpectedSig<'tcx>>, Option<ty::ClosureKind>) {
         match *expected_ty.kind() {
-            ty::Alias(ty::Opaque, ty::AliasTy { def_id, args, .. }) => self
+            ty::Alias(ty::AliasTy { kind: ty::Opaque { def_id }, args, .. }) => self
                 .deduce_closure_signature_from_predicates(
                     expected_ty,
                     closure_kind,
@@ -1017,14 +1017,14 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     get_future_output(obligation.predicate, obligation.cause.span)
                 })?
             }
-            ty::Alias(ty::Projection, _) => {
+            ty::Alias(ty::AliasTy { kind: ty::Projection { .. }, .. }) => {
                 return Some(Ty::new_error_with_message(
                     self.tcx,
                     closure_span,
                     "this projection should have been projected to an opaque type",
                 ));
             }
-            ty::Alias(ty::Opaque, ty::AliasTy { def_id, args, .. }) => self
+            ty::Alias(ty::AliasTy { kind: ty::Opaque { def_id }, args, .. }) => self
                 .tcx
                 .explicit_item_self_bounds(def_id)
                 .iter_instantiated_copied(self.tcx, args)

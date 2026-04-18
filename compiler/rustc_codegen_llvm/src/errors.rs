@@ -182,9 +182,9 @@ pub(crate) struct CopyBitcode {
 
 #[derive(Diagnostic)]
 #[diag(
-    "unknown debuginfo compression algorithm {$algorithm} - will fall back to uncompressed debuginfo"
+    "unsupported debuginfo compression algorithm {$algorithm} - will fall back to uncompressed debuginfo"
 )]
-pub(crate) struct UnknownCompression {
+pub(crate) struct UnsupportedCompression {
     pub algorithm: &'static str,
 }
 
@@ -206,5 +206,37 @@ pub(crate) struct FixedX18InvalidArch<'a> {
 }
 
 #[derive(Diagnostic)]
-#[diag("`-Zsanitizer-kcfi-arity` requires LLVM 21.0.0 or later")]
-pub(crate) struct SanitizerKcfiArityRequiresLLVM2100;
+#[diag("`-Zpacked-stack` is incompatible with `backchain` target feature")]
+#[note(
+    "enabling both `-Zpacked-stack` and the `backchain` target feature is incompatible with the default s390x ABI. Switch to s390x-unknown-none-softfloat if you need both attributes"
+)]
+pub(crate) struct PackedStackBackchainNeedsSoftfloat;
+
+#[derive(Diagnostic)]
+#[diag(
+    "intrinsic signature mismatch for `{$name}`: expected signature `{$llvm_fn_ty}`, found `{$rust_fn_ty}`"
+)]
+pub(crate) struct IntrinsicSignatureMismatch<'a> {
+    pub name: &'a str,
+    pub llvm_fn_ty: &'a str,
+    pub rust_fn_ty: &'a str,
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag("unknown LLVM intrinsic `{$name}`")]
+pub(crate) struct UnknownIntrinsic<'a> {
+    pub name: &'a str,
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag("intrinsic `{$name}` cannot be used with target arch `{$target_arch}`")]
+pub(crate) struct IntrinsicWrongArch<'a> {
+    pub name: &'a str,
+    pub target_arch: &'a str,
+    #[primary_span]
+    pub span: Span,
+}

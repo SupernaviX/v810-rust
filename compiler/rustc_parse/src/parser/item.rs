@@ -13,7 +13,7 @@ use rustc_errors::{Applicability, PResult, StashKey, msg, struct_span_code_err};
 use rustc_session::lint::builtin::VARARGS_WITHOUT_PATTERN;
 use rustc_span::edit_distance::edit_distance;
 use rustc_span::edition::Edition;
-use rustc_span::{DUMMY_SP, ErrorGuaranteed, Ident, Span, Symbol, kw, source_map, sym};
+use rustc_span::{DUMMY_SP, ErrorGuaranteed, Ident, Span, Symbol, kw, respan, sym};
 use thin_vec::{ThinVec, thin_vec};
 use tracing::debug;
 
@@ -192,7 +192,22 @@ impl<'a> Parser<'a> {
 
             // At this point, we have failed to parse an item.
             if !matches!(vis.kind, VisibilityKind::Inherited) {
-                this.dcx().emit_err(errors::VisibilityNotFollowedByItem { span: vis.span, vis });
+                let mut err = this
+                    .dcx()
+                    .create_err(errors::VisibilityNotFollowedByItem { span: vis.span, vis });
+                if let Some((ident, _)) = this.token.ident()
+                    && !ident.is_used_keyword()
+                    && let Some((similar_kw, is_incorrect_case)) = ident
+                        .name
+                        .find_similar(&rustc_span::symbol::used_keywords(|| ident.span.edition()))
+                {
+                    err.subdiagnostic(errors::MisspelledKw {
+                        similar_kw: similar_kw.to_string(),
+                        span: ident.span,
+                        is_incorrect_case,
+                    });
+                }
+                err.emit();
             }
 
             if let Defaultness::Default(span) = def {
@@ -248,10 +263,18 @@ impl<'a> Parser<'a> {
             self.parse_use_item()?
         } else if self.check_fn_front_matter(check_pub, case) {
             // FUNCTION ITEM
+            let defaultness = def_();
+            if let Defaultness::Default(span) = defaultness {
+                // Default functions should only require feature `min_specialization`. We remove the
+                // `specialization` tag again as such spans *require* feature `specialization` to be
+                // enabled. In a later stage, we make `specialization` imply `min_specialization`.
+                self.psess.gated_spans.gate(sym::min_specialization, span);
+                self.psess.gated_spans.ungate_last(sym::specialization, span);
+            }
             let (ident, sig, generics, contract, body) =
                 self.parse_fn(attrs, fn_parse_mode, lo, vis, case)?;
             ItemKind::Fn(Box::new(Fn {
-                defaultness: def_(),
+                defaultness,
                 ident,
                 sig,
                 generics,
@@ -410,7 +433,7 @@ impl<'a> Parser<'a> {
         let tree = self.parse_use_tree()?;
         if let Err(mut e) = self.expect_semi() {
             match tree.kind {
-                UseTreeKind::Glob => {
+                UseTreeKind::Glob(_) => {
                     e.note("the wildcard token must be last on the path");
                 }
                 UseTreeKind::Nested { .. } => {
@@ -603,6 +626,7 @@ impl<'a> Parser<'a> {
     fn parse_polarity(&mut self) -> ast::ImplPolarity {
         // Disambiguate `impl !Trait for Type { ... }` and `impl ! { ... }` for the never type.
         if self.check(exp!(Bang)) && self.look_ahead(1, |t| t.can_begin_type()) {
+            self.psess.gated_spans.gate(sym::negative_impls, self.token.span);
             self.bump(); // `!`
             ast::ImplPolarity::Negative(self.prev_token.span)
         } else {
@@ -833,7 +857,7 @@ impl<'a> Parser<'a> {
             kind: AssocItemKind::DelegationMac(Box::new(DelegationMac {
                 qself: None,
                 prefix: of_trait.trait_ref.path.clone(),
-                suffixes: None,
+                suffixes: DelegationSuffixes::Glob(whole_reuse_span),
                 body,
             })),
         }));
@@ -855,10 +879,12 @@ impl<'a> Parser<'a> {
 
         Ok(if self.eat_path_sep() {
             let suffixes = if self.eat(exp!(Star)) {
-                None
+                DelegationSuffixes::Glob(self.prev_token.span)
             } else {
                 let parse_suffix = |p: &mut Self| Ok((p.parse_path_segment_ident()?, rename(p)?));
-                Some(self.parse_delim_comma_seq(exp!(OpenBrace), exp!(CloseBrace), parse_suffix)?.0)
+                DelegationSuffixes::List(
+                    self.parse_delim_comma_seq(exp!(OpenBrace), exp!(CloseBrace), parse_suffix)?.0,
+                )
             };
 
             ItemKind::DelegationMac(Box::new(DelegationMac {
@@ -1015,6 +1041,7 @@ impl<'a> Parser<'a> {
         if self.check_keyword(exp!(Default))
             && self.look_ahead(1, |t| t.is_non_raw_ident_where(|i| i.name != kw::As))
         {
+            self.psess.gated_spans.gate(sym::specialization, self.token.span);
             self.bump(); // `default`
             Defaultness::Default(self.prev_token_uninterpolated_span())
         } else if self.eat_keyword(exp!(Final)) {
@@ -1210,6 +1237,7 @@ impl<'a> Parser<'a> {
                             mutability: _,
                             expr,
                             define_opaque,
+                            eii_impls: _,
                         }) => {
                             self.dcx().emit_err(errors::AssociatedStaticItemNotAllowed { span });
                             AssocItemKind::Const(Box::new(ConstItem {
@@ -1303,13 +1331,13 @@ impl<'a> Parser<'a> {
                 }
             };
 
-        Ok(UseTree { prefix, kind, span: lo.to(self.prev_token.span) })
+        Ok(UseTree { prefix, kind })
     }
 
     /// Parses `*` or `{...}`.
     fn parse_use_tree_glob_or_nested(&mut self) -> PResult<'a, UseTreeKind> {
         Ok(if self.eat(exp!(Star)) {
-            UseTreeKind::Glob
+            UseTreeKind::Glob(self.prev_token.span)
         } else {
             let lo = self.token.span;
             UseTreeKind::Nested {
@@ -1478,6 +1506,7 @@ impl<'a> Parser<'a> {
                                 },
                                 safety: Safety::Default,
                                 define_opaque: None,
+                                eii_impls: ThinVec::default(),
                             }))
                         }
                         _ => return self.error_bad_item_kind(span, &kind, "`extern` blocks"),
@@ -1492,7 +1521,10 @@ impl<'a> Parser<'a> {
         let span = self.psess.source_map().guess_head_span(span);
         let descr = kind.descr();
         let help = match kind {
-            ItemKind::DelegationMac(deleg) if deleg.suffixes.is_none() => false,
+            ItemKind::DelegationMac(box DelegationMac {
+                suffixes: DelegationSuffixes::Glob(_),
+                ..
+            }) => false,
             _ => true,
         };
         self.dcx().emit_err(errors::BadItemKind { span, descr, ctx, help });
@@ -1611,7 +1643,15 @@ impl<'a> Parser<'a> {
 
         self.expect_semi()?;
 
-        let item = StaticItem { ident, ty, safety, mutability, expr, define_opaque: None };
+        let item = StaticItem {
+            ident,
+            ty,
+            safety,
+            mutability,
+            expr,
+            define_opaque: None,
+            eii_impls: ThinVec::default(),
+        };
         Ok(ItemKind::Static(Box::new(item)))
     }
 
@@ -3557,7 +3597,7 @@ impl<'a> Parser<'a> {
             _ => return Ok(None),
         };
 
-        let eself = source_map::respan(eself_lo.to(eself_hi), eself);
+        let eself = respan(eself_lo.to(eself_hi), eself);
         Ok(Some(Param::from_self(AttrVec::default(), eself, eself_ident)))
     }
 

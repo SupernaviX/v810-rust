@@ -74,10 +74,18 @@ pub mod ext {
         expr_from_text("_")
     }
     pub fn expr_ty_default(ty: &ast::Type) -> ast::Expr {
-        expr_from_text(&format!("{ty}::default()"))
+        if !ty.needs_angles_in_path() {
+            expr_from_text(&format!("{ty}::default()"))
+        } else {
+            expr_from_text(&format!("<{ty}>::default()"))
+        }
     }
     pub fn expr_ty_new(ty: &ast::Type) -> ast::Expr {
-        expr_from_text(&format!("{ty}::new()"))
+        if !ty.needs_angles_in_path() {
+            expr_from_text(&format!("{ty}::new()"))
+        } else {
+            expr_from_text(&format!("<{ty}>::new()"))
+        }
     }
     pub fn expr_self() -> ast::Expr {
         expr_from_text("self")
@@ -1312,6 +1320,18 @@ pub fn meta_token_tree(path: ast::Path, tt: ast::TokenTree) -> ast::Meta {
 
 pub fn meta_path(path: ast::Path) -> ast::Meta {
     ast_from_text(&format!("#[{path}]"))
+}
+
+pub fn cfg_attr_meta(
+    predicate: ast::CfgPredicate,
+    inner: impl IntoIterator<Item = ast::Meta>,
+) -> ast::CfgAttrMeta {
+    let inner = inner.into_iter().join(", ");
+    ast_from_text(&format!("#![cfg_attr({predicate}, {inner})]"))
+}
+
+pub fn cfg_flag(flag: &str) -> ast::CfgPredicate {
+    ast_from_text(&format!("#![cfg({flag})]"))
 }
 
 pub fn token_tree(

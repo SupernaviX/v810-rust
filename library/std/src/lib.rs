@@ -94,8 +94,8 @@
 //! pull-requests for your suggested changes.
 //!
 //! Contributions are appreciated! If you see a part of the docs that can be
-//! improved, submit a PR, or chat with us first on [Zulip][rust-zulip]
-//! #docs.
+//! improved, submit a PR, or chat with us first on [Zulip][t-libs-zulip]
+//! #t-libs.
 //!
 //! # A Tour of The Rust Standard Library
 //!
@@ -209,7 +209,7 @@
 //! [multithreading]: thread
 //! [other]: #what-is-in-the-standard-library-documentation
 //! [primitive types]: ../book/ch03-02-data-types.html
-//! [rust-zulip]: https://rust-lang.zulipchat.com/
+//! [t-libs-zulip]: https://rust-lang.zulipchat.com/#narrow/channel/219381-t-libs/
 //! [array]: prim@array
 //! [slice]: prim@slice
 
@@ -275,9 +275,7 @@
 #![feature(cfg_sanitizer_cfi)]
 #![feature(cfg_target_thread_local)]
 #![feature(cfi_encoding)]
-#![feature(const_default)]
 #![feature(const_trait_impl)]
-#![feature(core_float_math)]
 #![feature(decl_macro)]
 #![feature(deprecated_suggestion)]
 #![feature(doc_cfg)]
@@ -287,16 +285,11 @@
 #![feature(f16)]
 #![feature(f128)]
 #![feature(ffi_const)]
-#![feature(formatting_options)]
-#![feature(funnel_shifts)]
 #![feature(intra_doc_pointers)]
-#![feature(iter_advance_by)]
-#![feature(iter_next_chunk)]
 #![feature(lang_items)]
 #![feature(link_cfg)]
 #![feature(linkage)]
 #![feature(macro_metavar_expr_concat)]
-#![feature(maybe_uninit_fill)]
 #![feature(min_specialization)]
 #![feature(must_not_suspend)]
 #![feature(needs_panic_runtime)]
@@ -314,17 +307,19 @@
 #![feature(try_blocks)]
 #![feature(try_trait_v2)]
 #![feature(type_alias_impl_trait)]
-#![feature(uint_carryless_mul)]
 // tidy-alphabetical-end
 //
 // Library features (core):
 // tidy-alphabetical-start
+#![feature(borrowed_buf_init)]
 #![feature(bstr)]
 #![feature(bstr_internals)]
 #![feature(cast_maybe_uninit)]
 #![feature(char_internals)]
 #![feature(clone_to_uninit)]
 #![feature(const_convert)]
+#![feature(const_default)]
+#![feature(core_float_math)]
 #![feature(core_intrinsics)]
 #![feature(core_io_borrowed_buf)]
 #![feature(cstr_display)]
@@ -340,13 +335,21 @@
 #![feature(float_minimum_maximum)]
 #![feature(fmt_internals)]
 #![feature(fn_ptr_trait)]
+#![feature(formatting_options)]
+#![feature(funnel_shifts)]
 #![feature(generic_atomic)]
+#![feature(hash_map_internals)]
+#![feature(hash_map_macro)]
 #![feature(hasher_prefixfree_extras)]
 #![feature(hashmap_internals)]
 #![feature(hint_must_use)]
 #![feature(int_from_ascii)]
 #![feature(ip)]
+#![feature(iter_advance_by)]
+#![feature(iter_next_chunk)]
+#![feature(maybe_dangling)]
 #![feature(maybe_uninit_array_assume_init)]
+#![feature(maybe_uninit_fill)]
 #![feature(panic_can_unwind)]
 #![feature(panic_internals)]
 #![feature(pin_coerce_unsized_trait)]
@@ -364,6 +367,7 @@
 #![feature(sync_unsafe_cell)]
 #![feature(temporary_niche_types)]
 #![feature(ub_checks)]
+#![feature(uint_carryless_mul)]
 #![feature(used_with_arg)]
 // tidy-alphabetical-end
 //
@@ -415,6 +419,13 @@
 // tidy-alphabetical-end
 //
 #![default_lib_allocator]
+// Removed features
+#![unstable_removed(
+    feature = "concat_idents",
+    reason = "Replaced by the macro_metavar_expr_concat feature",
+    link = "https://github.com/rust-lang/rust/issues/29599#issuecomment-2986866250",
+    since = "1.90.0"
+)]
 
 // The Rust prelude
 // The compiler expects the prelude definition to be defined before its use statement.
@@ -535,7 +546,7 @@ pub use core::option;
 pub use core::pin;
 #[stable(feature = "rust1", since = "1.0.0")]
 pub use core::ptr;
-#[unstable(feature = "new_range_api", issue = "125687")]
+#[stable(feature = "new_range_api", since = "1.96.0")]
 pub use core::range;
 #[stable(feature = "rust1", since = "1.0.0")]
 pub use core::result;
@@ -634,7 +645,7 @@ pub mod simd {
 }
 
 #[unstable(feature = "autodiff", issue = "124509")]
-/// This module provides support for automatic differentiation.
+#[doc = include_str!("../../core/src/autodiff.md")]
 pub mod autodiff {
     /// This macro handles automatic differentiation.
     pub use core::autodiff::{autodiff_forward, autodiff_reverse};
@@ -704,6 +715,8 @@ pub use core::cfg_select;
     reason = "`concat_bytes` is not stable enough for use and is subject to change"
 )]
 pub use core::concat_bytes;
+#[unstable(feature = "derive_macro_global_path", issue = "154645")]
+pub use core::derive;
 #[stable(feature = "matches_macro", since = "1.42.0")]
 #[allow(deprecated, deprecated_in_future)]
 pub use core::matches;

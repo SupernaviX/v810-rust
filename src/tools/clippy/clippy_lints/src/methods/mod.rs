@@ -63,6 +63,7 @@ mod manual_inspect;
 mod manual_is_variant_and;
 mod manual_next_back;
 mod manual_ok_or;
+mod manual_option_zip;
 mod manual_repeat_n;
 mod manual_saturating_arithmetic;
 mod manual_str_repeat;
@@ -134,9 +135,8 @@ mod unnecessary_join;
 mod unnecessary_lazy_eval;
 mod unnecessary_literal_unwrap;
 mod unnecessary_map_or;
+mod unnecessary_map_or_else;
 mod unnecessary_min_or_max;
-mod unnecessary_option_map_or_else;
-mod unnecessary_result_map_or_else;
 mod unnecessary_sort_by;
 mod unnecessary_to_owned;
 mod unwrap_expect_used;
@@ -1953,6 +1953,34 @@ declare_clippy_lint! {
 
 declare_clippy_lint! {
     /// ### What it does
+    /// Checks for usage of `a.and_then(|a| b.map(|b| (a, b)))` which can be
+    /// more concisely expressed as `a.zip(b)`.
+    ///
+    /// ### Why is this bad?
+    /// `Option::zip` is more concise and directly expresses the intent of
+    /// combining two `Option` values into a tuple.
+    ///
+    /// ### Example
+    /// ```no_run
+    /// let a: Option<i32> = Some(1);
+    /// let b: Option<i32> = Some(2);
+    /// let _ = a.and_then(|x| b.map(|y| (x, y)));
+    /// ```
+    ///
+    /// Use instead:
+    /// ```no_run
+    /// let a: Option<i32> = Some(1);
+    /// let b: Option<i32> = Some(2);
+    /// let _ = a.zip(b);
+    /// ```
+    #[clippy::version = "1.95.0"]
+    pub MANUAL_OPTION_ZIP,
+    complexity,
+    "manual reimplementation of `Option::zip`"
+}
+
+declare_clippy_lint! {
+    /// ### What it does
     ///
     /// Checks for `repeat().take()` that can be replaced with `repeat_n()`.
     ///
@@ -3030,7 +3058,7 @@ declare_clippy_lint! {
     ///     ptr.sub(8);
     /// }
     /// ```
-    #[clippy::version = "1.92.0"]
+    #[clippy::version = "1.94.0"]
     pub PTR_OFFSET_BY_LITERAL,
     pedantic,
     "unneeded pointer offset"
@@ -4347,6 +4375,7 @@ declare_clippy_lint! {
 }
 
 declare_clippy_lint! {
+    /// ### What it does
     /// Checks for usage of `.map_or_else()` "map closure" for `Option` type.
     ///
     /// ### Why is this bad?
@@ -4814,6 +4843,7 @@ impl_lint_pass!(Methods => [
     MANUAL_IS_VARIANT_AND,
     MANUAL_NEXT_BACK,
     MANUAL_OK_OR,
+    MANUAL_OPTION_ZIP,
     MANUAL_REPEAT_N,
     MANUAL_SATURATING_ARITHMETIC,
     MANUAL_SPLIT_ONCE,
@@ -5115,6 +5145,7 @@ impl Methods {
                     }
                 },
                 (sym::and_then, [arg]) => {
+                    manual_option_zip::check(cx, expr, recv, arg, self.msrv);
                     let biom_option_linted = bind_instead_of_map::check_and_then_some(cx, expr, recv, arg);
                     let biom_result_linted = bind_instead_of_map::check_and_then_ok(cx, expr, recv, arg);
                     if !biom_option_linted && !biom_result_linted {
@@ -5449,8 +5480,7 @@ impl Methods {
                 },
                 (sym::map_or_else, [def, map]) => {
                     result_map_or_else_none::check(cx, expr, recv, def, map);
-                    unnecessary_option_map_or_else::check(cx, expr, recv, def, map);
-                    unnecessary_result_map_or_else::check(cx, expr, recv, def, map);
+                    unnecessary_map_or_else::check(cx, expr, recv, def, map, call_span);
                 },
                 (sym::next, []) => {
                     if let Some((name2, recv2, args2, _, _)) = method_call(recv) {

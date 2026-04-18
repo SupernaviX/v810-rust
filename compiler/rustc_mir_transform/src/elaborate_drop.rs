@@ -9,8 +9,7 @@ use rustc_middle::ty::adjustment::PointerCoercion;
 use rustc_middle::ty::util::IntTypeExt;
 use rustc_middle::ty::{self, GenericArg, GenericArgsRef, Ty, TyCtxt};
 use rustc_middle::{bug, span_bug, traits};
-use rustc_span::DUMMY_SP;
-use rustc_span::source_map::{Spanned, dummy_spanned};
+use rustc_span::{DUMMY_SP, Spanned, dummy_spanned};
 use tracing::{debug, instrument};
 
 use crate::patch::MirPatch;
@@ -549,7 +548,16 @@ where
                 let subpath = self.elaborator.field_subpath(variant_path, field_idx);
                 let tcx = self.tcx();
 
-                assert_eq!(self.elaborator.typing_env().typing_mode, ty::TypingMode::PostAnalysis);
+                match self.elaborator.typing_env().typing_mode() {
+                    ty::TypingMode::PostAnalysis => {}
+                    ty::TypingMode::Coherence
+                    | ty::TypingMode::Analysis { .. }
+                    | ty::TypingMode::Borrowck { .. }
+                    | ty::TypingMode::PostBorrowckAnalysis { .. } => {
+                        bug!()
+                    }
+                }
+
                 let field_ty = field.ty(tcx, args);
                 // We silently leave an unnormalized type here to support polymorphic drop
                 // elaboration for users of rustc internal APIs

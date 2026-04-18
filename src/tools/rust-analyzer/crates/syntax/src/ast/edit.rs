@@ -43,8 +43,14 @@ impl ops::Add<u8> for IndentLevel {
     }
 }
 
+impl ops::AddAssign<u8> for IndentLevel {
+    fn add_assign(&mut self, rhs: u8) {
+        self.0 += rhs;
+    }
+}
+
 impl IndentLevel {
-    pub fn single() -> IndentLevel {
+    pub fn zero() -> IndentLevel {
         IndentLevel(0)
     }
     pub fn is_zero(&self) -> bool {
@@ -99,8 +105,7 @@ impl IndentLevel {
     }
 
     pub(super) fn clone_increase_indent(self, node: &SyntaxNode) -> SyntaxNode {
-        let node = node.clone_subtree();
-        let mut editor = SyntaxEditor::new(node.clone());
+        let (mut editor, node) = SyntaxEditor::new(node.clone());
         let tokens = node
             .preorder_with_tokens()
             .filter_map(|event| match event {
@@ -134,8 +139,7 @@ impl IndentLevel {
     }
 
     pub(super) fn clone_decrease_indent(self, node: &SyntaxNode) -> SyntaxNode {
-        let node = node.clone_subtree();
-        let mut editor = SyntaxEditor::new(node.clone());
+        let (mut editor, node) = SyntaxEditor::new(node.clone());
         let tokens = node
             .preorder_with_tokens()
             .filter_map(|event| match event {

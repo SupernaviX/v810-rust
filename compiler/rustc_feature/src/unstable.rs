@@ -234,7 +234,7 @@ declare_features! (
     /// Implementation details of externally implementable items
     (internal, eii_internals, "1.94.0", None),
     /// Implementation details of field representing types.
-    (internal, field_representing_type_raw, "CURRENT_RUSTC_VERSION", None),
+    (internal, field_representing_type_raw, "1.96.0", None),
     /// Outputs useful `assert!` messages
     (unstable, generic_assert, "1.63.0", None),
     /// Allows using the #[rustc_intrinsic] attribute.
@@ -257,6 +257,8 @@ declare_features! (
     (internal, rustc_attrs, "1.0.0", None),
     /// Allows using the `#[stable]` and `#[unstable]` attributes.
     (internal, staged_api, "1.0.0", None),
+    /// Perma-unstable, only used to test the `incomplete_features` lint.
+    (incomplete, test_incomplete_feature, "1.96.0", None),
     /// Added for testing unstable lints; perma-unstable.
     (internal, test_unstable_lint, "1.60.0", None),
     /// Use for stable + negative coherence and strict coherence depending on trait's
@@ -408,6 +410,8 @@ declare_features! (
     (unstable, cfg_target_has_atomic, "1.60.0", Some(94039)),
     /// Allows `cfg(target_has_atomic_equal_alignment = "...")`.
     (unstable, cfg_target_has_atomic_equal_alignment, "1.60.0", Some(93822)),
+    /// Allows `cfg(target_object_format = "...")`.
+    (unstable, cfg_target_object_format, "CURRENT_RUSTC_VERSION", Some(152586)),
     /// Allows `cfg(target_thread_local)`.
     (unstable, cfg_target_thread_local, "1.7.0", Some(29594)),
     /// Allows the use of `#[cfg(ub_checks)` to check if UB checks are enabled.
@@ -429,7 +433,7 @@ declare_features! (
     /// Allows defining and calling c-variadic functions in const contexts.
     (unstable, const_c_variadic, "1.95.0", Some(151787)),
     /// Allows `const || {}` closures in const contexts.
-    (incomplete, const_closures, "1.68.0", Some(106003)),
+    (unstable, const_closures, "1.68.0", Some(106003)),
     /// Allows using `[const] Destruct` bounds and calling drop impls in const contexts.
     (unstable, const_destruct, "1.85.0", Some(133214)),
     /// Allows `for _ in _` loops in const contexts.
@@ -470,6 +474,10 @@ declare_features! (
     (unstable, derive_from, "1.91.0", Some(144889)),
     /// Allows giving non-const impls custom diagnostic messages if attempted to be used as const
     (unstable, diagnostic_on_const, "1.93.0", Some(143874)),
+    /// Allows giving on-move borrowck custom diagnostic messages for a type
+    (unstable, diagnostic_on_move, "1.96.0", Some(154181)),
+    /// Allows giving unresolved imports a custom diagnostic message
+    (unstable, diagnostic_on_unknown, "1.96.0", Some(152900)),
     /// Allows `#[doc(cfg(...))]`.
     (unstable, doc_cfg, "1.21.0", Some(43781)),
     /// Allows `#[doc(masked)]`.
@@ -501,9 +509,11 @@ declare_features! (
     /// Allows the use of `#[ffi_pure]` on foreign functions.
     (unstable, ffi_pure, "1.45.0", Some(58329)),
     /// Experimental field projections.
-    (incomplete, field_projections, "CURRENT_RUSTC_VERSION", Some(145383)),
+    (incomplete, field_projections, "1.96.0", Some(145383)),
     /// Allows marking trait functions as `final` to prevent overriding impls
     (unstable, final_associated_functions, "1.95.0", Some(131179)),
+    /// fma4 target feature on x86.
+    (unstable, fma4_target_feature, "CURRENT_RUSTC_VERSION", Some(155233)),
     /// Controlling the behavior of fmt::Debug
     (unstable, fmt_debug, "1.82.0", Some(129709)),
     /// Allows using `#[align(...)]` on function items
@@ -516,6 +526,8 @@ declare_features! (
     (unstable, frontmatter, "1.88.0", Some(136889)),
     /// Allows defining gen blocks and `gen fn`.
     (unstable, gen_blocks, "1.75.0", Some(117078)),
+    /// Allows using generics in more complex const expressions, based on definitional equality.
+    (unstable, generic_const_args, "1.95.0", Some(151972)),
     /// Allows non-trivial generic constants which have to have wfness manually propagated to callers
     (incomplete, generic_const_exprs, "1.56.0", Some(76560)),
     /// Allows generic parameters and where-clauses on free & associated const items.
@@ -533,7 +545,7 @@ declare_features! (
     /// Target features on hexagon.
     (unstable, hexagon_target_feature, "1.27.0", Some(150250)),
     /// Allows `impl(crate) trait Foo` restrictions.
-    (incomplete, impl_restriction, "CURRENT_RUSTC_VERSION", Some(105077)),
+    (incomplete, impl_restriction, "1.96.0", Some(105077)),
     /// Allows `impl Trait` to be used inside associated types (RFC 2515).
     (unstable, impl_trait_in_assoc_type, "1.70.0", Some(63063)),
     /// Allows `impl Trait` in bindings (`let`).
@@ -565,6 +577,8 @@ declare_features! (
     (unstable, macro_attr, "1.91.0", Some(143547)),
     /// Allow `macro_rules!` derive rules
     (unstable, macro_derive, "1.91.0", Some(143549)),
+    /// Allow `$x:guard` matcher in macros
+    (unstable, macro_guard_matcher, "1.96.0", Some(153104)),
     /// Give access to additional metadata about declarative macro meta-variables.
     (unstable, macro_metavar_expr, "1.61.0", Some(83527)),
     /// Provides a way to concatenate identifiers using metavariable expressions.
@@ -573,6 +587,9 @@ declare_features! (
     (unstable, marker_trait_attr, "1.30.0", Some(29864)),
     /// Enable mgca `type const` syntax before expansion.
     (incomplete, mgca_type_const_syntax, "1.95.0", Some(132980)),
+    /// Allows additional const parameter types, such as [u8; 10] or user defined types.
+    /// User defined types must not have fields more private than the type itself.
+    (unstable, min_adt_const_params, "1.96.0", Some(154042)),
     /// Enables the generic const args MVP (only bare paths, not arbitrary computation).
     (incomplete, min_generic_const_args, "1.84.0", Some(132980)),
     /// A minimal, sound subset of specialization intended to be used by the
@@ -617,8 +634,6 @@ declare_features! (
     (unstable, offset_of_enum, "1.75.0", Some(120141)),
     /// Allows using fields with slice type in offset_of!
     (unstable, offset_of_slice, "1.81.0", Some(126151)),
-    /// Allows using generics in more complex const expressions, based on definitional equality.
-    (unstable, opaque_generic_const_args, "1.95.0", Some(151972)),
     /// Allows using `#[optimize(X)]`.
     (unstable, optimize_attribute, "1.34.0", Some(54882)),
     /// Allows specifying nop padding on functions for dynamic patching.
@@ -687,7 +702,7 @@ declare_features! (
     /// Allows inconsistent bounds in where clauses.
     (unstable, trivial_bounds, "1.28.0", Some(48214)),
     /// Allows using `try {...}` expressions.
-    (unstable, try_blocks, "1.29.0", Some(31436)),
+    (unstable, try_blocks, "1.29.0", Some(154391)),
     /// Allows using `try bikeshed TargetType {...}` expressions.
     (unstable, try_blocks_heterogeneous, "1.94.0", Some(149488)),
     /// Allows `impl Trait` to be used inside type aliases (RFC 2515).
@@ -800,6 +815,6 @@ pub const INCOMPATIBLE_FEATURES: &[(Symbol, Symbol)] = &[
 
 /// Some features require one or more other features to be enabled.
 pub const DEPENDENT_FEATURES: &[(Symbol, &[Symbol])] = &[
-    (sym::opaque_generic_const_args, &[sym::min_generic_const_args]),
+    (sym::generic_const_args, &[sym::min_generic_const_args]),
     (sym::unsized_const_params, &[sym::adt_const_params]),
 ];

@@ -45,7 +45,7 @@ impl<'db> Evaluator<'db> {
             return Ok(false);
         }
 
-        let function_data = self.db.function_signature(def);
+        let function_data = FunctionSignature::of(self.db, def);
         let attrs = AttrFlags::query(self.db, def.into());
         let is_intrinsic = FunctionSignature::is_intrinsic(self.db, def);
 
@@ -152,8 +152,8 @@ impl<'db> Evaluator<'db> {
                     not_supported!("wrong arg count for clone");
                 };
                 let addr = Address::from_bytes(arg.get(self)?)?;
-                let InternedClosure(closure_owner, _) = self.db.lookup_intern_closure(id.0);
-                let infer = InferenceResult::for_body(self.db, closure_owner);
+                let InternedClosure(owner, _) = self.db.lookup_intern_closure(id.0);
+                let infer = InferenceResult::of(self.db, owner);
                 let (captures, _) = infer.closure_info(id.0);
                 let layout = self.layout(self_ty)?;
                 let db = self.db;
@@ -518,7 +518,7 @@ impl<'db> Evaluator<'db> {
             "sched_getaffinity" => {
                 let [_pid, _set_size, set] = args else {
                     return Err(MirEvalError::InternalError(
-                        "libc::write args are not provided".into(),
+                        "sched_getaffinity args are not provided".into(),
                     ));
                 };
                 let set = Address::from_bytes(set.get(self)?)?;
@@ -530,9 +530,7 @@ impl<'db> Evaluator<'db> {
             }
             "getenv" => {
                 let [name] = args else {
-                    return Err(MirEvalError::InternalError(
-                        "libc::write args are not provided".into(),
-                    ));
+                    return Err(MirEvalError::InternalError("getenv args are not provided".into()));
                 };
                 let mut name_buf = vec![];
                 let name = {
@@ -840,7 +838,7 @@ impl<'db> Evaluator<'db> {
                 // cases.
                 let [lhs, rhs] = args else {
                     return Err(MirEvalError::InternalError(
-                        "wrapping_add args are not provided".into(),
+                        "ptr_guaranteed_cmp args are not provided".into(),
                     ));
                 };
                 let ans = lhs.get(self)? == rhs.get(self)?;

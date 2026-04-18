@@ -15,6 +15,7 @@ use rustc_hir::lang_items::LangItem;
 use rustc_hir::{AmbigArg, ItemKind, find_attr};
 use rustc_infer::infer::outlives::env::OutlivesEnvironment;
 use rustc_infer::infer::{self, InferCtxt, SubregionOrigin, TyCtxtInferExt};
+use rustc_infer::traits::PredicateObligations;
 use rustc_lint_defs::builtin::SHADOWING_SUPERTRAIT_ITEMS;
 use rustc_macros::Diagnostic;
 use rustc_middle::mir::interpret::ErrorHandled;
@@ -40,7 +41,7 @@ use rustc_trait_selection::traits::{
 };
 use tracing::{debug, instrument};
 
-use super::compare_eii::compare_eii_function_types;
+use super::compare_eii::{compare_eii_function_types, compare_eii_statics};
 use crate::autoderef::Autoderef;
 use crate::constrained_generic_params::{Parameter, identify_constrained_generic_params};
 use crate::errors;
@@ -124,6 +125,20 @@ impl<'tcx> WfCheckingCtxt<'_, 'tcx> {
             ty::ClauseKind::WellFormed(term),
         ));
     }
+
+    pub(super) fn unnormalized_obligations(
+        &self,
+        span: Span,
+        ty: Ty<'tcx>,
+    ) -> Option<PredicateObligations<'tcx>> {
+        traits::wf::unnormalized_obligations(
+            self.ocx.infcx,
+            self.param_env,
+            ty.into(),
+            span,
+            self.body_def_id,
+        )
+    }
 }
 
 pub(super) fn enter_wf_checking_ctxt<'tcx, F>(
@@ -140,7 +155,12 @@ where
 
     let mut wfcx = WfCheckingCtxt { ocx, body_def_id, param_env };
 
-    if !tcx.features().trivial_bounds() {
+    // As of now, bounds are only checked on lazy type aliases, they're ignored for most type
+    // aliases. So, only check for false global bounds if we're not ignoring bounds altogether.
+    let ignore_bounds =
+        tcx.def_kind(body_def_id) == DefKind::TyAlias && !tcx.type_alias_is_lazy(body_def_id);
+
+    if !ignore_bounds && !tcx.features().trivial_bounds() {
         wfcx.check_false_global_bounds()
     }
     f(&mut wfcx)?;
@@ -753,8 +773,10 @@ impl<'tcx> GATArgsCollector<'tcx> {
 impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for GATArgsCollector<'tcx> {
     fn visit_ty(&mut self, t: Ty<'tcx>) {
         match t.kind() {
-            ty::Alias(ty::Projection, p) if p.def_id == self.gat => {
-                for (idx, arg) in p.args.iter().enumerate() {
+            &ty::Alias(ty::AliasTy { kind: ty::Projection { def_id }, args, .. })
+                if def_id == self.gat =>
+            {
+                for (idx, arg) in args.iter().enumerate() {
                     match arg.kind() {
                         GenericArgKind::Lifetime(lt) if !lt.is_bound() => {
                             self.regions.insert((lt, idx));
@@ -822,7 +844,7 @@ fn check_param_wf(tcx: TyCtxt<'_>, param: &ty::GenericParamDef) -> Result<(), Er
             let span = tcx.def_span(param.def_id);
             let def_id = param.def_id.expect_local();
 
-            if tcx.features().adt_const_params() {
+            if tcx.features().adt_const_params() || tcx.features().min_adt_const_params() {
                 enter_wf_checking_ctxt(tcx, tcx.local_parent(def_id), |wfcx| {
                     wfcx.register_bound(
                         ObligationCause::new(span, def_id, ObligationCauseCode::ConstParam(ty)),
@@ -882,7 +904,7 @@ fn check_param_wf(tcx: TyCtxt<'_>, param: &ty::GenericParamDef) -> Result<(), Er
                     ) => None,
                     Err(ConstParamTyImplementationError::UnsizedConstParamsFeatureRequired) => {
                         Some(vec![
-                            (adt_const_params_feature_string, sym::adt_const_params),
+                            (adt_const_params_feature_string, sym::min_adt_const_params),
                             (
                                 " references to implement the `ConstParamTy` trait".into(),
                                 sym::unsized_const_params,
@@ -909,11 +931,13 @@ fn check_param_wf(tcx: TyCtxt<'_>, param: &ty::GenericParamDef) -> Result<(), Er
 
                         ty_is_local(ty).then_some(vec![(
                             adt_const_params_feature_string,
-                            sym::adt_const_params,
+                            sym::min_adt_const_params,
                         )])
                     }
                     // Implements `ConstParamTy`, suggest adding the feature to enable.
-                    Ok(..) => Some(vec![(adt_const_params_feature_string, sym::adt_const_params)]),
+                    Ok(..) => {
+                        Some(vec![(adt_const_params_feature_string, sym::min_adt_const_params)])
+                    }
                 };
                 if let Some(features) = may_suggest_feature {
                     tcx.disabled_nightly_features(&mut diag, features);
@@ -998,7 +1022,7 @@ fn check_type_defn<'tcx>(
     item: &hir::Item<'tcx>,
     all_sized: bool,
 ) -> Result<(), ErrorGuaranteed> {
-    let _ = tcx.check_representability(item.owner_id.def_id);
+    tcx.ensure_ok().check_representability(item.owner_id.def_id);
     let adt_def = tcx.adt_def(item.owner_id);
 
     enter_wf_checking_ctxt(tcx, item.owner_id.def_id, |wfcx| {
@@ -1186,7 +1210,7 @@ fn check_item_fn(
     decl: &hir::FnDecl<'_>,
 ) -> Result<(), ErrorGuaranteed> {
     enter_wf_checking_ctxt(tcx, def_id, |wfcx| {
-        check_eiis(tcx, def_id);
+        check_eiis_fn(tcx, def_id);
 
         let sig = tcx.fn_sig(def_id).instantiate_identity();
         check_fn_or_method(wfcx, sig, decl, def_id);
@@ -1194,7 +1218,7 @@ fn check_item_fn(
     })
 }
 
-fn check_eiis(tcx: TyCtxt<'_>, def_id: LocalDefId) {
+fn check_eiis_fn(tcx: TyCtxt<'_>, def_id: LocalDefId) {
     // does the function have an EiiImpl attribute? that contains the defid of a *macro*
     // that was used to mark the implementation. This is a two step process.
     for EiiImpl { resolution, span, .. } in
@@ -1221,6 +1245,33 @@ fn check_eiis(tcx: TyCtxt<'_>, def_id: LocalDefId) {
     }
 }
 
+fn check_eiis_static<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId, ty: Ty<'tcx>) {
+    // does the function have an EiiImpl attribute? that contains the defid of a *macro*
+    // that was used to mark the implementation. This is a two step process.
+    for EiiImpl { resolution, span, .. } in
+        find_attr!(tcx, def_id, EiiImpls(impls) => impls).into_iter().flatten()
+    {
+        let (foreign_item, name) = match resolution {
+            EiiImplResolution::Macro(def_id) => {
+                // we expect this macro to have the `EiiMacroFor` attribute, that points to a function
+                // signature that we'd like to compare the function we're currently checking with
+                if let Some(foreign_item) =
+                    find_attr!(tcx, *def_id, EiiDeclaration(EiiDecl {foreign_item: t, ..}) => *t)
+                {
+                    (foreign_item, tcx.item_name(*def_id))
+                } else {
+                    tcx.dcx().span_delayed_bug(*span, "resolved to something that's not an EII");
+                    continue;
+                }
+            }
+            EiiImplResolution::Known(decl) => (decl.foreign_item, decl.name.name),
+            EiiImplResolution::Error(_eg) => continue,
+        };
+
+        let _ = compare_eii_statics(tcx, def_id, ty, foreign_item, name, *span);
+    }
+}
+
 #[instrument(level = "debug", skip(tcx))]
 pub(crate) fn check_static_item<'tcx>(
     tcx: TyCtxt<'tcx>,
@@ -1229,6 +1280,10 @@ pub(crate) fn check_static_item<'tcx>(
     should_check_for_sync: bool,
 ) -> Result<(), ErrorGuaranteed> {
     enter_wf_checking_ctxt(tcx, item_id, |wfcx| {
+        if should_check_for_sync {
+            check_eiis_static(tcx, item_id, ty);
+        }
+
         let span = tcx.ty_span(item_id);
         let loc = Some(WellFormedLoc::Ty(item_id));
         let item_ty = wfcx.deeply_normalize(span, loc, ty);
@@ -2230,7 +2285,7 @@ impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for IsProbablyCyclical<'tcx> {
     fn visit_ty(&mut self, ty: Ty<'tcx>) -> ControlFlow<(), ()> {
         let def_id = match ty.kind() {
             ty::Adt(adt_def, _) => Some(adt_def.did()),
-            ty::Alias(ty::Free, alias_ty) => Some(alias_ty.def_id),
+            &ty::Alias(ty::AliasTy { kind: ty::Free { def_id }, .. }) => Some(def_id),
             _ => None,
         };
         if let Some(def_id) = def_id {
@@ -2350,7 +2405,8 @@ pub(super) fn check_type_wf(tcx: TyCtxt<'_>, (): ()) -> Result<(), ErrorGuarante
             }))
             .and(items.par_nested_bodies(|item| tcx.ensure_result().check_well_formed(item)))
             .and(items.par_opaques(|item| tcx.ensure_result().check_well_formed(item)));
-    super::entry::check_for_entry_fn(tcx);
+
+    super::entry::check_for_entry_fn(tcx)?;
 
     res
 }

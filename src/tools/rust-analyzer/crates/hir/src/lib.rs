@@ -45,20 +45,20 @@ use std::{
 };
 
 use arrayvec::ArrayVec;
-use base_db::{CrateDisplayName, CrateOrigin, LangCrateOrigin};
+use base_db::{CrateDisplayName, CrateOrigin, LangCrateOrigin, all_crates};
 use either::Either;
 use hir_def::{
     AdtId, AssocItemId, AssocItemLoc, BuiltinDeriveImplId, CallableDefId, ConstId, ConstParamId,
-    DefWithBodyId, EnumId, EnumVariantId, ExternBlockId, ExternCrateId, FunctionId, GenericDefId,
-    HasModule, ImplId, ItemContainerId, LifetimeParamId, LocalFieldId, Lookup, MacroExpander,
-    MacroId, StaticId, StructId, SyntheticSyntax, TupleId, TypeAliasId, TypeOrConstParamId,
-    TypeParamId, UnionId,
+    DefWithBodyId, EnumId, EnumVariantId, ExpressionStoreOwnerId, ExternBlockId, ExternCrateId,
+    FunctionId, GenericDefId, HasModule, ImplId, ItemContainerId, LifetimeParamId, LocalFieldId,
+    Lookup, MacroExpander, MacroId, StaticId, StructId, SyntheticSyntax, TupleId, TypeAliasId,
+    TypeOrConstParamId, TypeParamId, UnionId,
     attrs::AttrFlags,
     builtin_derive::BuiltinDeriveImplMethod,
-    expr_store::{ExpressionStoreDiagnostics, ExpressionStoreSourceMap},
+    expr_store::{ExpressionStore, ExpressionStoreDiagnostics, ExpressionStoreSourceMap},
     hir::{
         BindingAnnotation, BindingId, Expr, ExprId, ExprOrPatId, LabelId, Pat,
-        generics::{LifetimeParamData, TypeOrConstParamData, TypeParamProvenance},
+        generics::{GenericParams, LifetimeParamData, TypeOrConstParamData, TypeParamProvenance},
     },
     item_tree::ImportAlias,
     lang_item::LangItemTarget,
@@ -69,7 +69,11 @@ use hir_def::{
     },
     per_ns::PerNs,
     resolver::{HasResolver, Resolver},
-    signatures::{EnumSignature, ImplFlags, StaticFlags, StructFlags, TraitFlags, VariantFields},
+    signatures::{
+        ConstSignature, EnumSignature, FunctionSignature, ImplFlags, ImplSignature, StaticFlags,
+        StaticSignature, StructFlags, StructSignature, TraitFlags, TraitSignature,
+        TypeAliasSignature, UnionSignature, VariantFields,
+    },
     src::HasSource as _,
     visibility::visibility_from_ast,
 };
@@ -141,6 +145,7 @@ pub use {
         Complete,
         FindPathConfig,
         attrs::{Docs, IsInnerDoc},
+        expr_store::Body,
         find_path::PrefixKind,
         import_map,
         lang_item::{LangItemEnum as LangItem, crate_lang_items},
@@ -238,7 +243,7 @@ impl Crate {
     }
 
     pub fn reverse_dependencies(self, db: &dyn HirDatabase) -> Vec<Crate> {
-        let all_crates = db.all_crates();
+        let all_crates = all_crates(db);
         all_crates
             .iter()
             .copied()
@@ -305,7 +310,7 @@ impl Crate {
     }
 
     pub fn all(db: &dyn HirDatabase) -> Vec<Crate> {
-        db.all_crates().iter().map(|&id| Crate { id }).collect()
+        all_crates(db).iter().map(|&id| Crate { id }).collect()
     }
 
     /// Try to get the root URL of the documentation of a crate.
@@ -329,7 +334,7 @@ impl Crate {
     }
 
     fn core(db: &dyn HirDatabase) -> Option<Crate> {
-        db.all_crates()
+        all_crates(db)
             .iter()
             .copied()
             .find(|&krate| {
@@ -351,8 +356,7 @@ pub enum ModuleDef {
     Function(Function),
     Adt(Adt),
     // Can't be directly declared, but can be imported.
-    // FIXME: Rename to `EnumVariant`
-    Variant(Variant),
+    EnumVariant(EnumVariant),
     Const(Const),
     Static(Static),
     Trait(Trait),
@@ -364,7 +368,7 @@ impl_from!(
     Module,
     Function,
     Adt(Struct, Enum, Union),
-    Variant,
+    EnumVariant,
     Const,
     Static,
     Trait,
@@ -374,12 +378,12 @@ impl_from!(
     for ModuleDef
 );
 
-impl From<VariantDef> for ModuleDef {
-    fn from(var: VariantDef) -> Self {
+impl From<Variant> for ModuleDef {
+    fn from(var: Variant) -> Self {
         match var {
-            VariantDef::Struct(t) => Adt::from(t).into(),
-            VariantDef::Union(t) => Adt::from(t).into(),
-            VariantDef::Variant(t) => t.into(),
+            Variant::Struct(t) => Adt::from(t).into(),
+            Variant::Union(t) => Adt::from(t).into(),
+            Variant::EnumVariant(t) => t.into(),
         }
     }
 }
@@ -390,7 +394,7 @@ impl ModuleDef {
             ModuleDef::Module(it) => it.parent(db),
             ModuleDef::Function(it) => Some(it.module(db)),
             ModuleDef::Adt(it) => Some(it.module(db)),
-            ModuleDef::Variant(it) => Some(it.module(db)),
+            ModuleDef::EnumVariant(it) => Some(it.module(db)),
             ModuleDef::Const(it) => Some(it.module(db)),
             ModuleDef::Static(it) => Some(it.module(db)),
             ModuleDef::Trait(it) => Some(it.module(db)),
@@ -423,7 +427,7 @@ impl ModuleDef {
             ModuleDef::Adt(it) => it.name(db),
             ModuleDef::Trait(it) => it.name(db),
             ModuleDef::Function(it) => it.name(db),
-            ModuleDef::Variant(it) => it.name(db),
+            ModuleDef::EnumVariant(it) => it.name(db),
             ModuleDef::TypeAlias(it) => it.name(db),
             ModuleDef::Static(it) => it.name(db),
             ModuleDef::Macro(it) => it.name(db),
@@ -452,7 +456,7 @@ impl ModuleDef {
             ModuleDef::Module(it) => it.id.into(),
             ModuleDef::Const(it) => it.id.into(),
             ModuleDef::Static(it) => it.id.into(),
-            ModuleDef::Variant(it) => it.id.into(),
+            ModuleDef::EnumVariant(it) => it.id.into(),
             ModuleDef::BuiltinType(_) | ModuleDef::Macro(_) => return Vec::new(),
         };
 
@@ -481,7 +485,7 @@ impl ModuleDef {
             ModuleDef::Function(it) => Some(it.into()),
             ModuleDef::Const(it) => Some(it.into()),
             ModuleDef::Static(it) => Some(it.into()),
-            ModuleDef::Variant(it) => Some(it.into()),
+            ModuleDef::EnumVariant(it) => Some(it.into()),
 
             ModuleDef::Module(_)
             | ModuleDef::Adt(_)
@@ -500,9 +504,24 @@ impl ModuleDef {
             ModuleDef::Trait(it) => Some(it.into()),
             ModuleDef::TypeAlias(it) => Some(it.into()),
             ModuleDef::Module(_)
-            | ModuleDef::Variant(_)
+            | ModuleDef::EnumVariant(_)
             | ModuleDef::Static(_)
             | ModuleDef::Const(_)
+            | ModuleDef::BuiltinType(_)
+            | ModuleDef::Macro(_) => None,
+        }
+    }
+
+    pub fn as_generic_def(self) -> Option<GenericDef> {
+        match self {
+            ModuleDef::Function(it) => Some(it.into()),
+            ModuleDef::Adt(it) => Some(it.into()),
+            ModuleDef::Trait(it) => Some(it.into()),
+            ModuleDef::TypeAlias(it) => Some(it.into()),
+            ModuleDef::Static(it) => Some(it.into()),
+            ModuleDef::Const(it) => Some(it.into()),
+            ModuleDef::EnumVariant(_)
+            | ModuleDef::Module(_)
             | ModuleDef::BuiltinType(_)
             | ModuleDef::Macro(_) => None,
         }
@@ -513,7 +532,7 @@ impl ModuleDef {
             ModuleDef::Module(it) => it.attrs(db),
             ModuleDef::Function(it) => HasAttrs::attrs(*it, db),
             ModuleDef::Adt(it) => it.attrs(db),
-            ModuleDef::Variant(it) => it.attrs(db),
+            ModuleDef::EnumVariant(it) => it.attrs(db),
             ModuleDef::Const(it) => it.attrs(db),
             ModuleDef::Static(it) => it.attrs(db),
             ModuleDef::Trait(it) => it.attrs(db),
@@ -528,7 +547,7 @@ impl HasCrate for ModuleDef {
     fn krate(&self, db: &dyn HirDatabase) -> Crate {
         match self.module(db) {
             Some(module) => module.krate(db),
-            None => Crate::core(db).unwrap_or_else(|| db.all_crates()[0].into()),
+            None => Crate::core(db).unwrap_or_else(|| all_crates(db)[0].into()),
         }
     }
 }
@@ -543,7 +562,7 @@ impl HasVisibility for ModuleDef {
             ModuleDef::Static(it) => it.visibility(db),
             ModuleDef::Trait(it) => it.visibility(db),
             ModuleDef::TypeAlias(it) => it.visibility(db),
-            ModuleDef::Variant(it) => it.visibility(db),
+            ModuleDef::EnumVariant(it) => it.visibility(db),
             ModuleDef::Macro(it) => it.visibility(db),
             ModuleDef::BuiltinType(_) => Visibility::Public,
         }
@@ -714,8 +733,8 @@ impl Module {
                 ModuleDef::Adt(adt) => {
                     match adt {
                         Adt::Struct(s) => {
-                            let source_map = db.struct_signature_with_source_map(s.id).1;
-                            expr_store_diagnostics(db, acc, &source_map);
+                            let source_map = &StructSignature::with_source_map(db, s.id).1;
+                            expr_store_diagnostics(db, acc, source_map);
                             let source_map = &s.id.fields_with_source_map(db).1;
                             expr_store_diagnostics(db, acc, source_map);
                             push_ty_diagnostics(
@@ -726,8 +745,8 @@ impl Module {
                             );
                         }
                         Adt::Union(u) => {
-                            let source_map = db.union_signature_with_source_map(u.id).1;
-                            expr_store_diagnostics(db, acc, &source_map);
+                            let source_map = &UnionSignature::with_source_map(db, u.id).1;
+                            expr_store_diagnostics(db, acc, source_map);
                             let source_map = &u.id.fields_with_source_map(db).1;
                             expr_store_diagnostics(db, acc, source_map);
                             push_ty_diagnostics(
@@ -738,8 +757,8 @@ impl Module {
                             );
                         }
                         Adt::Enum(e) => {
-                            let source_map = db.enum_signature_with_source_map(e.id).1;
-                            expr_store_diagnostics(db, acc, &source_map);
+                            let source_map = &EnumSignature::with_source_map(db, e.id).1;
+                            expr_store_diagnostics(db, acc, source_map);
                             let (variants, diagnostics) = e.id.enum_variants_with_diagnostics(db);
                             let file = e.id.lookup(db).id.file_id;
                             let ast_id_map = db.ast_id_map(file);
@@ -774,13 +793,13 @@ impl Module {
                 }
                 ModuleDef::Macro(m) => emit_macro_def_diagnostics(db, acc, m),
                 ModuleDef::TypeAlias(type_alias) => {
-                    let source_map = db.type_alias_signature_with_source_map(type_alias.id).1;
-                    expr_store_diagnostics(db, acc, &source_map);
+                    let source_map = &TypeAliasSignature::with_source_map(db, type_alias.id).1;
+                    expr_store_diagnostics(db, acc, source_map);
                     push_ty_diagnostics(
                         db,
                         acc,
                         db.type_for_type_alias_with_diagnostics(type_alias.id).1,
-                        &source_map,
+                        source_map,
                     );
                     acc.extend(def.diagnostics(db, style_lints));
                 }
@@ -800,8 +819,8 @@ impl Module {
                 continue;
             };
             let loc = impl_id.lookup(db);
-            let (impl_signature, source_map) = db.impl_signature_with_source_map(impl_id);
-            expr_store_diagnostics(db, acc, &source_map);
+            let (impl_signature, source_map) = ImplSignature::with_source_map(db, impl_id);
+            expr_store_diagnostics(db, acc, source_map);
 
             let file_id = loc.id.file_id;
             if file_id.macro_file().is_some_and(|it| it.kind(db) == MacroKind::DeriveBuiltIn) {
@@ -873,9 +892,9 @@ impl Module {
             if let (false, Some(trait_)) = (impl_is_negative, trait_) {
                 let items = &trait_.id.trait_items(db).items;
                 let required_items = items.iter().filter(|&(_, assoc)| match *assoc {
-                    AssocItemId::FunctionId(it) => !db.function_signature(it).has_body(),
-                    AssocItemId::ConstId(id) => !db.const_signature(id).has_body(),
-                    AssocItemId::TypeAliasId(it) => db.type_alias_signature(it).ty.is_none(),
+                    AssocItemId::FunctionId(it) => !FunctionSignature::of(db, it).has_body(),
+                    AssocItemId::ConstId(id) => !ConstSignature::of(db, id).has_body(),
+                    AssocItemId::TypeAliasId(it) => TypeAliasSignature::of(db, it).ty.is_none(),
                 });
                 impl_assoc_items_scratch.extend(impl_id.impl_items(db).items.iter().cloned());
 
@@ -913,7 +932,7 @@ impl Module {
                     let self_ty = structurally_normalize_ty(
                         &infcx,
                         self_ty,
-                        db.trait_environment(impl_id.into()),
+                        db.trait_environment(GenericDefId::from(impl_id).into()),
                     );
                     let self_ty_is_guaranteed_unsized = matches!(
                         self_ty.kind(),
@@ -968,7 +987,7 @@ impl Module {
                                         continue;
                                     }
 
-                                    if db.function_signature(*fn_).is_default() {
+                                    if FunctionSignature::of(db, *fn_).is_default() {
                                         return false;
                                     }
                                 }
@@ -992,12 +1011,12 @@ impl Module {
                 impl_assoc_items_scratch.clear();
             }
 
-            push_ty_diagnostics(db, acc, db.impl_self_ty_with_diagnostics(impl_id).1, &source_map);
+            push_ty_diagnostics(db, acc, db.impl_self_ty_with_diagnostics(impl_id).1, source_map);
             push_ty_diagnostics(
                 db,
                 acc,
                 db.impl_trait_with_diagnostics(impl_id).and_then(|it| it.1),
-                &source_map,
+                source_map,
             );
 
             for &(_, item) in impl_id.impl_items(db).items.iter() {
@@ -1091,7 +1110,7 @@ fn macro_call_diagnostics<'db>(
         let file_id = loc.kind.file_id();
         let mut range = precise_macro_call_location(&loc.kind, db, loc.krate);
         let RenderedExpandError { message, error, kind } = err.render_to_string(db);
-        if Some(err.span().anchor.file_id) == file_id.file_id().map(|it| it.editioned_file_id(db)) {
+        if Some(err.span().anchor.file_id) == file_id.file_id().map(|it| it.span_file_id(db)) {
             range.value = err.span().range
                 + db.ast_id_map(file_id).get_erased(err.span().anchor.ast_id).text_range().start();
         }
@@ -1220,11 +1239,15 @@ fn emit_def_diagnostic_<'db>(
             );
         }
         DefDiagnosticKind::InvalidDeriveTarget { ast, id } => {
-            let derive = id.find_attr_range(db, krate, *ast).3.path_range();
+            let (_, attr) = id.find_attr_range(db, krate, *ast);
+            let derive = attr
+                .path()
+                .map(|path| path.syntax().text_range())
+                .unwrap_or_else(|| attr.syntax().text_range());
             acc.push(InvalidDeriveTarget { range: ast.with_value(derive) }.into());
         }
         DefDiagnosticKind::MalformedDerive { ast, id } => {
-            let derive = id.find_attr_range(db, krate, *ast).2;
+            let derive = id.find_attr_range(db, krate, *ast).1.syntax().text_range();
             acc.push(MalformedDerive { range: ast.with_value(derive) }.into());
         }
         DefDiagnosticKind::MacroDefError { ast, message } => {
@@ -1264,7 +1287,8 @@ fn precise_macro_call_location(
             ast_id.with_value(range)
         }
         MacroCallKind::Attr { ast_id, censored_attr_ids: attr_ids, .. } => {
-            let attr_range = attr_ids.invoc_attr().find_attr_range(db, krate, *ast_id).2;
+            let attr_range =
+                attr_ids.invoc_attr().find_attr_range(db, krate, *ast_id).1.syntax().text_range();
             ast_id.with_value(attr_range)
         }
     }
@@ -1280,7 +1304,7 @@ impl HasVisibility for Module {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Field {
-    pub(crate) parent: VariantDef,
+    pub(crate) parent: Variant,
     pub(crate) id: LocalFieldId,
 }
 
@@ -1304,7 +1328,7 @@ impl<'db> InstantiatedField<'db> {
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone, Hash)]
 pub struct TupleField {
-    pub owner: DefWithBodyId,
+    pub owner: ExpressionStoreOwnerId,
     pub tuple: TupleId,
     pub index: u32,
 }
@@ -1316,7 +1340,7 @@ impl TupleField {
 
     pub fn ty<'db>(&self, db: &'db dyn HirDatabase) -> Type<'db> {
         let interner = DbInterner::new_no_crate(db);
-        let ty = InferenceResult::for_body(db, self.owner)
+        let ty = InferenceResult::of(db, self.owner)
             .tuple_field_access_type(self.tuple)
             .as_slice()
             .get(self.index as usize)
@@ -1386,9 +1410,9 @@ impl Field {
     ) -> Type<'db> {
         let var_id = self.parent.into();
         let def_id: AdtId = match self.parent {
-            VariantDef::Struct(it) => it.id.into(),
-            VariantDef::Union(it) => it.id.into(),
-            VariantDef::Variant(it) => it.parent_enum(db).id.into(),
+            Variant::Struct(it) => it.id.into(),
+            Variant::Union(it) => it.id.into(),
+            Variant::EnumVariant(it) => it.parent_enum(db).id.into(),
         };
         let interner = DbInterner::new_no_crate(db);
         let args = generic_args_from_tys(interner, def_id.into(), generics.map(|ty| ty.ty));
@@ -1414,7 +1438,7 @@ impl Field {
         .map(|layout| Layout(layout, db.target_data_layout(self.krate(db).into()).unwrap()))
     }
 
-    pub fn parent_def(&self, _db: &dyn HirDatabase) -> VariantDef {
+    pub fn parent_def(&self, _db: &dyn HirDatabase) -> Variant {
         self.parent
     }
 }
@@ -1440,7 +1464,7 @@ impl Struct {
     }
 
     pub fn name(self, db: &dyn HirDatabase) -> Name {
-        db.struct_signature(self.id).name.clone()
+        StructSignature::of(db, self.id).name.clone()
     }
 
     pub fn fields(self, db: &dyn HirDatabase) -> Vec<Field> {
@@ -1533,7 +1557,7 @@ pub struct Union {
 
 impl Union {
     pub fn name(self, db: &dyn HirDatabase) -> Name {
-        db.union_signature(self.id).name.clone()
+        UnionSignature::of(db, self.id).name.clone()
     }
 
     pub fn module(self, db: &dyn HirDatabase) -> Module {
@@ -1592,11 +1616,11 @@ impl Enum {
     }
 
     pub fn name(self, db: &dyn HirDatabase) -> Name {
-        db.enum_signature(self.id).name.clone()
+        EnumSignature::of(db, self.id).name.clone()
     }
 
-    pub fn variants(self, db: &dyn HirDatabase) -> Vec<Variant> {
-        self.id.enum_variants(db).variants.iter().map(|&(id, _, _)| Variant { id }).collect()
+    pub fn variants(self, db: &dyn HirDatabase) -> Vec<EnumVariant> {
+        self.id.enum_variants(db).variants.iter().map(|&(id, _, _)| EnumVariant { id }).collect()
     }
 
     pub fn num_variants(self, db: &dyn HirDatabase) -> usize {
@@ -1688,19 +1712,18 @@ impl<'db> InstantiatedEnum<'db> {
     }
 }
 
-impl From<&Variant> for DefWithBodyId {
-    fn from(&v: &Variant) -> Self {
+impl From<&EnumVariant> for DefWithBodyId {
+    fn from(&v: &EnumVariant) -> Self {
         DefWithBodyId::VariantId(v.into())
     }
 }
 
-// FIXME: Rename to `EnumVariant`
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Variant {
+pub struct EnumVariant {
     pub(crate) id: EnumVariantId,
 }
 
-impl Variant {
+impl EnumVariant {
     pub fn module(self, db: &dyn HirDatabase) -> Module {
         Module { id: self.id.module(db) }
     }
@@ -1737,7 +1760,7 @@ impl Variant {
     }
 
     pub fn value(self, db: &dyn HirDatabase) -> Option<ast::Expr> {
-        self.source(db)?.value.expr()
+        self.source(db)?.value.const_arg()?.expr()
     }
 
     pub fn eval(self, db: &dyn HirDatabase) -> Result<i128, ConstEvalError> {
@@ -1774,7 +1797,7 @@ impl Variant {
 // FIXME: Rename to `EnumVariant`
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct InstantiatedVariant<'db> {
-    pub(crate) inner: Variant,
+    pub(crate) inner: EnumVariant,
     pub(crate) args: GenericArgs<'db>,
 }
 
@@ -1805,7 +1828,7 @@ pub enum StructKind {
 }
 
 /// Variants inherit visibility from the parent enum.
-impl HasVisibility for Variant {
+impl HasVisibility for EnumVariant {
     fn visibility(&self, db: &dyn HirDatabase) -> Visibility {
         self.parent_enum(db).visibility(db)
     }
@@ -1914,35 +1937,78 @@ impl HasVisibility for Adt {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum VariantDef {
+pub enum Variant {
     Struct(Struct),
     Union(Union),
-    Variant(Variant),
+    EnumVariant(EnumVariant),
 }
-impl_from!(Struct, Union, Variant for VariantDef);
+impl_from!(Struct, Union, EnumVariant for Variant);
 
-impl VariantDef {
+impl Variant {
     pub fn fields(self, db: &dyn HirDatabase) -> Vec<Field> {
         match self {
-            VariantDef::Struct(it) => it.fields(db),
-            VariantDef::Union(it) => it.fields(db),
-            VariantDef::Variant(it) => it.fields(db),
+            Variant::Struct(it) => it.fields(db),
+            Variant::Union(it) => it.fields(db),
+            Variant::EnumVariant(it) => it.fields(db),
         }
     }
 
     pub fn module(self, db: &dyn HirDatabase) -> Module {
         match self {
-            VariantDef::Struct(it) => it.module(db),
-            VariantDef::Union(it) => it.module(db),
-            VariantDef::Variant(it) => it.module(db),
+            Variant::Struct(it) => it.module(db),
+            Variant::Union(it) => it.module(db),
+            Variant::EnumVariant(it) => it.module(db),
         }
     }
 
     pub fn name(&self, db: &dyn HirDatabase) -> Name {
         match self {
-            VariantDef::Struct(s) => (*s).name(db),
-            VariantDef::Union(u) => (*u).name(db),
-            VariantDef::Variant(e) => (*e).name(db),
+            Variant::Struct(s) => (*s).name(db),
+            Variant::Union(u) => (*u).name(db),
+            Variant::EnumVariant(e) => (*e).name(db),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ExpressionStoreOwner {
+    Body(DefWithBody),
+    Signature(GenericDef),
+    VariantFields(Variant),
+}
+
+impl From<GenericDef> for ExpressionStoreOwner {
+    fn from(v: GenericDef) -> Self {
+        Self::Signature(v)
+    }
+}
+
+impl From<DefWithBody> for ExpressionStoreOwner {
+    fn from(v: DefWithBody) -> Self {
+        Self::Body(v)
+    }
+}
+
+impl From<ExpressionStoreOwnerId> for ExpressionStoreOwner {
+    fn from(v: ExpressionStoreOwnerId) -> Self {
+        match v {
+            ExpressionStoreOwnerId::Signature(generic_def_id) => {
+                Self::Signature(generic_def_id.into())
+            }
+            ExpressionStoreOwnerId::Body(def_with_body_id) => Self::Body(def_with_body_id.into()),
+            ExpressionStoreOwnerId::VariantFields(variant_id) => {
+                Self::VariantFields(variant_id.into())
+            }
+        }
+    }
+}
+
+impl ExpressionStoreOwner {
+    pub fn module(self, db: &dyn HirDatabase) -> Module {
+        match self {
+            Self::Body(body) => body.module(db),
+            Self::Signature(generic_def) => generic_def.module(db),
+            Self::VariantFields(variant) => variant.module(db),
         }
     }
 }
@@ -1953,9 +2019,9 @@ pub enum DefWithBody {
     Function(Function),
     Static(Static),
     Const(Const),
-    Variant(Variant),
+    EnumVariant(EnumVariant),
 }
-impl_from!(Function, Const, Static, Variant for DefWithBody);
+impl_from!(Function, Const, Static, EnumVariant for DefWithBody);
 
 impl DefWithBody {
     pub fn module(self, db: &dyn HirDatabase) -> Module {
@@ -1963,7 +2029,7 @@ impl DefWithBody {
             DefWithBody::Const(c) => c.module(db),
             DefWithBody::Function(f) => f.module(db),
             DefWithBody::Static(s) => s.module(db),
-            DefWithBody::Variant(v) => v.module(db),
+            DefWithBody::EnumVariant(v) => v.module(db),
         }
     }
 
@@ -1972,7 +2038,7 @@ impl DefWithBody {
             DefWithBody::Function(f) => Some(f.name(db)),
             DefWithBody::Static(s) => Some(s.name(db)),
             DefWithBody::Const(c) => c.name(db),
-            DefWithBody::Variant(v) => Some(v.name(db)),
+            DefWithBody::EnumVariant(v) => Some(v.name(db)),
         }
     }
 
@@ -1982,7 +2048,7 @@ impl DefWithBody {
             DefWithBody::Function(it) => it.ret_type(db),
             DefWithBody::Static(it) => it.ty(db),
             DefWithBody::Const(it) => it.ty(db),
-            DefWithBody::Variant(it) => it.parent_enum(db).variant_body_ty(db),
+            DefWithBody::EnumVariant(it) => it.parent_enum(db).variant_body_ty(db),
         }
     }
 
@@ -1994,7 +2060,7 @@ impl DefWithBody {
             },
             DefWithBody::Static(it) => it.id.into(),
             DefWithBody::Const(it) => it.id.into(),
-            DefWithBody::Variant(it) => it.into(),
+            DefWithBody::EnumVariant(it) => it.into(),
         })
     }
 
@@ -2003,7 +2069,7 @@ impl DefWithBody {
         let Some(id) = self.id() else {
             return String::new();
         };
-        let body = db.body(id);
+        let body = Body::of(db, id);
         body.pretty_print(db, id, Edition::CURRENT)
     }
 
@@ -2030,17 +2096,17 @@ impl DefWithBody {
         };
         let krate = self.module(db).id.krate(db);
 
-        let (body, source_map) = db.body_with_source_map(id);
+        let (body, source_map) = Body::with_source_map(db, id);
         let sig_source_map = match self {
             DefWithBody::Function(id) => match id.id {
-                AnyFunctionId::FunctionId(id) => db.function_signature_with_source_map(id).1,
+                AnyFunctionId::FunctionId(id) => &FunctionSignature::with_source_map(db, id).1,
                 AnyFunctionId::BuiltinDeriveImplMethod { .. } => return,
             },
-            DefWithBody::Static(id) => db.static_signature_with_source_map(id.into()).1,
-            DefWithBody::Const(id) => db.const_signature_with_source_map(id.into()).1,
-            DefWithBody::Variant(variant) => {
+            DefWithBody::Static(id) => &StaticSignature::with_source_map(db, id.into()).1,
+            DefWithBody::Const(id) => &ConstSignature::with_source_map(db, id.into()).1,
+            DefWithBody::EnumVariant(variant) => {
                 let enum_id = variant.parent_enum(db).id;
-                db.enum_signature_with_source_map(enum_id).1
+                &EnumSignature::with_source_map(db, enum_id).1
             }
         };
 
@@ -2048,17 +2114,11 @@ impl DefWithBody {
             Module { id: def_map.root_module_id() }.diagnostics(db, acc, style_lints);
         }
 
-        expr_store_diagnostics(db, acc, &source_map);
+        expr_store_diagnostics(db, acc, source_map);
 
-        let infer = InferenceResult::for_body(db, id);
+        let infer = InferenceResult::of(db, id);
         for d in infer.diagnostics() {
-            acc.extend(AnyDiagnostic::inference_diagnostic(
-                db,
-                id,
-                d,
-                &source_map,
-                &sig_source_map,
-            ));
+            acc.extend(AnyDiagnostic::inference_diagnostic(db, id, d, source_map, sig_source_map));
         }
 
         for (pat_or_expr, mismatch) in infer.type_mismatches() {
@@ -2180,7 +2240,7 @@ impl DefWithBody {
                     {
                         need_mut = &mir::MutabilityReason::Not;
                     }
-                    let local = Local { parent: id, binding_id };
+                    let local = Local { parent: id.into(), binding_id };
                     let is_mut = body[binding_id].mode == BindingAnnotation::Mutable;
 
                     match (need_mut, is_mut) {
@@ -2237,7 +2297,7 @@ impl DefWithBody {
         }
 
         for diagnostic in BodyValidationDiagnostic::collect(db, id, style_lints) {
-            acc.extend(AnyDiagnostic::body_validation_diagnostic(db, diagnostic, &source_map));
+            acc.extend(AnyDiagnostic::body_validation_diagnostic(db, diagnostic, source_map));
         }
 
         for diag in hir_ty::diagnostics::incorrect_case(db, id.into()) {
@@ -2251,7 +2311,7 @@ impl DefWithBody {
         db: &'db dyn HirDatabase,
     ) -> impl Iterator<Item = Type<'db>> {
         self.id().into_iter().flat_map(move |def_id| {
-            let infer = InferenceResult::for_body(db, def_id);
+            let infer = InferenceResult::of(db, def_id);
             let resolver = def_id.resolver(db);
 
             infer.expression_types().map(move |(_, ty)| Type::new_with_resolver(db, &resolver, ty))
@@ -2261,7 +2321,7 @@ impl DefWithBody {
     /// Returns an iterator over the inferred types of all patterns in this body.
     pub fn pattern_types<'db>(self, db: &'db dyn HirDatabase) -> impl Iterator<Item = Type<'db>> {
         self.id().into_iter().flat_map(move |def_id| {
-            let infer = InferenceResult::for_body(db, def_id);
+            let infer = InferenceResult::of(db, def_id);
             let resolver = def_id.resolver(db);
 
             infer.pattern_types().map(move |(_, ty)| Type::new_with_resolver(db, &resolver, ty))
@@ -2271,7 +2331,7 @@ impl DefWithBody {
     /// Returns an iterator over the inferred types of all bindings in this body.
     pub fn binding_types<'db>(self, db: &'db dyn HirDatabase) -> impl Iterator<Item = Type<'db>> {
         self.id().into_iter().flat_map(move |def_id| {
-            let infer = InferenceResult::for_body(db, def_id);
+            let infer = InferenceResult::of(db, def_id);
             let resolver = def_id.resolver(db);
 
             infer.binding_types().map(move |(_, ty)| Type::new_with_resolver(db, &resolver, ty))
@@ -2339,7 +2399,7 @@ impl Function {
 
     pub fn name(self, db: &dyn HirDatabase) -> Name {
         match self.id {
-            AnyFunctionId::FunctionId(id) => db.function_signature(id).name.clone(),
+            AnyFunctionId::FunctionId(id) => FunctionSignature::of(db, id).name.clone(),
             AnyFunctionId::BuiltinDeriveImplMethod { method, .. } => {
                 Name::new_symbol_root(method.name())
             }
@@ -2541,7 +2601,7 @@ impl Function {
 
     pub fn has_self_param(self, db: &dyn HirDatabase) -> bool {
         match self.id {
-            AnyFunctionId::FunctionId(id) => db.function_signature(id).has_self_param(),
+            AnyFunctionId::FunctionId(id) => FunctionSignature::of(db, id).has_self_param(),
             AnyFunctionId::BuiltinDeriveImplMethod { method, .. } => match method {
                 BuiltinDeriveImplMethod::clone
                 | BuiltinDeriveImplMethod::fmt
@@ -2576,7 +2636,7 @@ impl Function {
 
     pub fn num_params(self, db: &dyn HirDatabase) -> usize {
         match self.id {
-            AnyFunctionId::FunctionId(id) => db.function_signature(id).params.len(),
+            AnyFunctionId::FunctionId(id) => FunctionSignature::of(db, id).params.len(),
             AnyFunctionId::BuiltinDeriveImplMethod { .. } => {
                 self.fn_sig(db).1.skip_binder().inputs().len()
             }
@@ -2620,21 +2680,21 @@ impl Function {
 
     pub fn is_const(self, db: &dyn HirDatabase) -> bool {
         match self.id {
-            AnyFunctionId::FunctionId(id) => db.function_signature(id).is_const(),
+            AnyFunctionId::FunctionId(id) => FunctionSignature::of(db, id).is_const(),
             AnyFunctionId::BuiltinDeriveImplMethod { .. } => false,
         }
     }
 
     pub fn is_async(self, db: &dyn HirDatabase) -> bool {
         match self.id {
-            AnyFunctionId::FunctionId(id) => db.function_signature(id).is_async(),
+            AnyFunctionId::FunctionId(id) => FunctionSignature::of(db, id).is_async(),
             AnyFunctionId::BuiltinDeriveImplMethod { .. } => false,
         }
     }
 
     pub fn is_varargs(self, db: &dyn HirDatabase) -> bool {
         match self.id {
-            AnyFunctionId::FunctionId(id) => db.function_signature(id).is_varargs(),
+            AnyFunctionId::FunctionId(id) => FunctionSignature::of(db, id).is_varargs(),
             AnyFunctionId::BuiltinDeriveImplMethod { .. } => false,
         }
     }
@@ -2687,7 +2747,7 @@ impl Function {
             AnyFunctionId::FunctionId(id) => {
                 self.exported_main(db)
                     || self.module(db).is_crate_root(db)
-                        && db.function_signature(id).name == sym::main
+                        && FunctionSignature::of(db, id).name == sym::main
             }
             AnyFunctionId::BuiltinDeriveImplMethod { .. } => false,
         }
@@ -2764,7 +2824,7 @@ impl Function {
     /// This is false in the case of required (not provided) trait methods.
     pub fn has_body(self, db: &dyn HirDatabase) -> bool {
         match self.id {
-            AnyFunctionId::FunctionId(id) => db.function_signature(id).has_body(),
+            AnyFunctionId::FunctionId(id) => FunctionSignature::of(db, id).has_body(),
             AnyFunctionId::BuiltinDeriveImplMethod { .. } => true,
         }
     }
@@ -2792,7 +2852,7 @@ impl Function {
             id.into(),
             GenericArgs::empty(interner).store(),
             ParamEnvAndCrate {
-                param_env: db.trait_environment(id.into()),
+                param_env: db.trait_environment(GenericDefId::from(id).into()),
                 krate: id.module(db).krate(db),
             }
             .store(),
@@ -2878,24 +2938,26 @@ impl<'db> Param<'db> {
         match self.func {
             Callee::Def(CallableDefId::FunctionId(it)) => {
                 let parent = DefWithBodyId::FunctionId(it);
-                let body = db.body(parent);
+                let body = Body::of(db, parent);
                 if let Some(self_param) = body.self_param.filter(|_| self.idx == 0) {
-                    Some(Local { parent, binding_id: self_param })
+                    Some(Local { parent: parent.into(), binding_id: self_param })
                 } else if let Pat::Bind { id, .. } =
                     &body[body.params[self.idx - body.self_param.is_some() as usize]]
                 {
-                    Some(Local { parent, binding_id: *id })
+                    Some(Local { parent: parent.into(), binding_id: *id })
                 } else {
                     None
                 }
             }
             Callee::Closure(closure, _) => {
                 let c = db.lookup_intern_closure(closure);
-                let body = db.body(c.0);
-                if let Expr::Closure { args, .. } = &body[c.1]
-                    && let Pat::Bind { id, .. } = &body[args[self.idx]]
+                let body_owner = c.0;
+                let store = ExpressionStore::of(db, c.0);
+
+                if let Expr::Closure { args, .. } = &store[c.1]
+                    && let Pat::Bind { id, .. } = &store[args[self.idx]]
                 {
-                    return Some(Local { parent: c.0, binding_id: *id });
+                    return Some(Local { parent: body_owner, binding_id: *id });
                 }
                 None
             }
@@ -2917,7 +2979,7 @@ impl SelfParam {
     pub fn access(self, db: &dyn HirDatabase) -> Access {
         match self.func.id {
             AnyFunctionId::FunctionId(id) => {
-                let func_data = db.function_signature(id);
+                let func_data = FunctionSignature::of(db, id);
                 func_data
                     .params
                     .first()
@@ -3046,7 +3108,7 @@ impl Const {
     }
 
     pub fn name(self, db: &dyn HirDatabase) -> Option<Name> {
-        db.const_signature(self.id).name.clone()
+        ConstSignature::of(db, self.id).name.clone()
     }
 
     pub fn value(self, db: &dyn HirDatabase) -> Option<ast::Expr> {
@@ -3119,11 +3181,11 @@ impl Static {
     }
 
     pub fn name(self, db: &dyn HirDatabase) -> Name {
-        db.static_signature(self.id).name.clone()
+        StaticSignature::of(db, self.id).name.clone()
     }
 
     pub fn is_mut(self, db: &dyn HirDatabase) -> bool {
-        db.static_signature(self.id).flags.contains(StaticFlags::MUTABLE)
+        StaticSignature::of(db, self.id).flags.contains(StaticFlags::MUTABLE)
     }
 
     pub fn value(self, db: &dyn HirDatabase) -> Option<ast::Expr> {
@@ -3179,7 +3241,7 @@ impl Trait {
     }
 
     pub fn name(self, db: &dyn HirDatabase) -> Name {
-        db.trait_signature(self.id).name.clone()
+        TraitSignature::of(db, self.id).name.clone()
     }
 
     pub fn direct_supertraits(self, db: &dyn HirDatabase) -> Vec<Trait> {
@@ -3209,11 +3271,11 @@ impl Trait {
     }
 
     pub fn is_auto(self, db: &dyn HirDatabase) -> bool {
-        db.trait_signature(self.id).flags.contains(TraitFlags::AUTO)
+        TraitSignature::of(db, self.id).flags.contains(TraitFlags::AUTO)
     }
 
     pub fn is_unsafe(&self, db: &dyn HirDatabase) -> bool {
-        db.trait_signature(self.id).flags.contains(TraitFlags::UNSAFE)
+        TraitSignature::of(db, self.id).flags.contains(TraitFlags::UNSAFE)
     }
 
     pub fn type_or_const_param_count(
@@ -3221,7 +3283,7 @@ impl Trait {
         db: &dyn HirDatabase,
         count_required_only: bool,
     ) -> usize {
-        db.generic_params(self.id.into())
+        GenericParams::of(db,self.id.into())
             .iter_type_or_consts()
             .filter(|(_, ty)| !matches!(ty, TypeOrConstParamData::TypeParamData(ty) if ty.provenance != TypeParamProvenance::TypeParamList))
             .filter(|(_, ty)| !count_required_only || !ty.has_default())
@@ -3289,7 +3351,7 @@ impl TypeAlias {
     }
 
     pub fn name(self, db: &dyn HirDatabase) -> Name {
-        db.type_alias_signature(self.id).name.clone()
+        TypeAliasSignature::of(db, self.id).name.clone()
     }
 }
 
@@ -3337,7 +3399,7 @@ impl BuiltinType {
     }
 
     pub fn ty<'db>(self, db: &'db dyn HirDatabase) -> Type<'db> {
-        let core = Crate::core(db).map(|core| core.id).unwrap_or_else(|| db.all_crates()[0]);
+        let core = Crate::core(db).map(|core| core.id).unwrap_or_else(|| all_crates(db)[0]);
         let interner = DbInterner::new_no_crate(db);
         Type::new_for_crate(core, Ty::from_builtin_type(interner, self.inner))
     }
@@ -3731,7 +3793,18 @@ impl AsAssocItem for DefWithBody {
         match self {
             DefWithBody::Function(it) => it.as_assoc_item(db),
             DefWithBody::Const(it) => it.as_assoc_item(db),
-            DefWithBody::Static(_) | DefWithBody::Variant(_) => None,
+            DefWithBody::Static(_) | DefWithBody::EnumVariant(_) => None,
+        }
+    }
+}
+
+impl AsAssocItem for GenericDef {
+    fn as_assoc_item(self, db: &dyn HirDatabase) -> Option<AssocItem> {
+        match self {
+            GenericDef::Function(it) => it.as_assoc_item(db),
+            GenericDef::Const(it) => it.as_assoc_item(db),
+            GenericDef::TypeAlias(it) => it.as_assoc_item(db),
+            _ => None,
         }
     }
 }
@@ -3918,7 +3991,7 @@ impl AssocItem {
                     db,
                     acc,
                     db.type_for_type_alias_with_diagnostics(type_alias.id).1,
-                    &db.type_alias_signature_with_source_map(type_alias.id).1,
+                    &TypeAliasSignature::with_source_map(db, type_alias.id).1,
                 );
                 for diag in hir_ty::diagnostics::incorrect_case(db, type_alias.id.into()) {
                     acc.push(diag.into());
@@ -3971,12 +4044,36 @@ impl_from!(
 );
 
 impl GenericDef {
+    pub fn name(self, db: &dyn HirDatabase) -> Option<Name> {
+        match self {
+            GenericDef::Function(it) => Some(it.name(db)),
+            GenericDef::Adt(it) => Some(it.name(db)),
+            GenericDef::Trait(it) => Some(it.name(db)),
+            GenericDef::TypeAlias(it) => Some(it.name(db)),
+            GenericDef::Impl(_) => None,
+            GenericDef::Const(it) => it.name(db),
+            GenericDef::Static(it) => Some(it.name(db)),
+        }
+    }
+
+    pub fn module(self, db: &dyn HirDatabase) -> Module {
+        match self {
+            GenericDef::Function(it) => it.module(db),
+            GenericDef::Adt(it) => it.module(db),
+            GenericDef::Trait(it) => it.module(db),
+            GenericDef::TypeAlias(it) => it.module(db),
+            GenericDef::Impl(it) => it.module(db),
+            GenericDef::Const(it) => it.module(db),
+            GenericDef::Static(it) => it.module(db),
+        }
+    }
+
     pub fn params(self, db: &dyn HirDatabase) -> Vec<GenericParam> {
         let Ok(id) = self.try_into() else {
             // Let's pretend builtin derive impls don't have generic parameters.
             return Vec::new();
         };
-        let generics = db.generic_params(id);
+        let generics = GenericParams::of(db, id);
         let ty_params = generics.iter_type_or_consts().map(|(local_id, _)| {
             let toc = TypeOrConstParam { id: TypeOrConstParamId { parent: id, local_id } };
             match toc.split(db) {
@@ -3996,7 +4093,7 @@ impl GenericDef {
             // Let's pretend builtin derive impls don't have generic parameters.
             return Vec::new();
         };
-        let generics = db.generic_params(id);
+        let generics = GenericParams::of(db, id);
         generics
             .iter_lt()
             .map(|(local_id, _)| LifetimeParam { id: LifetimeParamId { parent: id, local_id } })
@@ -4008,7 +4105,7 @@ impl GenericDef {
             // Let's pretend builtin derive impls don't have generic parameters.
             return Vec::new();
         };
-        let generics = db.generic_params(id);
+        let generics = GenericParams::of(db, id);
         generics
             .iter_type_or_consts()
             .map(|(local_id, _)| TypeOrConstParam {
@@ -4038,31 +4135,31 @@ impl GenericDef {
     pub fn diagnostics<'db>(self, db: &'db dyn HirDatabase, acc: &mut Vec<AnyDiagnostic<'db>>) {
         let Some(def) = self.id() else { return };
 
-        let generics = db.generic_params(def);
+        let generics = GenericParams::of(db, def);
 
         if generics.is_empty() && generics.has_no_predicates() {
             return;
         }
 
         let source_map = match def {
-            GenericDefId::AdtId(AdtId::EnumId(it)) => db.enum_signature_with_source_map(it).1,
-            GenericDefId::AdtId(AdtId::StructId(it)) => db.struct_signature_with_source_map(it).1,
-            GenericDefId::AdtId(AdtId::UnionId(it)) => db.union_signature_with_source_map(it).1,
+            GenericDefId::AdtId(AdtId::EnumId(it)) => &EnumSignature::with_source_map(db, it).1,
+            GenericDefId::AdtId(AdtId::StructId(it)) => &StructSignature::with_source_map(db, it).1,
+            GenericDefId::AdtId(AdtId::UnionId(it)) => &UnionSignature::with_source_map(db, it).1,
             GenericDefId::ConstId(_) => return,
-            GenericDefId::FunctionId(it) => db.function_signature_with_source_map(it).1,
-            GenericDefId::ImplId(it) => db.impl_signature_with_source_map(it).1,
+            GenericDefId::FunctionId(it) => &FunctionSignature::with_source_map(db, it).1,
+            GenericDefId::ImplId(it) => &ImplSignature::with_source_map(db, it).1,
             GenericDefId::StaticId(_) => return,
-            GenericDefId::TraitId(it) => db.trait_signature_with_source_map(it).1,
-            GenericDefId::TypeAliasId(it) => db.type_alias_signature_with_source_map(it).1,
+            GenericDefId::TraitId(it) => &TraitSignature::with_source_map(db, it).1,
+            GenericDefId::TypeAliasId(it) => &TypeAliasSignature::with_source_map(db, it).1,
         };
 
-        expr_store_diagnostics(db, acc, &source_map);
-        push_ty_diagnostics(db, acc, db.generic_defaults_with_diagnostics(def).1, &source_map);
+        expr_store_diagnostics(db, acc, source_map);
+        push_ty_diagnostics(db, acc, db.generic_defaults_with_diagnostics(def).1, source_map);
         push_ty_diagnostics(
             db,
             acc,
             GenericPredicates::query_with_diagnostics(db, def).1.clone(),
-            &source_map,
+            source_map,
         );
         for (param_id, param) in generics.iter_type_or_consts() {
             if let TypeOrConstParamData::ConstParamData(_) = param {
@@ -4073,7 +4170,7 @@ impl GenericDef {
                         TypeOrConstParamId { parent: def, local_id: param_id },
                     ))
                     .1,
-                    &source_map,
+                    source_map,
                 );
             }
         }
@@ -4134,7 +4231,7 @@ impl<'db> GenericSubstitution<'db> {
                 _ => None,
             })
             .map(|container| {
-                db.generic_params(container)
+                GenericParams::of(db, container)
                     .iter_type_or_consts()
                     .filter_map(|param| match param.1 {
                         TypeOrConstParamData::TypeParamData(param) => Some(param.name.clone()),
@@ -4142,7 +4239,7 @@ impl<'db> GenericSubstitution<'db> {
                     })
                     .collect::<Vec<_>>()
             });
-        let generics = db.generic_params(self.def);
+        let generics = GenericParams::of(db, self.def);
         let type_params = generics.iter_type_or_consts().filter_map(|param| match param.1 {
             TypeOrConstParamData::TypeParamData(param) => Some(param.name.clone()),
             TypeOrConstParamData::ConstParamData(_) => None,
@@ -4170,7 +4267,7 @@ impl<'db> GenericSubstitution<'db> {
 /// A single local definition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Local {
-    pub(crate) parent: DefWithBodyId,
+    pub(crate) parent: ExpressionStoreOwnerId,
     pub(crate) binding_id: BindingId,
 }
 
@@ -4232,7 +4329,7 @@ impl Local {
 
     pub fn as_self_param(self, db: &dyn HirDatabase) -> Option<SelfParam> {
         match self.parent {
-            DefWithBodyId::FunctionId(func) if self.is_self(db) => {
+            ExpressionStoreOwnerId::Body(DefWithBodyId::FunctionId(func)) if self.is_self(db) => {
                 Some(SelfParam { func: func.into() })
             }
             _ => None,
@@ -4240,8 +4337,7 @@ impl Local {
     }
 
     pub fn name(self, db: &dyn HirDatabase) -> Name {
-        let body = db.body(self.parent);
-        body[self.binding_id].name.clone()
+        ExpressionStore::of(db, self.parent)[self.binding_id].name.clone()
     }
 
     pub fn is_self(self, db: &dyn HirDatabase) -> bool {
@@ -4249,16 +4345,17 @@ impl Local {
     }
 
     pub fn is_mut(self, db: &dyn HirDatabase) -> bool {
-        let body = db.body(self.parent);
-        body[self.binding_id].mode == BindingAnnotation::Mutable
+        ExpressionStore::of(db, self.parent)[self.binding_id].mode == BindingAnnotation::Mutable
     }
 
     pub fn is_ref(self, db: &dyn HirDatabase) -> bool {
-        let body = db.body(self.parent);
-        matches!(body[self.binding_id].mode, BindingAnnotation::Ref | BindingAnnotation::RefMut)
+        matches!(
+            ExpressionStore::of(db, self.parent)[self.binding_id].mode,
+            BindingAnnotation::Ref | BindingAnnotation::RefMut
+        )
     }
 
-    pub fn parent(self, _db: &dyn HirDatabase) -> DefWithBody {
+    pub fn parent(self, _db: &dyn HirDatabase) -> ExpressionStoreOwner {
         self.parent.into()
     }
 
@@ -4272,67 +4369,91 @@ impl Local {
 
     pub fn ty(self, db: &dyn HirDatabase) -> Type<'_> {
         let def = self.parent;
-        let infer = InferenceResult::for_body(db, def);
+        let infer = InferenceResult::of(db, def);
         let ty = infer.binding_ty(self.binding_id);
         Type::new(db, def, ty)
     }
 
     /// All definitions for this local. Example: `let (a$0, _) | (_, a$0) = it;`
     pub fn sources(self, db: &dyn HirDatabase) -> Vec<LocalSource> {
-        let (body, source_map) = db.body_with_source_map(self.parent);
-        match body.self_param.zip(source_map.self_param_syntax()) {
-            Some((param, source)) if param == self.binding_id => {
-                let root = source.file_syntax(db);
-                vec![LocalSource {
-                    local: self,
-                    source: source.map(|ast| Either::Right(ast.to_node(&root))),
-                }]
+        let b;
+        let (_, source_map) = match self.parent {
+            ExpressionStoreOwnerId::Signature(generic_def_id) => {
+                ExpressionStore::with_source_map(db, generic_def_id.into())
             }
-            _ => source_map
-                .patterns_for_binding(self.binding_id)
-                .iter()
-                .map(|&definition| {
-                    let src = source_map.pat_syntax(definition).unwrap(); // Hmm...
-                    let root = src.file_syntax(db);
-                    LocalSource {
+            ExpressionStoreOwnerId::Body(def_with_body_id) => {
+                b = Body::with_source_map(db, def_with_body_id);
+                if let Some((param, source)) = b.0.self_param.zip(b.1.self_param_syntax())
+                    && param == self.binding_id
+                {
+                    let root = source.file_syntax(db);
+                    return vec![LocalSource {
                         local: self,
-                        source: src.map(|ast| match ast.to_node(&root) {
-                            Either::Right(ast::Pat::IdentPat(it)) => Either::Left(it),
-                            _ => unreachable!("local with non ident-pattern"),
-                        }),
-                    }
-                })
-                .collect(),
-        }
+                        source: source.map(|ast| Either::Right(ast.to_node(&root))),
+                    }];
+                }
+                (&b.0.store, &b.1.store)
+            }
+            ExpressionStoreOwnerId::VariantFields(def) => {
+                ExpressionStore::with_source_map(db, def.into())
+            }
+        };
+        source_map
+            .patterns_for_binding(self.binding_id)
+            .iter()
+            .map(|&definition| {
+                let src = source_map.pat_syntax(definition).unwrap(); // Hmm...
+                let root = src.file_syntax(db);
+                LocalSource {
+                    local: self,
+                    source: src.map(|ast| match ast.to_node(&root) {
+                        Either::Right(ast::Pat::IdentPat(it)) => Either::Left(it),
+                        _ => unreachable!("local with non ident-pattern"),
+                    }),
+                }
+            })
+            .collect()
     }
 
     /// The leftmost definition for this local. Example: `let (a$0, _) | (_, a) = it;`
     pub fn primary_source(self, db: &dyn HirDatabase) -> LocalSource {
-        let (body, source_map) = db.body_with_source_map(self.parent);
-        match body.self_param.zip(source_map.self_param_syntax()) {
-            Some((param, source)) if param == self.binding_id => {
-                let root = source.file_syntax(db);
+        let b;
+        let (_, source_map) = match self.parent {
+            ExpressionStoreOwnerId::Signature(generic_def_id) => {
+                ExpressionStore::with_source_map(db, generic_def_id.into())
+            }
+            ExpressionStoreOwnerId::Body(def_with_body_id) => {
+                b = Body::with_source_map(db, def_with_body_id);
+                if let Some((param, source)) = b.0.self_param.zip(b.1.self_param_syntax())
+                    && param == self.binding_id
+                {
+                    let root = source.file_syntax(db);
+                    return LocalSource {
+                        local: self,
+                        source: source.map(|ast| Either::Right(ast.to_node(&root))),
+                    };
+                }
+                (&b.0.store, &b.1.store)
+            }
+            ExpressionStoreOwnerId::VariantFields(def) => {
+                ExpressionStore::with_source_map(db, def.into())
+            }
+        };
+        source_map
+            .patterns_for_binding(self.binding_id)
+            .first()
+            .map(|&definition| {
+                let src = source_map.pat_syntax(definition).unwrap(); // Hmm...
+                let root = src.file_syntax(db);
                 LocalSource {
                     local: self,
-                    source: source.map(|ast| Either::Right(ast.to_node(&root))),
+                    source: src.map(|ast| match ast.to_node(&root) {
+                        Either::Right(ast::Pat::IdentPat(it)) => Either::Left(it),
+                        _ => unreachable!("local with non ident-pattern"),
+                    }),
                 }
-            }
-            _ => source_map
-                .patterns_for_binding(self.binding_id)
-                .first()
-                .map(|&definition| {
-                    let src = source_map.pat_syntax(definition).unwrap(); // Hmm...
-                    let root = src.file_syntax(db);
-                    LocalSource {
-                        local: self,
-                        source: src.map(|ast| match ast.to_node(&root) {
-                            Either::Right(ast::Pat::IdentPat(it)) => Either::Left(it),
-                            _ => unreachable!("local with non ident-pattern"),
-                        }),
-                    }
-                })
-                .unwrap(),
-        }
+            })
+            .unwrap()
     }
 }
 
@@ -4417,7 +4538,7 @@ impl ToolModule {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Label {
-    pub(crate) parent: DefWithBodyId,
+    pub(crate) parent: ExpressionStoreOwnerId,
     pub(crate) label_id: LabelId,
 }
 
@@ -4426,13 +4547,12 @@ impl Label {
         self.parent(db).module(db)
     }
 
-    pub fn parent(self, _db: &dyn HirDatabase) -> DefWithBody {
+    pub fn parent(self, _db: &dyn HirDatabase) -> ExpressionStoreOwner {
         self.parent.into()
     }
 
     pub fn name(self, db: &dyn HirDatabase) -> Name {
-        let body = db.body(self.parent);
-        body[self.label_id].name.clone()
+        ExpressionStore::of(db, self.parent)[self.label_id].name.clone()
     }
 }
 
@@ -4543,7 +4663,7 @@ impl TypeParam {
     /// Is this type parameter implicitly introduced (eg. `Self` in a trait or an `impl Trait`
     /// argument)?
     pub fn is_implicit(self, db: &dyn HirDatabase) -> bool {
-        let params = db.generic_params(self.id.parent());
+        let params = GenericParams::of(db, self.id.parent());
         let data = &params[self.id.local_id()];
         match data.type_param().unwrap().provenance {
             TypeParamProvenance::TypeParamList => false,
@@ -4565,7 +4685,7 @@ impl TypeParam {
     pub fn trait_bounds(self, db: &dyn HirDatabase) -> Vec<Trait> {
         let self_ty = self.ty(db).ty;
         GenericPredicates::query_explicit(db, self.id.parent())
-            .iter_identity_copied()
+            .iter_identity()
             .filter_map(|pred| match &pred.kind().skip_binder() {
                 ClauseKind::Trait(trait_ref) if trait_ref.self_ty() == self_ty => {
                     Some(Trait::from(trait_ref.def_id().0))
@@ -4598,7 +4718,7 @@ pub struct LifetimeParam {
 
 impl LifetimeParam {
     pub fn name(self, db: &dyn HirDatabase) -> Name {
-        let params = db.generic_params(self.id.parent);
+        let params = GenericParams::of(db, self.id.parent);
         params[self.id.local_id].name.clone()
     }
 
@@ -4622,7 +4742,7 @@ impl ConstParam {
     }
 
     pub fn name(self, db: &dyn HirDatabase) -> Name {
-        let params = db.generic_params(self.id.parent());
+        let params = GenericParams::of(db, self.id.parent());
         match params[self.id.local_id()].name() {
             Some(it) => it.clone(),
             None => {
@@ -4669,7 +4789,7 @@ pub struct TypeOrConstParam {
 
 impl TypeOrConstParam {
     pub fn name(self, db: &dyn HirDatabase) -> Name {
-        let params = db.generic_params(self.id.parent);
+        let params = GenericParams::of(db, self.id.parent);
         match params[self.id.local_id].name() {
             Some(n) => n.clone(),
             _ => Name::missing(),
@@ -4685,7 +4805,7 @@ impl TypeOrConstParam {
     }
 
     pub fn split(self, db: &dyn HirDatabase) -> Either<ConstParam, TypeParam> {
-        let params = db.generic_params(self.id.parent);
+        let params = GenericParams::of(db, self.id.parent);
         match &params[self.id.local_id] {
             TypeOrConstParamData::TypeParamData(_) => {
                 Either::Right(TypeParam { id: TypeParamId::from_unchecked(self.id) })
@@ -4704,7 +4824,7 @@ impl TypeOrConstParam {
     }
 
     pub fn as_type_param(self, db: &dyn HirDatabase) -> Option<TypeParam> {
-        let params = db.generic_params(self.id.parent);
+        let params = GenericParams::of(db, self.id.parent);
         match &params[self.id.local_id] {
             TypeOrConstParamData::TypeParamData(_) => {
                 Some(TypeParam { id: TypeParamId::from_unchecked(self.id) })
@@ -4714,7 +4834,7 @@ impl TypeOrConstParam {
     }
 
     pub fn as_const_param(self, db: &dyn HirDatabase) -> Option<ConstParam> {
-        let params = db.generic_params(self.id.parent);
+        let params = GenericParams::of(db, self.id.parent);
         match &params[self.id.local_id] {
             TypeOrConstParamData::TypeParamData(_) => None,
             TypeOrConstParamData::ConstParamData(_) => {
@@ -4741,7 +4861,7 @@ impl Impl {
                 result.extend(module.scope.builtin_derive_impls().map(Impl::from));
 
                 for unnamed_const in module.scope.unnamed_consts() {
-                    for (_, block_def_map) in db.body(unnamed_const.into()).blocks(db) {
+                    for (_, block_def_map) in Body::of(db, unnamed_const.into()).blocks(db) {
                         extend_with_def_map(db, block_def_map, result);
                     }
                 }
@@ -4783,12 +4903,12 @@ impl Impl {
             std::iter::successors(module.block(db), |block| block.loc(db).module.block(db))
                 .filter_map(|block| TraitImpls::for_block(db, block).as_deref())
                 .for_each(|impls| impls.for_self_ty(&simplified_ty, &mut extend_with_impls));
-            for &krate in &**db.all_crates() {
+            for &krate in &*all_crates(db) {
                 TraitImpls::for_crate(db, krate)
                     .for_self_ty(&simplified_ty, &mut extend_with_impls);
             }
         } else {
-            for &krate in &**db.all_crates() {
+            for &krate in &*all_crates(db) {
                 TraitImpls::for_crate(db, krate)
                     .for_self_ty(&simplified_ty, &mut extend_with_impls);
             }
@@ -4898,14 +5018,14 @@ impl Impl {
 
     pub fn is_negative(self, db: &dyn HirDatabase) -> bool {
         match self.id {
-            AnyImplId::ImplId(id) => db.impl_signature(id).flags.contains(ImplFlags::NEGATIVE),
+            AnyImplId::ImplId(id) => ImplSignature::of(db, id).flags.contains(ImplFlags::NEGATIVE),
             AnyImplId::BuiltinDeriveImplId(_) => false,
         }
     }
 
     pub fn is_unsafe(self, db: &dyn HirDatabase) -> bool {
         match self.id {
-            AnyImplId::ImplId(id) => db.impl_signature(id).flags.contains(ImplFlags::UNSAFE),
+            AnyImplId::ImplId(id) => ImplSignature::of(db, id).flags.contains(ImplFlags::UNSAFE),
             AnyImplId::BuiltinDeriveImplId(_) => false,
         }
     }
@@ -5012,7 +5132,7 @@ impl<'db> Closure<'db> {
             return Vec::new();
         };
         let owner = db.lookup_intern_closure(id).0;
-        let infer = InferenceResult::for_body(db, owner);
+        let infer = InferenceResult::of(db, owner);
         let info = infer.closure_info(id);
         info.0
             .iter()
@@ -5032,9 +5152,12 @@ impl<'db> Closure<'db> {
             return Vec::new();
         };
         let owner = db.lookup_intern_closure(id).0;
-        let infer = InferenceResult::for_body(db, owner);
+        let Some(body_owner) = owner.as_def_with_body() else {
+            return Vec::new();
+        };
+        let infer = InferenceResult::of(db, body_owner);
         let (captures, _) = infer.closure_info(id);
-        let env = body_param_env_from_has_crate(db, owner);
+        let env = body_param_env_from_has_crate(db, body_owner);
         captures.iter().map(|capture| Type { env, ty: capture.ty(db, self.subst) }).collect()
     }
 
@@ -5042,7 +5165,10 @@ impl<'db> Closure<'db> {
         match self.id {
             AnyClosureId::ClosureId(id) => {
                 let owner = db.lookup_intern_closure(id).0;
-                let infer = InferenceResult::for_body(db, owner);
+                let Some(body_owner) = owner.as_def_with_body() else {
+                    return FnTrait::FnOnce;
+                };
+                let infer = InferenceResult::of(db, body_owner);
                 let info = infer.closure_info(id);
                 info.1.into()
             }
@@ -5125,7 +5251,7 @@ impl FnTrait {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClosureCapture<'db> {
-    owner: DefWithBodyId,
+    owner: ExpressionStoreOwnerId,
     closure: InternedClosureId,
     capture: hir_ty::CapturedItem,
     _marker: PhantomCovariantLifetime<'db>,
@@ -5184,17 +5310,16 @@ pub enum CaptureKind {
 
 #[derive(Debug, Clone)]
 pub struct CaptureUsages {
-    parent: DefWithBodyId,
+    parent: ExpressionStoreOwnerId,
     spans: SmallVec<[mir::MirSpan; 3]>,
 }
 
 impl CaptureUsages {
     pub fn sources(&self, db: &dyn HirDatabase) -> Vec<CaptureUsageSource> {
-        let (body, source_map) = db.body_with_source_map(self.parent);
-
+        let (body, source_map) = ExpressionStore::with_source_map(db, self.parent);
         let mut result = Vec::with_capacity(self.spans.len());
         for &span in self.spans.iter() {
-            let is_ref = span.is_ref_span(&body);
+            let is_ref = span.is_ref_span(body);
             match span {
                 mir::MirSpan::ExprId(expr) => {
                     if let Ok(expr) = source_map.expr_syntax(expr) {
@@ -5362,7 +5487,7 @@ impl<'db> Type<'db> {
         fn is_phantom_data(db: &dyn HirDatabase, adt_id: AdtId) -> bool {
             match adt_id {
                 AdtId::StructId(s) => {
-                    let flags = db.struct_signature(s).flags;
+                    let flags = StructSignature::of(db, s).flags;
                     flags.contains(StructFlags::IS_PHANTOM_DATA)
                 }
                 AdtId::UnionId(_) | AdtId::EnumId(_) => false,
@@ -5956,8 +6081,8 @@ impl<'db> Type<'db> {
         // for a nicer IDE experience. However, method resolution is always done on real code (either
         // existing code or code to be inserted), and there using PostAnalysis is dangerous - we may
         // suggest invalid methods. So we're using the TypingMode of the body we're in.
-        let typing_mode = if let Some(body_owner) = resolver.body_owner() {
-            TypingMode::analysis_in_body(interner, body_owner.into())
+        let typing_mode = if let Some(store_owner) = resolver.expression_store_owner() {
+            TypingMode::analysis_in_body(interner, store_owner.into())
         } else {
             TypingMode::non_body_analysis()
         };
@@ -6362,18 +6487,19 @@ impl<'db> TypeNs<'db> {
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone, Hash)]
 pub struct InlineAsmOperand {
-    owner: DefWithBodyId,
+    owner: ExpressionStoreOwnerId,
     expr: ExprId,
     index: usize,
 }
 
 impl InlineAsmOperand {
-    pub fn parent(self, _db: &dyn HirDatabase) -> DefWithBody {
+    pub fn parent(self, _db: &dyn HirDatabase) -> ExpressionStoreOwner {
         self.owner.into()
     }
 
     pub fn name(&self, db: &dyn HirDatabase) -> Option<Name> {
-        match &db.body(self.owner)[self.expr] {
+        let body = ExpressionStore::of(db, self.owner);
+        match &body[self.expr] {
             hir_def::hir::Expr::InlineAsm(e) => e.operands.get(self.index)?.0.clone(),
             _ => None,
         }
@@ -6403,7 +6529,7 @@ enum Callee<'db> {
 pub enum CallableKind<'db> {
     Function(Function),
     TupleStruct(Struct),
-    TupleEnumVariant(Variant),
+    TupleEnumVariant(EnumVariant),
     Closure(Closure<'db>),
     FnPtr,
     FnImpl(FnTrait),
@@ -6753,7 +6879,7 @@ impl HasCrate for Field {
     }
 }
 
-impl HasCrate for Variant {
+impl HasCrate for EnumVariant {
     fn krate(&self, db: &dyn HirDatabase) -> Crate {
         self.module(db).krate(db)
     }
@@ -6922,9 +7048,9 @@ impl_has_name!(
     Struct,
     Union,
     Enum,
-    Variant,
+    EnumVariant,
     Adt,
-    VariantDef,
+    Variant,
     DefWithBody,
     Function,
     ExternCrateDecl,
@@ -7054,7 +7180,7 @@ pub fn resolve_absolute_path<'a, I: Iterator<Item = Symbol> + Clone + 'a>(
         .next()
         .into_iter()
         .flat_map(move |crate_name| {
-            db.all_crates()
+            all_crates(db)
                 .iter()
                 .filter(|&krate| {
                     krate
@@ -7113,7 +7239,7 @@ fn generic_args_from_tys<'db>(
 }
 
 fn has_non_default_type_params(db: &dyn HirDatabase, generic_def: GenericDefId) -> bool {
-    let params = db.generic_params(generic_def);
+    let params = GenericParams::of(db, generic_def);
     let defaults = db.generic_defaults(generic_def);
     params
         .iter_type_or_consts()
@@ -7134,7 +7260,7 @@ fn param_env_from_resolver<'db>(
     ParamEnvAndCrate {
         param_env: resolver
             .generic_def()
-            .map_or_else(ParamEnv::empty, |generic_def| db.trait_environment(generic_def)),
+            .map_or_else(ParamEnv::empty, |generic_def| db.trait_environment(generic_def.into())),
         krate: resolver.krate(),
     }
 }
@@ -7143,14 +7269,14 @@ fn param_env_from_has_crate<'db>(
     db: &'db dyn HirDatabase,
     id: impl hir_def::HasModule + Into<GenericDefId> + Copy,
 ) -> ParamEnvAndCrate<'db> {
-    ParamEnvAndCrate { param_env: db.trait_environment(id.into()), krate: id.krate(db) }
+    ParamEnvAndCrate { param_env: db.trait_environment(id.into().into()), krate: id.krate(db) }
 }
 
 fn body_param_env_from_has_crate<'db>(
     db: &'db dyn HirDatabase,
-    id: impl hir_def::HasModule + Into<DefWithBodyId> + Copy,
+    id: impl hir_def::HasModule + Into<ExpressionStoreOwnerId> + Copy,
 ) -> ParamEnvAndCrate<'db> {
-    ParamEnvAndCrate { param_env: db.trait_environment_for_body(id.into()), krate: id.krate(db) }
+    ParamEnvAndCrate { param_env: db.trait_environment(id.into()), krate: id.krate(db) }
 }
 
 fn empty_param_env<'db>(krate: base_db::Crate) -> ParamEnvAndCrate<'db> {

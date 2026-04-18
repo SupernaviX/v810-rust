@@ -30,8 +30,10 @@ use rustc_data_structures::stack::ensure_sufficient_stack;
 use rustc_data_structures::tagged_ptr::Tag;
 use rustc_macros::{Decodable, Encodable, HashStable_Generic, Walkable};
 pub use rustc_span::AttrId;
-use rustc_span::source_map::{Spanned, respan};
-use rustc_span::{ByteSymbol, DUMMY_SP, ErrorGuaranteed, Ident, Span, Symbol, kw, sym};
+use rustc_span::{
+    ByteSymbol, DUMMY_SP, ErrorGuaranteed, HashStableContext, Ident, Span, Spanned, Symbol, kw,
+    respan, sym,
+};
 use thin_vec::{ThinVec, thin_vec};
 
 use crate::attr::data_structures::CfgEntry;
@@ -119,8 +121,8 @@ impl PartialEq<&[Symbol]> for Path {
     }
 }
 
-impl<CTX: rustc_span::HashStableContext> HashStable<CTX> for Path {
-    fn hash_stable(&self, hcx: &mut CTX, hasher: &mut StableHasher) {
+impl<Hcx: HashStableContext> HashStable<Hcx> for Path {
+    fn hash_stable(&self, hcx: &mut Hcx, hasher: &mut StableHasher) {
         self.segments.len().hash_stable(hcx, hasher);
         for segment in &self.segments {
             segment.ident.hash_stable(hcx, hasher);
@@ -937,7 +939,7 @@ pub enum PatKind {
     Never,
 
     /// A guard pattern (e.g., `x if guard(x)`).
-    Guard(Box<Pat>, Box<Expr>),
+    Guard(Box<Pat>, Box<Guard>),
 
     /// Parentheses in patterns used for grouping (i.e., `(PAT)`).
     Paren(Box<Pat>),
@@ -1345,7 +1347,7 @@ pub struct Arm {
     /// Match arm pattern, e.g. `10` in `match foo { 10 => {}, _ => {} }`.
     pub pat: Box<Pat>,
     /// Match arm guard, e.g. `n > 10` in `match foo { n if n > 10 => {}, _ => {} }`.
-    pub guard: Option<Box<Expr>>,
+    pub guard: Option<Box<Guard>>,
     /// Match arm body. Omitted if the pattern is a never pattern.
     pub body: Option<Box<Expr>>,
     pub span: Span,
@@ -3336,7 +3338,7 @@ pub enum UseTreeKind {
     /// ```
     Nested { items: ThinVec<(UseTree, NodeId)>, span: Span },
     /// `use prefix::*`
-    Glob,
+    Glob(Span),
 }
 
 /// A tree of paths sharing common prefixes.
@@ -3345,10 +3347,11 @@ pub enum UseTreeKind {
 pub struct UseTree {
     pub prefix: Path,
     pub kind: UseTreeKind,
-    pub span: Span,
 }
 
 impl UseTree {
+    /// If the `UseTree` is just an identifier, return that.
+    /// Panics if it's a glob (`*`) or a nested use tree.
     pub fn ident(&self) -> Ident {
         match self.kind {
             UseTreeKind::Simple(Some(rename)) => rename,
@@ -3356,6 +3359,27 @@ impl UseTree {
                 self.prefix.segments.last().expect("empty prefix in a simple import").ident
             }
             _ => panic!("`UseTree::ident` can only be used on a simple import"),
+        }
+    }
+
+    /// Returns the full span from the start of the path to the
+    /// closing `}` or nested spans, `*` of glob spans or the end of the
+    /// identifier of simple spans.
+    pub fn span(&self) -> Span {
+        self.prefix.span.to(self.hi_span())
+    }
+
+    /// Returns the trailing element's span. So for a nested
+    /// span you get the entire `{}`-block, for a glob you
+    /// get the span of the `*` itself, and for simple use trees
+    /// you get the identifier to rename the import to or the full
+    /// path if no rename is specified.
+    pub fn hi_span(&self) -> Span {
+        match self.kind {
+            UseTreeKind::Simple(None) => self.prefix.span,
+            UseTreeKind::Simple(Some(name)) => name.span,
+            UseTreeKind::Nested { span, .. } => span,
+            UseTreeKind::Glob(span) => span,
         }
     }
 }
@@ -3878,11 +3902,16 @@ pub struct Delegation {
 }
 
 #[derive(Clone, Encodable, Decodable, Debug, Walkable)]
+pub enum DelegationSuffixes {
+    List(ThinVec<(Ident, Option<Ident>)>),
+    Glob(Span),
+}
+
+#[derive(Clone, Encodable, Decodable, Debug, Walkable)]
 pub struct DelegationMac {
     pub qself: Option<Box<QSelf>>,
     pub prefix: Path,
-    // Some for list delegation, and None for glob delegation.
-    pub suffixes: Option<ThinVec<(Ident, Option<Ident>)>>,
+    pub suffixes: DelegationSuffixes,
     pub body: Option<Box<Block>>,
 }
 
@@ -3894,6 +3923,13 @@ pub struct StaticItem {
     pub mutability: Mutability,
     pub expr: Option<Box<Expr>>,
     pub define_opaque: Option<ThinVec<(NodeId, Path)>>,
+
+    /// This static is an implementation of an externally implementable item (EII).
+    /// This means, there was an EII declared somewhere and this static is the
+    /// implementation that should be used for the declaration.
+    ///
+    /// For statics, there may be at most one `EiiImpl`, but this is a `ThinVec` to make usages of this field nicer.
+    pub eii_impls: ThinVec<EiiImpl>,
 }
 
 #[derive(Clone, Encodable, Decodable, Debug, Walkable)]
@@ -3951,6 +3987,18 @@ pub struct ConstBlockItem {
 
 impl ConstBlockItem {
     pub const IDENT: Ident = Ident { name: kw::Underscore, span: DUMMY_SP };
+}
+
+#[derive(Clone, Encodable, Decodable, Debug, Walkable)]
+pub struct Guard {
+    pub cond: Expr,
+    pub span_with_leading_if: Span,
+}
+
+impl Guard {
+    pub fn span(&self) -> Span {
+        self.cond.span
+    }
 }
 
 // Adding a new variant? Please update `test_item` in `tests/ui/macros/stringify.rs`.
