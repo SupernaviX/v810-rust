@@ -576,6 +576,7 @@ fn human_readable_target_arch(os: Symbol) -> Option<&'static str> {
         Sparc => "SPARC",
         Sparc64 => "SPARC-64",
         SpirV => "SPIR-V",
+        V810 => "V810",
         Wasm32 | Wasm64 => "WebAssembly",
         X86 => "x86",
         X86_64 => "x86-64",
