@@ -230,7 +230,7 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
             &AttributeKind::Sanitize { on_set, off_set, rtsan: _, span: attr_span } => {
                 self.check_sanitize(attr_span, on_set | off_set, span, target);
             }
-            &AttributeKind::Interrupt(attr_span) => self.check_interrupt(*attr_span, span, target)
+            AttributeKind::Interrupt(attr_span) => self.check_interrupt(*attr_span, span, target),
             AttributeKind::Link(_, attr_span) => self.check_link(hir_id, *attr_span, span, target),
             AttributeKind::MacroExport { span, .. } => {
                 self.check_macro_export(hir_id, *span, target)
