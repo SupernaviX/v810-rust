@@ -66,7 +66,10 @@ unsafe fn configure_llvm(sess: &Session) {
 
     let cg_opts = sess.opts.cg.llvm_args.iter().map(AsRef::as_ref);
     let tg_opts = sess.target.llvm_args.iter().map(AsRef::as_ref);
-    let sess_args = cg_opts.chain(tg_opts);
+    // Target-spec args are passed to LLVM before user `-Cllvm-args`. LLVM's
+    // `cl::opt` parser is last-wins, so this lets `-Cllvm-args=...` override
+    // a value already set in the target spec (e.g. `-wasm-use-legacy-eh`).
+    let sess_args = tg_opts.chain(cg_opts);
 
     let user_specified_args: FxHashSet<_> =
         sess_args.clone().map(|s| llvm_arg_to_arg_name(s)).filter(|s| !s.is_empty()).collect();
@@ -120,7 +123,7 @@ unsafe fn configure_llvm(sess: &Session) {
         // Use non-zero `import-instr-limit` multiplier for cold callsites.
         add("-import-cold-multiplier=0.1", false);
 
-        if sess.print_llvm_stats() {
+        if sess.print_llvm_stats() || sess.print_llvm_stats_json().is_some() {
             add("-stats", false);
         }
 
@@ -510,6 +513,9 @@ fn print_target_cpus(sess: &Session, tm: &llvm::TargetMachine, out: &mut String)
     };
     let mut cpus = cpu_names
         .lines()
+        .filter(|cpu_name| {
+            !sess.target.unsupported_cpus.contains(&std::borrow::Cow::Borrowed(*cpu_name))
+        })
         .map(|cpu_name| Cpu { cpu_name, remark: make_remark(cpu_name) })
         .collect::<VecDeque<_>>();
 
@@ -737,4 +743,11 @@ pub(crate) fn global_llvm_features(sess: &Session, only_base_features: bool) -> 
 pub(crate) fn tune_cpu(sess: &Session) -> Option<&str> {
     let name = sess.opts.unstable_opts.tune_cpu.as_ref()?;
     Some(handle_native(name))
+}
+
+pub(crate) fn target_has_mnemonic(sess: &Session, mnemonic: &str) -> bool {
+    require_inited();
+    let tm = create_informational_target_machine(sess, false);
+    let cstr = SmallCStr::new(mnemonic);
+    unsafe { llvm::LLVMRustTargetHasMnemonic(tm.raw(), cstr.as_ptr()) }
 }

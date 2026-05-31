@@ -17,12 +17,13 @@ use rustc_target::callconv::{ArgAbi, ArgAttributes, CastTarget, FnAbi, PassMode}
 use tracing::{debug, info};
 
 use super::operand::OperandRef;
-use super::operand::OperandValue::{Immediate, Pair, Ref, ZeroSized};
+use super::operand::OperandValue::{self, Immediate, Pair, Ref, ZeroSized};
 use super::place::{PlaceRef, PlaceValue};
 use super::{CachedLlbb, FunctionCx, LocalRef};
 use crate::base::{self, is_call_from_compiler_builtins_to_upstream_monomorphization};
 use crate::common::{self, IntPredicate};
 use crate::errors::CompilerBuiltinsCannotCall;
+use crate::mir::IntrinsicResult;
 use crate::traits::*;
 use crate::{MemFlags, meth};
 
@@ -214,19 +215,18 @@ impl<'a, 'tcx> TerminatorCodegenHelper<'tcx> {
             mir::UnwindAction::Continue => None,
             mir::UnwindAction::Unreachable => None,
             mir::UnwindAction::Terminate(reason) => {
-                if fx.mir[self.bb].is_cleanup && base::wants_new_eh_instructions(fx.cx.tcx().sess) {
+                if fx.mir[self.bb].is_cleanup && base::wants_wasm_eh(fx.cx.tcx().sess) {
+                    // For wasm, we need to generate a nested `cleanuppad within %outer_pad`
+                    // to catch exceptions during cleanup and call `panic_in_cleanup`.
+                    Some(fx.terminate_block(reason, Some(self.bb)))
+                } else if fx.mir[self.bb].is_cleanup
+                    && base::wants_new_eh_instructions(fx.cx.tcx().sess)
+                {
                     // MSVC SEH will abort automatically if an exception tries to
                     // propagate out from cleanup.
-
-                    // FIXME(@mirkootter): For wasm, we currently do not support terminate during
-                    // cleanup, because this requires a few more changes: The current code
-                    // caches the `terminate_block` for each function; funclet based code - however -
-                    // requires a different terminate_block for each funclet
-                    // Until this is implemented, we just do not unwind inside cleanup blocks
-
                     None
                 } else {
-                    Some(fx.terminate_block(reason))
+                    Some(fx.terminate_block(reason, None))
                 }
             }
         };
@@ -238,7 +238,7 @@ impl<'a, 'tcx> TerminatorCodegenHelper<'tcx> {
 
         if let Some(unwind_block) = unwind_block {
             let ret_llbb = if let Some((_, target)) = destination {
-                fx.llbb(target)
+                self.llbb_with_cleanup(fx, target)
             } else {
                 fx.unreachable_block()
             };
@@ -309,7 +309,7 @@ impl<'a, 'tcx> TerminatorCodegenHelper<'tcx> {
     ) -> MergingSucc {
         let unwind_target = match unwind {
             mir::UnwindAction::Cleanup(cleanup) => Some(self.llbb_with_cleanup(fx, cleanup)),
-            mir::UnwindAction::Terminate(reason) => Some(fx.terminate_block(reason)),
+            mir::UnwindAction::Terminate(reason) => Some(fx.terminate_block(reason, None)),
             mir::UnwindAction::Continue => None,
             mir::UnwindAction::Unreachable => None,
         };
@@ -317,7 +317,7 @@ impl<'a, 'tcx> TerminatorCodegenHelper<'tcx> {
         if operands.iter().any(|x| matches!(x, InlineAsmOperandRef::Label { .. })) {
             assert!(unwind_target.is_none());
             let ret_llbb = if let Some(target) = destination {
-                fx.llbb(target)
+                self.llbb_with_cleanup(fx, target)
             } else {
                 fx.unreachable_block()
             };
@@ -334,7 +334,7 @@ impl<'a, 'tcx> TerminatorCodegenHelper<'tcx> {
             MergingSucc::False
         } else if let Some(cleanup) = unwind_target {
             let ret_llbb = if let Some(target) = destination {
-                fx.llbb(target)
+                self.llbb_with_cleanup(fx, target)
             } else {
                 fx.unreachable_block()
             };
@@ -523,7 +523,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
         if self.fn_abi.c_variadic {
             // The `VaList` "spoofed" argument is just after all the real arguments.
             let va_list_arg_idx = self.fn_abi.args.len();
-            match self.locals[mir::Local::from_usize(1 + va_list_arg_idx)] {
+            match self.locals[mir::Local::arg(va_list_arg_idx)] {
                 LocalRef::Place(va_list) => {
                     bx.va_end(va_list.val.llval);
 
@@ -604,7 +604,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
     ) -> MergingSucc {
         let ty = location.ty(self.mir, bx.tcx()).ty;
         let ty = self.monomorphize(ty);
-        let drop_fn = Instance::resolve_drop_in_place(bx.tcx(), ty);
+        let drop_fn = Instance::resolve_drop_glue(bx.tcx(), ty);
 
         if let ty::InstanceKind::DropGlue(_, None) = drop_fn.def {
             // we don't actually need to drop anything.
@@ -622,7 +622,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
         };
         let (maybe_null, drop_fn, fn_abi, drop_instance) = match ty.kind() {
             // FIXME(eddyb) perhaps move some of this logic into
-            // `Instance::resolve_drop_in_place`?
+            // `Instance::resolve_drop_glue`?
             ty::Dynamic(_, _) => {
                 // IN THIS ARM, WE HAVE:
                 // ty = *mut (dyn Trait)
@@ -945,32 +945,31 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                         let result_layout =
                             self.cx.layout_of(self.monomorphized_place_ty(destination.as_ref()));
 
-                        let (result, store_in_local) = if result_layout.is_zst() {
-                            (
-                                PlaceRef::new_sized(bx.const_undef(bx.type_ptr()), result_layout),
-                                None,
-                            )
-                        } else if let Some(local) = destination.as_local() {
-                            match self.locals[local] {
-                                LocalRef::Place(dest) => (dest, None),
-                                LocalRef::UnsizedPlace(_) => bug!("return type must be sized"),
-                                LocalRef::PendingOperand => {
-                                    // Currently, intrinsics always need a location to store
-                                    // the result, so we create a temporary `alloca` for the
-                                    // result.
-                                    let tmp = PlaceRef::alloca(bx, result_layout);
-                                    tmp.storage_live(bx);
-                                    (tmp, Some(local))
+                        let (result_place, store_in_local) =
+                            if let Some(local) = destination.as_local() {
+                                match self.locals[local] {
+                                    LocalRef::Place(dest) => (Some(dest.val), None),
+                                    LocalRef::UnsizedPlace(_) => bug!("return type must be sized"),
+                                    LocalRef::PendingOperand => (None, Some(local)),
+                                    LocalRef::Operand(_) => {
+                                        if result_layout.is_zst() {
+                                            let place = PlaceRef::new_sized(
+                                                bx.const_undef(bx.type_ptr()),
+                                                result_layout,
+                                            );
+                                            (Some(place.val), None)
+                                        } else {
+                                            bug!("place local already assigned to");
+                                        }
+                                    }
                                 }
-                                LocalRef::Operand(_) => {
-                                    bug!("place local already assigned to");
-                                }
-                            }
-                        } else {
-                            (self.codegen_place(bx, destination.as_ref()), None)
-                        };
+                            } else {
+                                (Some(self.codegen_place(bx, destination.as_ref()).val), None)
+                            };
 
-                        if result.val.align < result.layout.align.abi {
+                        if let Some(place) = result_place
+                            && place.align < result_layout.align.abi
+                        {
                             // Currently, MIR code generation does not create calls
                             // that store directly to fields of packed structs (in
                             // fact, the calls it creates write only to temps).
@@ -983,16 +982,36 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                         let args: Vec<_> =
                             args.iter().map(|arg| self.codegen_operand(bx, &arg.node)).collect();
 
-                        match self.codegen_intrinsic_call(bx, instance, &args, result, source_info)
-                        {
-                            Ok(()) => {
-                                if let Some(local) = store_in_local {
-                                    let op = bx.load_operand(result);
-                                    result.storage_dead(bx);
+                        let intrinsic_result = self.codegen_intrinsic_call(
+                            bx,
+                            instance,
+                            &args,
+                            result_layout,
+                            result_place,
+                            source_info,
+                        );
+
+                        if let IntrinsicResult::Operand(op_val) = intrinsic_result {
+                            match (result_place, store_in_local) {
+                                (None, Some(local)) => {
+                                    let op = OperandRef {
+                                        val: op_val,
+                                        layout: result_layout,
+                                        move_annotation: None,
+                                    };
                                     self.overwrite_local(local, LocalRef::Operand(op));
                                     self.debug_introduce_local(bx, local);
                                 }
+                                (Some(place_val), None) => {
+                                    let dest = PlaceRef { val: place_val, layout: result_layout };
+                                    op_val.store(bx, dest);
+                                }
+                                _ => bug!(),
+                            }
+                        }
 
+                        match intrinsic_result {
+                            IntrinsicResult::Operand(_) | IntrinsicResult::WroteIntoPlace => {
                                 return if let Some(target) = target {
                                     helper.funclet_br(self, bx, target, mergeable_succ)
                                 } else {
@@ -1000,7 +1019,24 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                                     MergingSucc::False
                                 };
                             }
-                            Err(instance) => {
+                            IntrinsicResult::Err(_) => {
+                                // Even though we're definitely going to error, we need it initialize
+                                // the local or `maybe_codegen_consume_direct` might ICE later
+                                // when it goes to use the result from this intrinsic.
+                                if let Some(local) = store_in_local {
+                                    let op = OperandRef {
+                                        val: OperandValue::poison(bx, result_layout),
+                                        layout: result_layout,
+                                        move_annotation: None,
+                                    };
+                                    self.overwrite_local(local, LocalRef::Operand(op));
+                                }
+                                // Also we need to terminate the block to avoid an LLVM assertion,
+                                // even though we're not going to actually use the IR.
+                                bx.abort();
+                                return MergingSucc::False;
+                            }
+                            IntrinsicResult::Fallback(instance) => {
                                 if intrinsic.must_be_overridden {
                                     span_bug!(
                                         fn_span,
@@ -1147,8 +1183,9 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
 
         // Special logic for tail calls with `PassMode::Indirect { on_stack: false, .. }` arguments.
         //
-        // Normally an indirect argument with `on_stack: false` would be passed as a pointer into
-        // the caller's stack frame. For tail calls, that would be unsound, because the caller's
+        // Normally an indirect argument that is allocated in the caller's stack frame
+        // would be passed as a pointer into the callee's stack frame.
+        // For tail calls, that would be unsound, because the caller's
         // stack frame is overwritten by the callee's stack frame.
         //
         // Therefore we store the argument for the callee in the corresponding caller's slot.
@@ -1240,59 +1277,57 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                 }
             }
 
-            match kind {
-                CallKind::Normal => {
-                    // The callee needs to own the argument memory if we pass it
-                    // by-ref, so make a local copy of non-immediate constants.
-                    if let &mir::Operand::Copy(_) | &mir::Operand::Constant(_) = &arg.node
-                        && let Ref(PlaceValue { llextra: None, .. }) = op.val
-                    {
-                        let tmp = PlaceRef::alloca(bx, op.layout);
-                        bx.lifetime_start(tmp.val.llval, tmp.layout.size);
-                        op.store_with_annotation(bx, tmp);
-                        op.val = Ref(tmp.val);
-                        lifetime_ends_after_call.push((tmp.val.llval, tmp.layout.size));
+            let by_move = if let PassMode::Indirect { on_stack: false, .. } = fn_abi.args[i].mode
+                && kind == CallKind::Tail
+            {
+                // Special logic for tail calls with `PassMode::Indirect { on_stack: false, .. }` arguments.
+                //
+                // Normally an indirect argument that is allocated in the caller's stack frame
+                // would be passed as a pointer into the callee's stack frame.
+                // For tail calls, that would be unsound, because the caller's
+                // stack frame is overwritten by the callee's stack frame.
+                //
+                // To handle the case, we introduce `tail_call_temporaries` to copy arguments into
+                // temporaries, then copy back to the caller's argument slots.
+                // Finally, we pass the caller's argument slots as arguments.
+                //
+                // To do that, the argument must be MUST-by-move value.
+                let Some(tmp) = tail_call_temporaries[i].take() else {
+                    span_bug!(fn_span, "missing temporary for indirect tail call argument #{i}")
+                };
+
+                let local = self.mir.args_iter().nth(i).unwrap();
+
+                match &self.locals[local] {
+                    LocalRef::Place(arg) => {
+                        bx.typed_place_copy(arg.val, tmp.val, fn_abi.args[i].layout);
+                        op.val = Ref(arg.val);
                     }
-                }
-                CallKind::Tail => {
-                    if let PassMode::Indirect { on_stack: false, .. } = fn_abi.args[i].mode {
-                        let Some(tmp) = tail_call_temporaries[i].take() else {
-                            span_bug!(
-                                fn_span,
-                                "missing temporary for indirect tail call argument #{i}"
-                            )
+                    LocalRef::Operand(arg) => {
+                        let Ref(place_value) = arg.val else {
+                            bug!("only `Ref` should use `PassMode::Indirect`");
                         };
-
-                        let local = self.mir.args_iter().nth(i).unwrap();
-
-                        match &self.locals[local] {
-                            LocalRef::Place(arg) => {
-                                bx.typed_place_copy(arg.val, tmp.val, fn_abi.args[i].layout);
-                                op.val = Ref(arg.val);
-                            }
-                            LocalRef::Operand(arg) => {
-                                let Ref(place_value) = arg.val else {
-                                    bug!("only `Ref` should use `PassMode::Indirect`");
-                                };
-                                bx.typed_place_copy(place_value, tmp.val, fn_abi.args[i].layout);
-                                op.val = arg.val;
-                            }
-                            LocalRef::UnsizedPlace(_) => {
-                                span_bug!(fn_span, "unsized types are not supported")
-                            }
-                            LocalRef::PendingOperand => {
-                                span_bug!(fn_span, "argument local should not be pending")
-                            }
-                        };
-
-                        bx.lifetime_end(tmp.val.llval, tmp.layout.size);
+                        bx.typed_place_copy(place_value, tmp.val, fn_abi.args[i].layout);
+                        op.val = arg.val;
                     }
-                }
-            }
+                    LocalRef::UnsizedPlace(_) => {
+                        span_bug!(fn_span, "unsized types are not supported")
+                    }
+                    LocalRef::PendingOperand => {
+                        span_bug!(fn_span, "argument local should not be pending")
+                    }
+                };
+
+                bx.lifetime_end(tmp.val.llval, tmp.layout.size);
+                true
+            } else {
+                matches!(arg.node, mir::Operand::Move(_))
+            };
 
             self.codegen_argument(
                 bx,
                 op,
+                by_move,
                 &mut llargs,
                 &fn_abi.args[i],
                 &mut lifetime_ends_after_call,
@@ -1331,6 +1366,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
             self.codegen_argument(
                 bx,
                 location,
+                /* by_move */ false,
                 &mut llargs,
                 last_arg,
                 &mut lifetime_ends_after_call,
@@ -1649,6 +1685,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
         &mut self,
         bx: &mut Bx,
         op: OperandRef<'tcx, Bx::Value>,
+        by_move: bool,
         llargs: &mut Vec<Bx::Value>,
         arg: &ArgAbi<'tcx, Ty<'tcx>>,
         lifetime_ends_after_call: &mut Vec<(Bx::Value, Size)>,
@@ -1703,18 +1740,19 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                 _ => (op.immediate_or_packed_pair(bx), arg.layout.align.abi, false),
             },
             Ref(op_place_val) => match arg.mode {
-                PassMode::Indirect { attrs, .. } => {
+                PassMode::Indirect { attrs, on_stack, .. } => {
+                    // For `foo(packed.large_field)`, and types with <4 byte alignment on x86,
+                    // alignment requirements may be higher than the type's alignment, so copy
+                    // to a higher-aligned alloca.
                     let required_align = match attrs.pointee_align {
                         Some(pointee_align) => cmp::max(pointee_align, arg.layout.align.abi),
                         None => arg.layout.align.abi,
                     };
-                    if op_place_val.align < required_align {
-                        // For `foo(packed.large_field)`, and types with <4 byte alignment on x86,
-                        // alignment requirements may be higher than the type's alignment, so copy
-                        // to a higher-aligned alloca.
+                    // Copy to an alloca when the argument is neither by-val nor by-move.
+                    if op_place_val.align < required_align || (!on_stack && !by_move) {
                         let scratch = PlaceValue::alloca(bx, arg.layout.size, required_align);
                         bx.lifetime_start(scratch.llval, arg.layout.size);
-                        bx.typed_place_copy(scratch, op_place_val, op.layout);
+                        op.store_with_annotation(bx, scratch.with_type(arg.layout));
                         lifetime_ends_after_call.push((scratch.llval, arg.layout.size));
                         (scratch.llval, scratch.align, true)
                     } else {
@@ -1800,6 +1838,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
         lifetime_ends_after_call: &mut Vec<(Bx::Value, Size)>,
     ) -> usize {
         let tuple = self.codegen_operand(bx, operand);
+        let by_move = matches!(operand, mir::Operand::Move(_));
 
         // Handle both by-ref and immediate tuples.
         if let Ref(place_val) = tuple.val {
@@ -1810,13 +1849,20 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
             for i in 0..tuple.layout.fields.count() {
                 let field_ptr = tuple_ptr.project_field(bx, i);
                 let field = bx.load_operand(field_ptr);
-                self.codegen_argument(bx, field, llargs, &args[i], lifetime_ends_after_call);
+                self.codegen_argument(
+                    bx,
+                    field,
+                    by_move,
+                    llargs,
+                    &args[i],
+                    lifetime_ends_after_call,
+                );
             }
         } else {
             // If the tuple is immediate, the elements are as well.
             for i in 0..tuple.layout.fields.count() {
                 let op = tuple.extract_field(self, bx, i);
-                self.codegen_argument(bx, op, llargs, &args[i], lifetime_ends_after_call);
+                self.codegen_argument(bx, op, by_move, llargs, &args[i], lifetime_ends_after_call);
             }
         }
         tuple.layout.fields.count()
@@ -1896,8 +1942,39 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
         })
     }
 
-    fn terminate_block(&mut self, reason: UnwindTerminateReason) -> Bx::BasicBlock {
-        if let Some((cached_bb, cached_reason)) = self.terminate_block
+    fn terminate_block(
+        &mut self,
+        reason: UnwindTerminateReason,
+        outer_catchpad_bb: Option<mir::BasicBlock>,
+    ) -> Bx::BasicBlock {
+        // mb_funclet_bb should be present if and only if the target is wasm and
+        // we're terminating because of an unwind in a cleanup block. In that
+        // case we have nested funclets and the inner catch_switch needs to know
+        // what outer catch_pad it is contained in.
+        debug_assert!(
+            outer_catchpad_bb.is_some()
+                == (base::wants_wasm_eh(self.cx.tcx().sess)
+                    && reason == UnwindTerminateReason::InCleanup)
+        );
+
+        // When we aren't in a wasm InCleanup block, there's only one terminate
+        // block needed so we cache at START_BLOCK index.
+        let mut cache_bb = mir::START_BLOCK;
+        // In wasm eh InCleanup, use the outer funclet's cleanup BB as the cache
+        // key.
+        if let Some(outer_bb) = outer_catchpad_bb {
+            let cleanup_kinds =
+                self.cleanup_kinds.as_ref().expect("cleanup_kinds required for funclets");
+            cache_bb = cleanup_kinds[outer_bb]
+                .funclet_bb(outer_bb)
+                .expect("funclet_bb should be in a funclet");
+
+            // Ensure the outer funclet is created first
+            if self.funclets[cache_bb].is_none() {
+                self.landing_pad_for(cache_bb);
+            }
+        }
+        if let Some((cached_bb, cached_reason)) = self.terminate_blocks[cache_bb]
             && reason == cached_reason
         {
             return cached_bb;
@@ -1935,12 +2012,35 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
             //      cp_terminate:
             //         %cp = catchpad within %cs [null, i32 64, null]
             //         ...
+            //
+            // By contrast, on WebAssembly targets, we specifically _do_ want to
+            // catch foreign exceptions. The situation with MSVC is a
+            // regrettable hack which we don't want to extend to other targets
+            // unless necessary. For WebAssembly, to generate catch(...) and
+            // catch only C++ exception instead of generating a catch_all, we
+            // need to call the intrinsics @llvm.wasm.get.exception and
+            // @llvm.wasm.get.ehselector in the catch pad. Since we don't do
+            // this, we generate a catch_all. We originally got this behavior
+            // by accident but it luckily matches our intention.
 
             llbb = Bx::append_block(self.cx, self.llfn, "cs_terminate");
-            let cp_llbb = Bx::append_block(self.cx, self.llfn, "cp_terminate");
 
             let mut cs_bx = Bx::build(self.cx, llbb);
-            let cs = cs_bx.catch_switch(None, None, &[cp_llbb]);
+
+            // For wasm InCleanup blocks, our catch_switch is nested within the
+            // outer catchpad, so we need to provide it as the parent value to
+            // catch_switch.
+            let mut outer_cleanuppad = None;
+            if outer_catchpad_bb.is_some() {
+                // Get the outer funclet's catchpad
+                let outer_funclet = self.funclets[cache_bb]
+                    .as_ref()
+                    .expect("landing_pad_for didn't create funclet");
+                outer_cleanuppad = Some(cs_bx.get_funclet_cleanuppad(outer_funclet));
+            }
+            let cp_llbb = Bx::append_block(self.cx, self.llfn, "cp_terminate");
+            let cs = cs_bx.catch_switch(outer_cleanuppad, None, &[cp_llbb]);
+            drop(cs_bx);
 
             bx = Bx::build(self.cx, cp_llbb);
             let null =
@@ -1961,13 +2061,18 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
             } else {
                 // Specifying more arguments than necessary usually doesn't
                 // hurt, but the `WasmEHPrepare` LLVM pass does not recognize
-                // anything other than a single `null` as a `catch (...)` block,
+                // anything other than a single `null` as a `catch_all` block,
                 // leading to problems down the line during instruction
                 // selection.
                 &[null] as &[_]
             };
 
             funclet = Some(bx.catch_pad(cs, args));
+            // On wasm, if we wanted to generate a catch(...) and only catch C++
+            // exceptions, we'd call @llvm.wasm.get.exception and
+            // @llvm.wasm.get.ehselector selectors here. We want a catch_all so
+            // we leave them out. This is intentionally diverging from the MSVC
+            // behavior.
         } else {
             llbb = Bx::append_block(self.cx, self.llfn, "terminate");
             bx = Bx::build(self.cx, llbb);
@@ -1993,7 +2098,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
 
         bx.unreachable();
 
-        self.terminate_block = Some((llbb, reason));
+        self.terminate_blocks[cache_bb] = Some((llbb, reason));
         llbb
     }
 

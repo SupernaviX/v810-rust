@@ -155,7 +155,7 @@ impl Error for FromBytesWithNulError {}
 /// within the slice.
 ///
 /// This error is created by the [`CStr::from_bytes_until_nul`] method.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[stable(feature = "cstr_from_bytes_until_nul", since = "1.69.0")]
 pub struct FromBytesUntilNulError(());
 
@@ -176,7 +176,8 @@ impl fmt::Debug for CStr {
 }
 
 #[stable(feature = "cstr_default", since = "1.10.0")]
-impl Default for &CStr {
+#[rustc_const_unstable(feature = "const_default", issue = "143894")]
+impl const Default for &CStr {
     #[inline]
     fn default() -> Self {
         c""

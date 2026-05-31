@@ -11,7 +11,7 @@ use crate::convert::Infallible;
 use crate::error::Error;
 use crate::hash::{self, Hash};
 use crate::intrinsics::transmute_unchecked;
-use crate::iter::{UncheckedIterator, repeat_n};
+use crate::iter::{TrustedLen, repeat_n};
 use crate::marker::Destruct;
 use crate::mem::{self, ManuallyDrop, MaybeUninit};
 use crate::ops::{
@@ -52,7 +52,10 @@ pub use iter::IntoIter;
 #[must_use = "cloning is often expensive and is not expected to have side effects"]
 #[stable(feature = "array_repeat", since = "1.91.0")]
 pub fn repeat<T: Clone, const N: usize>(val: T) -> [T; N] {
-    from_trusted_iterator(repeat_n(val, N))
+    let mut iter = repeat_n(val, N);
+    // SAFETY: Unless a panic occurs, from_fn will call the closure N times,
+    // and repeat_n's next() will return Some for N times.
+    from_fn(move |_| unsafe { iter.next().unwrap_unchecked() })
 }
 
 /// Creates an array where each element is produced by calling `f` with
@@ -90,10 +93,8 @@ pub fn repeat<T: Clone, const N: usize>(val: T) -> [T; N] {
 /// You can also capture things, for example to create an array full of clones
 /// where you can't just use `[item; N]` because it's not `Copy`:
 /// ```
-/// # // TBH `array::repeat` would be better for this, but it's not stable yet.
-/// let my_string = String::from("Hello");
-/// let clones: [String; 42] = std::array::from_fn(|_| my_string.clone());
-/// assert!(clones.iter().all(|x| *x == my_string));
+/// let my_string: [String; 2] = std::array::from_fn(|i| format!("Hello {i}"));
+/// assert_eq!(my_string, ["Hello 0", "Hello 1"]);
 /// ```
 ///
 /// The array is generated in ascending index order, starting from the front
@@ -466,7 +467,15 @@ trait SpecArrayClone: Clone {
 impl<T: Clone> SpecArrayClone for T {
     #[inline]
     default fn clone<const N: usize>(array: &[T; N]) -> [T; N] {
-        from_trusted_iterator(array.iter().cloned())
+        let mut ptr: *const T = array.as_ptr();
+        // SAFETY: Unless a panic occurs, from_fn will call the closure N times,
+        // so our pointer arithmetic will be in bounds for the N-element array.
+        // This works even for ZSTs, since in that case, add() is a no-op.
+        from_fn(move |_| unsafe {
+            let old = ptr;
+            ptr = ptr.add(1);
+            (&*old).clone()
+        })
     }
 }
 
@@ -879,39 +888,6 @@ impl<T, const N: usize> [T; N] {
     }
 }
 
-/// Populate an array from the first `N` elements of `iter`
-///
-/// # Panics
-///
-/// If the iterator doesn't actually have enough items.
-///
-/// By depending on `TrustedLen`, however, we can do that check up-front (where
-/// it easily optimizes away) so it doesn't impact the loop that fills the array.
-#[inline]
-fn from_trusted_iterator<T, const N: usize>(iter: impl UncheckedIterator<Item = T>) -> [T; N] {
-    try_from_trusted_iterator(iter.map(NeverShortCircuit)).0
-}
-
-#[inline]
-fn try_from_trusted_iterator<T, R, const N: usize>(
-    iter: impl UncheckedIterator<Item = R>,
-) -> ChangeOutputType<R, [T; N]>
-where
-    R: Try<Output = T>,
-    R::Residual: Residual<[T; N]>,
-{
-    assert!(iter.size_hint().0 >= N);
-    fn next<T>(mut iter: impl UncheckedIterator<Item = T>) -> impl FnMut(usize) -> T {
-        move |_| {
-            // SAFETY: We know that `from_fn` will call this at most N times,
-            // and we checked to ensure that we have at least that many items.
-            unsafe { iter.next_unchecked() }
-        }
-    }
-
-    try_from_fn(next(iter))
-}
-
 /// Version of [`try_from_fn`] using a passed-in slice in order to avoid
 /// needing to monomorphize for every array length.
 ///
@@ -1010,18 +986,65 @@ impl<T: [const] Destruct> const Drop for Guard<'_, T> {
 pub(crate) const fn iter_next_chunk<T, const N: usize>(
     iter: &mut impl [const] Iterator<Item = T>,
 ) -> Result<[T; N], IntoIter<T, N>> {
-    let mut array = [const { MaybeUninit::uninit() }; N];
-    let r = iter_next_chunk_erased(&mut array, iter);
-    match r {
-        Ok(()) => {
-            // SAFETY: All elements of `array` were populated.
-            Ok(unsafe { MaybeUninit::array_assume_init(array) })
-        }
-        Err(initialized) => {
-            // SAFETY: Only the first `initialized` elements were populated
-            Err(unsafe { IntoIter::new_unchecked(array, 0..initialized) })
+    iter.spec_next_chunk()
+}
+
+pub(crate) const trait SpecNextChunk<T, const N: usize>: Iterator<Item = T> {
+    fn spec_next_chunk(&mut self) -> Result<[T; N], IntoIter<T, N>>;
+}
+#[rustc_const_unstable(feature = "const_iter", issue = "92476")]
+impl<I: [const] Iterator<Item = T>, T, const N: usize> const SpecNextChunk<T, N> for I {
+    #[inline]
+    default fn spec_next_chunk(&mut self) -> Result<[T; N], IntoIter<T, N>> {
+        let mut array = [const { MaybeUninit::uninit() }; N];
+        let r = iter_next_chunk_erased(&mut array, self);
+        match r {
+            Ok(()) => {
+                // SAFETY: All elements of `array` were populated.
+                Ok(unsafe { MaybeUninit::array_assume_init(array) })
+            }
+            Err(initialized) => {
+                // SAFETY: Only the first `initialized` elements were populated
+                Err(unsafe { IntoIter::new_unchecked(array, 0..initialized) })
+            }
         }
     }
+}
+#[rustc_const_unstable(feature = "const_iter", issue = "92476")]
+impl<I: [const] Iterator<Item = T> + TrustedLen, T, const N: usize> const SpecNextChunk<T, N>
+    for I
+{
+    fn spec_next_chunk(&mut self) -> Result<[T; N], IntoIter<T, N>> {
+        let len = (*self).size_hint().0;
+        let mut array = [const { MaybeUninit::uninit() }; N];
+        if len < N {
+            // SAFETY: `TrustedLen`, an unsafe trait, requires that i can get len items out of it.
+            unsafe { write(&mut array, self, len) };
+            // SAFETY: Only the first `len` elements were populated
+            Err(unsafe { IntoIter::new_unchecked(array, 0..len) })
+        } else {
+            // SAFETY: `TrustedLen`, an unsafe trait, requires that i can get N items out of it.
+            unsafe { write(&mut array, self, N) };
+            // SAFETY: All N items were populated
+            Ok(unsafe { MaybeUninit::array_assume_init(array) })
+        }
+    }
+}
+// SAFETY: `from` must have len items, and len items must be < N.
+#[rustc_const_unstable(feature = "const_iter", issue = "92476")]
+const unsafe fn write<T, const N: usize>(
+    to: &mut [MaybeUninit<T>; N],
+    from: &mut impl [const] Iterator<Item = T>,
+    len: usize,
+) {
+    let mut guard = Guard { array_mut: to, initialized: 0 };
+    while guard.initialized < len {
+        // SAFETY: caller has guaranteed, from has len items.
+        let item = unsafe { from.next().unwrap_unchecked() };
+        // SAFETY: guard.initialized < len < N
+        unsafe { guard.push_unchecked(item) };
+    }
+    crate::mem::forget(guard);
 }
 
 /// Version of [`iter_next_chunk`] using a passed-in slice in order to avoid

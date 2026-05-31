@@ -27,7 +27,7 @@ use crate::core::build_steps::gcc::GccTargetPair;
 use crate::core::build_steps::tool::{
     self, RustcPrivateCompilers, ToolTargetBuildMode, get_tool_target_compiler,
 };
-use crate::core::build_steps::vendor::{VENDOR_DIR, Vendor};
+use crate::core::build_steps::vendor::Vendor;
 use crate::core::build_steps::{compile, llvm};
 use crate::core::builder::{Builder, Kind, RunConfig, ShouldRun, Step, StepMetadata};
 use crate::core::config::{GccCiMode, TargetSelection};
@@ -1211,6 +1211,19 @@ impl Step for Src {
             &dst_src,
         );
 
+        // Vendor all Cargo dependencies
+        let vendor = builder.ensure(Vendor {
+            sync_args: vec![],
+            versioned_dirs: true,
+            root_dir: dst_src.clone(),
+            output_dir: None,
+            only_library_workspace: true,
+        });
+
+        let library_cargo_config_dir = dst_src.join("library").join(".cargo");
+        builder.create_dir(&library_cargo_config_dir);
+        builder.create(&library_cargo_config_dir.join("config.toml"), &vendor.config_library);
+
         tarball.generate()
     }
 
@@ -1376,12 +1389,17 @@ fn prepare_source_tarball<'a>(
             sync_args: pkgs_for_pgo_training.collect(),
             versioned_dirs: true,
             root_dir: plain_dst_src.into(),
-            output_dir: VENDOR_DIR.into(),
+            output_dir: None,
+            only_library_workspace: false,
         });
 
         let cargo_config_dir = plain_dst_src.join(".cargo");
         builder.create_dir(&cargo_config_dir);
         builder.create(&cargo_config_dir.join("config.toml"), &vendor.config);
+
+        let library_cargo_config_dir = plain_dst_src.join("library").join(".cargo");
+        builder.create_dir(&library_cargo_config_dir);
+        builder.create(&library_cargo_config_dir.join("config.toml"), &vendor.config_library);
     }
 
     // Delete extraneous directories
@@ -2572,6 +2590,14 @@ pub fn maybe_install_llvm_runtime(builder: &Builder<'_>, target: TargetSelection
     // statically.
     if builder.llvm_link_shared() {
         maybe_install_llvm(builder, target, &dst_libdir, false);
+
+        // To workaround lack of rpath on Windows, we bundle another copy of
+        // the LLVM DLL to make rust-lld and llvm-tools work when `sysroot/bin`
+        //  is missing from PATH, i.e. when they not launched by rustc.
+        if target.triple.contains("windows") {
+            let dst_libdir = sysroot.join("lib/rustlib").join(target).join("bin");
+            maybe_install_llvm(builder, target, &dst_libdir, false);
+        }
     }
 }
 

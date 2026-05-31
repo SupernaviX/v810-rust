@@ -105,8 +105,9 @@ pub use rustc_const_eval::interpret::*;
 // Resolve ambiguity.
 #[doc(no_inline)]
 pub use rustc_const_eval::interpret::{self, AllocMap, Provenance as _};
-use rustc_log::tracing::{self, info, trace};
-use rustc_middle::{bug, span_bug};
+pub use rustc_data_structures::either::Either;
+pub use rustc_log::tracing::{self, info, trace};
+pub use rustc_middle::{bug, span_bug};
 
 #[cfg(all(feature = "native-lib", unix))]
 pub mod native_lib {
@@ -132,8 +133,11 @@ pub use crate::borrow_tracker::tree_borrows::{EvalContextExt as _, Tree};
 pub use crate::borrow_tracker::{
     BorTag, BorrowTrackerMethod, EvalContextExt as _, TreeBorrowsParams,
 };
-pub use crate::clock::{Instant, MonotonicClock};
-pub use crate::concurrency::blocking_io::{BlockingIoManager, EvalContextExt as _, WithSource};
+pub use crate::clock::{Deadline, Instant, MonotonicClock, TimeoutClock, TimeoutStyle};
+pub use crate::concurrency::blocking_io::{
+    BlockingIoInterest, BlockingIoManager, BlockingIoSourceReadiness, EvalContextExt as _,
+    SourceFileDescription,
+};
 pub use crate::concurrency::cpu_affinity::MAX_CPUS;
 pub use crate::concurrency::data_race::{
     AtomicFenceOrd, AtomicReadOrd, AtomicRwOrd, AtomicWriteOrd, EvalContextExt as _,
@@ -142,7 +146,7 @@ pub use crate::concurrency::init_once::{EvalContextExt as _, InitOnceRef};
 pub use crate::concurrency::sync::{CondvarRef, EvalContextExt as _, MutexRef, RwLockRef};
 pub use crate::concurrency::thread::{
     BlockReason, DynUnblockCallback, EvalContextExt as _, StackEmptyCallback, ThreadId,
-    ThreadManager, TimeoutAnchor, TimeoutClock, UnblockKind,
+    ThreadManager, UnblockKind,
 };
 pub use crate::concurrency::{GenmcConfig, GenmcCtx, run_genmc_mode};
 pub use crate::data_structures::dedup_range_map::DedupRangeMap;
@@ -180,10 +184,16 @@ pub const MIRI_DEFAULT_ARGS: &[&str] = &[
     "--cfg=miri",
     "-Zalways-encode-mir",
     "-Zextra-const-ub-checks",
-    "-Zmir-emit-retag",
     "-Zmir-preserve-ub",
     "-Zmir-opt-level=0",
+    // Disable passes that add checks for language UB -- we get better diagnostics if
+    // we let Miri do these checks.
     "-Zmir-enable-passes=-CheckAlignment,-CheckNull,-CheckEnums",
+    // FIXME: Disable some passes to make higher opt levels also work.
+    // - ReferencePropagation is incompatible with SB's ref-to-raw castb behavior.
+    //   The fix here is to ditch SB and use TB instead but we're not yet ready for that.
+    // - GVN is not yet adjusted for implicit retags during assignments.
+    "-Zmir-enable-passes=-ReferencePropagation,-GVN",
     // Deduplicating diagnostics means we miss events when tracking what happens during an
     // execution. Let's not do that.
     "-Zdeduplicate-diagnostics=no",

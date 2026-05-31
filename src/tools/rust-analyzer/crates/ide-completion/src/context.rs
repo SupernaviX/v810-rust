@@ -4,12 +4,12 @@ mod analysis;
 #[cfg(test)]
 mod tests;
 
-use std::iter;
+use std::{iter, sync::LazyLock};
 
 use base_db::toolchain_channel;
 use hir::{
     DisplayTarget, HasAttrs, InFile, Local, ModuleDef, ModuleSource, Name, PathResolution,
-    ScopeDef, Semantics, SemanticsScope, Symbol, Type, TypeInfo,
+    ScopeDef, Semantics, SemanticsScope, Symbol, Type, TypeInfo, sym,
 };
 use ide_db::{
     FilePosition, FxHashMap, FxHashSet, RootDatabase, famous_defs::FamousDefs,
@@ -411,7 +411,7 @@ pub(crate) enum CompletionAnalysis<'db> {
         fake_attribute_under_caret: Option<ast::TokenTreeMeta>,
         extern_crate: Option<ast::ExternCrate>,
     },
-    /// Set if we are inside the predicate of a #[cfg] or #[cfg_attr].
+    /// Set if we are inside the predicate of a `#[cfg]` or `#[cfg_attr]`.
     CfgPredicate,
     MacroSegment,
 }
@@ -458,10 +458,10 @@ pub(crate) enum ParamKind {
 /// `CompletionContext` is created early during completion to figure out, where
 /// exactly is the cursor, syntax-wise.
 #[derive(Debug)]
-pub(crate) struct CompletionContext<'a> {
-    pub(crate) sema: Semantics<'a, RootDatabase>,
-    pub(crate) scope: SemanticsScope<'a>,
-    pub(crate) db: &'a RootDatabase,
+pub(crate) struct CompletionContext<'a, 'db> {
+    pub(crate) sema: Semantics<'db, RootDatabase>,
+    pub(crate) scope: SemanticsScope<'db>,
+    pub(crate) db: &'db RootDatabase,
     pub(crate) config: &'a CompletionConfig<'a>,
     pub(crate) position: FilePosition,
 
@@ -487,7 +487,7 @@ pub(crate) struct CompletionContext<'a> {
     /// This is usually the parameter name of the function argument we are completing.
     pub(crate) expected_name: Option<NameOrNameRef>,
     /// The expected type of what we are completing.
-    pub(crate) expected_type: Option<Type<'a>>,
+    pub(crate) expected_type: Option<Type<'db>>,
 
     pub(crate) qualifier_ctx: QualifierCtx,
 
@@ -523,7 +523,7 @@ pub(crate) enum CompleteSemicolon {
     CompleteComma,
 }
 
-impl CompletionContext<'_> {
+impl<'db> CompletionContext<'_, 'db> {
     /// The range of the identifier that is being completed.
     pub(crate) fn source_range(&self) -> TextRange {
         let kind = self.original_token.kind();
@@ -540,7 +540,7 @@ impl CompletionContext<'_> {
         }
     }
 
-    pub(crate) fn famous_defs(&self) -> FamousDefs<'_, '_> {
+    pub(crate) fn famous_defs(&self) -> FamousDefs<'_, 'db> {
         FamousDefs(&self.sema, self.krate)
     }
 
@@ -601,7 +601,18 @@ impl CompletionContext<'_> {
         let Some(attrs) = attrs else {
             return true;
         };
-        !attrs.is_unstable() || self.is_nightly
+        if !attrs.is_unstable() {
+            return true;
+        }
+        if !self.is_nightly {
+            return false;
+        }
+        // Unstable on nightly, but we still don't want to suggest internal features, unless the feature flag is enabled.
+        let Some(unstable_feature) = attrs.unstable_feature(self.db) else {
+            return true;
+        };
+        !INTERNAL_FEATURES.contains(&unstable_feature)
+            || self.krate.is_unstable_feature_enabled(self.db, &unstable_feature)
     }
 
     pub(crate) fn check_stability_and_hidden<I>(&self, item: I) -> bool
@@ -721,13 +732,13 @@ impl CompletionContext<'_> {
 }
 
 // CompletionContext construction
-impl<'db> CompletionContext<'db> {
+impl<'a, 'db> CompletionContext<'a, 'db> {
     pub(crate) fn new(
         db: &'db RootDatabase,
         position @ FilePosition { file_id, offset }: FilePosition,
-        config: &'db CompletionConfig<'db>,
+        config: &'a CompletionConfig<'a>,
         trigger_character: Option<char>,
-    ) -> Option<(CompletionContext<'db>, CompletionAnalysis<'db>)> {
+    ) -> Option<(CompletionContext<'a, 'db>, CompletionAnalysis<'db>)> {
         let _p = tracing::info_span!("CompletionContext::new").entered();
         let sema = Semantics::new(db);
 
@@ -924,3 +935,40 @@ const OP_TRAIT_LANG: &[hir::LangItem] = &[
     hir::LangItem::Shr,
     hir::LangItem::Sub,
 ];
+
+// FIXME: Find a way to keep this up to date somehow?
+const INTERNAL_FEATURES_LIST: &[Symbol] = &[
+    sym::abi_unadjusted,
+    sym::allocator_internals,
+    sym::allow_internal_unsafe,
+    sym::allow_internal_unstable,
+    sym::cfg_emscripten_wasm_eh,
+    sym::cfg_target_has_reliable_f16_f128,
+    sym::compiler_builtins,
+    sym::custom_mir,
+    sym::eii_internals,
+    sym::field_representing_type_raw,
+    sym::intrinsics,
+    sym::lang_items,
+    sym::link_cfg,
+    sym::more_maybe_bounds,
+    sym::negative_bounds,
+    sym::pattern_complexity_limit,
+    sym::prelude_import,
+    sym::profiler_runtime,
+    sym::rustc_attrs,
+    sym::staged_api,
+    sym::test_unstable_lint,
+    sym::builtin_syntax,
+    sym::link_llvm_intrinsics,
+    sym::needs_panic_runtime,
+    sym::panic_runtime,
+    sym::pattern_types,
+    sym::rustdoc_internals,
+    sym::contracts_internals,
+    sym::freeze_impls,
+    sym::unsized_fn_params,
+];
+
+static INTERNAL_FEATURES: LazyLock<FxHashSet<Symbol>> =
+    LazyLock::new(|| INTERNAL_FEATURES_LIST.iter().cloned().collect());

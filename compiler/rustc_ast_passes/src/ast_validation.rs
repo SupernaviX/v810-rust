@@ -30,11 +30,11 @@ use rustc_data_structures::fx::FxIndexMap;
 use rustc_errors::{DiagCtxtHandle, Diagnostic, LintBuffer};
 use rustc_feature::Features;
 use rustc_session::Session;
+use rustc_session::errors::feature_err;
 use rustc_session::lint::builtin::{
     DEPRECATED_WHERE_CLAUSE_LOCATION, MISSING_ABI, MISSING_UNSAFE_ON_EXTERN,
     PATTERNS_IN_FNS_WITHOUT_BODY, UNUSED_VISIBILITIES,
 };
-use rustc_session::parse::feature_err;
 use rustc_span::{Ident, Span, kw, sym};
 use rustc_target::spec::{AbiMap, AbiMapping};
 use thin_vec::thin_vec;
@@ -208,7 +208,7 @@ impl<'a> AstValidator<'a> {
     }
 
     // Mirrors `visit::walk_ty`, but tracks relevant state.
-    fn walk_ty(&mut self, t: &'a Ty) {
+    fn walk_ty(&mut self, t: &Ty) {
         match &t.kind {
             TyKind::ImplTrait(_, bounds) => {
                 self.with_impl_trait(Some(t.span), |this| visit::walk_ty(this, t));
@@ -424,6 +424,7 @@ impl<'a> AstValidator<'a> {
                     | CanonAbi::Rust
                     | CanonAbi::RustCold
                     | CanonAbi::RustPreserveNone
+                    | CanonAbi::Swift
                     | CanonAbi::Arm(_)
                     | CanonAbi::X86(_) => { /* nothing to check */ }
 
@@ -607,7 +608,7 @@ impl<'a> AstValidator<'a> {
     }
 
     fn check_final_has_body(&self, item: &Item<AssocItemKind>, defaultness: Defaultness) {
-        if let AssocItemKind::Fn(box Fn { body: None, .. }) = &item.kind
+        if let AssocItemKind::Fn(Fn { body: None, .. }) = &item.kind
             && let Defaultness::Final(def_span) = defaultness
         {
             let span = self.sess.source_map().guess_head_span(item.span);
@@ -731,7 +732,7 @@ impl<'a> AstValidator<'a> {
     /// C-variadics must be:
     /// - Non-const
     /// - Either foreign, or free and `unsafe extern "C"` semantically
-    fn check_c_variadic_type(&self, fk: FnKind<'a>, attrs: &'a AttrVec) {
+    fn check_c_variadic_type(&self, fk: FnKind<'_>, attrs: &AttrVec) {
         // `...` is already rejected when it is not the final parameter.
         let variadic_param = match fk.decl().inputs.last() {
             Some(param) if matches!(param.ty.kind, TyKind::CVarArgs) => param,
@@ -762,12 +763,23 @@ impl<'a> AstValidator<'a> {
         match fn_ctxt {
             FnCtxt::Foreign => return,
             FnCtxt::Free | FnCtxt::Assoc(_) => {
-                if !self.sess.target.supports_c_variadic_definitions() {
-                    self.dcx().emit_err(errors::CVariadicNotSupported {
-                        variadic_span: variadic_param.span,
-                        target: &*self.sess.target.llvm_target,
-                    });
-                    return;
+                match self.sess.target.supports_c_variadic_definitions() {
+                    CVariadicStatus::NotSupported => {
+                        self.dcx().emit_err(errors::CVariadicNotSupported {
+                            variadic_span: variadic_param.span,
+                            target: &*self.sess.target.llvm_target,
+                        });
+                        return;
+                    }
+                    CVariadicStatus::Unstable { feature } if !self.features.enabled(feature) => {
+                        let msg =
+                            format!("C-variadic function definitions on this target are unstable");
+                        feature_err(&self.sess, feature, variadic_param.span, msg).emit();
+                        return;
+                    }
+                    CVariadicStatus::Unstable { .. } | CVariadicStatus::Stable => {
+                        /* fall through */
+                    }
                 }
 
                 match sig.header.ext {
@@ -806,7 +818,7 @@ impl<'a> AstValidator<'a> {
     fn check_c_variadic_abi(
         &self,
         abi: ExternAbi,
-        attrs: &'a AttrVec,
+        attrs: &AttrVec,
         dotdotdot_span: Span,
         sig: &FnSig,
     ) {
@@ -976,7 +988,7 @@ impl<'a> AstValidator<'a> {
         });
     }
 
-    fn visit_ty_common(&mut self, ty: &'a Ty) {
+    fn visit_ty_common(&mut self, ty: &Ty) {
         match &ty.kind {
             TyKind::FnPtr(bfty) => {
                 self.check_fn_ptr_safety(bfty.decl_span, bfty.safety);
@@ -1039,13 +1051,13 @@ impl<'a> AstValidator<'a> {
     }
 
     // Used within `visit_item` for item kinds where we don't call `visit::walk_item`.
-    fn visit_attrs_vis(&mut self, attrs: &'a AttrVec, vis: &'a Visibility) {
+    fn visit_attrs_vis(&mut self, attrs: &AttrVec, vis: &Visibility) {
         walk_list!(self, visit_attribute, attrs);
         self.visit_vis(vis);
     }
 
     // Used within `visit_item` for item kinds where we don't call `visit::walk_item`.
-    fn visit_attrs_vis_ident(&mut self, attrs: &'a AttrVec, vis: &'a Visibility, ident: &'a Ident) {
+    fn visit_attrs_vis_ident(&mut self, attrs: &AttrVec, vis: &Visibility, ident: &Ident) {
         walk_list!(self, visit_attribute, attrs);
         self.visit_vis(vis);
         self.visit_ident(ident);
@@ -1117,25 +1129,25 @@ fn validate_generic_param_order(dcx: DiagCtxtHandle<'_>, generics: &[GenericPara
             dcx.emit_err(errors::OutOfOrderParams {
                 spans: spans.clone(),
                 sugg_span: span,
-                param_ord,
-                max_param,
+                param_ord: param_ord.to_string(),
+                max_param: max_param.to_string(),
                 ordered_params: &ordered_params,
             });
         }
     }
 }
 
-impl<'a> Visitor<'a> for AstValidator<'a> {
+impl Visitor<'_> for AstValidator<'_> {
     fn visit_attribute(&mut self, attr: &Attribute) {
         validate_attr::check_attr(&self.sess.psess, attr);
     }
 
-    fn visit_ty(&mut self, ty: &'a Ty) {
+    fn visit_ty(&mut self, ty: &Ty) {
         self.visit_ty_common(ty);
         self.walk_ty(ty)
     }
 
-    fn visit_item(&mut self, item: &'a Item) {
+    fn visit_item(&mut self, item: &Item) {
         if item.attrs.iter().any(|attr| attr.is_proc_macro_attr()) {
             self.has_proc_macro_decls = true;
         }
@@ -1152,8 +1164,7 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
             ItemKind::Impl(Impl {
                 generics,
                 constness,
-                of_trait:
-                    Some(box TraitImplHeader { safety, polarity, defaultness: _, trait_ref: t }),
+                of_trait: Some(TraitImplHeader { safety, polarity, defaultness: _, trait_ref: t }),
                 self_ty,
                 items,
             }) => {
@@ -1223,7 +1234,7 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
                 );
             }
             ItemKind::Fn(
-                func @ box Fn {
+                func @ Fn {
                     defaultness,
                     ident,
                     generics: _,
@@ -1317,14 +1328,8 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
                     visit::walk_item(this, item)
                 });
             }
-            ItemKind::Trait(box Trait {
-                constness,
-                is_auto,
-                generics,
-                ident,
-                bounds,
-                items,
-                ..
+            ItemKind::Trait(Trait {
+                constness, is_auto, generics, ident, bounds, items, ..
             }) => {
                 self.visit_attrs_vis_ident(&item.attrs, &item.vis, ident);
                 if *is_auto == IsAuto::Yes {
@@ -1349,7 +1354,7 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
                     walk_list!(this, visit_assoc_item, items, AssocCtxt::Trait);
                 });
             }
-            ItemKind::TraitAlias(box TraitAlias { constness, generics, bounds, .. }) => {
+            ItemKind::TraitAlias(TraitAlias { constness, generics, bounds, .. }) => {
                 let disallowed = matches!(constness, ast::Const::No)
                     .then(|| TildeConstReason::Trait { span: item.span });
                 self.with_tilde_const(disallowed, |this| {
@@ -1411,7 +1416,7 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
                     }
                 });
             }
-            ItemKind::Const(box ConstItem { defaultness, ident, rhs_kind, .. }) => {
+            ItemKind::Const(ConstItem { defaultness, ident, rhs_kind, .. }) => {
                 self.check_defaultness(item.span, *defaultness, AllowDefault::No, AllowFinal::No);
                 if !rhs_kind.has_expr() {
                     self.dcx().emit_err(errors::ConstWithoutBody {
@@ -1433,7 +1438,7 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
 
                 visit::walk_item(self, item);
             }
-            ItemKind::Static(box StaticItem { expr, safety, .. }) => {
+            ItemKind::Static(StaticItem { expr, safety, .. }) => {
                 self.check_item_safety(item.span, *safety);
                 if matches!(safety, Safety::Unsafe(_)) {
                     self.dcx().emit_err(errors::UnsafeStatic { span: item.span });
@@ -1448,7 +1453,7 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
                 visit::walk_item(self, item);
             }
             ItemKind::TyAlias(
-                ty_alias @ box TyAlias { defaultness, bounds, after_where_clause, ty, .. },
+                ty_alias @ TyAlias { defaultness, bounds, after_where_clause, ty, .. },
             ) => {
                 self.check_defaultness(item.span, *defaultness, AllowDefault::No, AllowFinal::No);
                 if ty.is_none() {
@@ -1477,9 +1482,9 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
         self.lint_node_id = previous_lint_node_id;
     }
 
-    fn visit_foreign_item(&mut self, fi: &'a ForeignItem) {
+    fn visit_foreign_item(&mut self, fi: &ForeignItem) {
         match &fi.kind {
-            ForeignItemKind::Fn(box Fn { defaultness, ident, sig, body, .. }) => {
+            ForeignItemKind::Fn(Fn { defaultness, ident, sig, body, .. }) => {
                 self.check_defaultness(fi.span, *defaultness, AllowDefault::No, AllowFinal::No);
                 self.check_foreign_fn_bodyless(*ident, body.as_deref());
                 self.check_foreign_fn_headerless(sig.header);
@@ -1500,7 +1505,7 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
                     });
                 }
             }
-            ForeignItemKind::TyAlias(box TyAlias {
+            ForeignItemKind::TyAlias(TyAlias {
                 defaultness,
                 ident,
                 generics,
@@ -1515,7 +1520,7 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
                 self.check_foreign_ty_genericless(generics, after_where_clause);
                 self.check_foreign_item_ascii_only(*ident);
             }
-            ForeignItemKind::Static(box StaticItem { ident, safety, expr, .. }) => {
+            ForeignItemKind::Static(StaticItem { ident, safety, expr, .. }) => {
                 self.check_item_safety(fi.span, *safety);
                 self.check_foreign_kind_bodyless(*ident, "static", expr.as_ref().map(|b| b.span));
                 self.check_foreign_item_ascii_only(*ident);
@@ -1527,7 +1532,7 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
     }
 
     // Mirrors `visit::walk_generic_args`, but tracks relevant state.
-    fn visit_generic_args(&mut self, generic_args: &'a GenericArgs) {
+    fn visit_generic_args(&mut self, generic_args: &GenericArgs) {
         match generic_args {
             GenericArgs::AngleBracketed(data) => {
                 self.check_generic_args_before_constraints(data);
@@ -1557,7 +1562,7 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
         }
     }
 
-    fn visit_generics(&mut self, generics: &'a Generics) {
+    fn visit_generics(&mut self, generics: &Generics) {
         let mut prev_param_default = None;
         for param in &generics.params {
             match param.kind {
@@ -1613,7 +1618,7 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
         }
     }
 
-    fn visit_param_bound(&mut self, bound: &'a GenericBound, ctxt: BoundKind) {
+    fn visit_param_bound(&mut self, bound: &GenericBound, ctxt: BoundKind) {
         match bound {
             GenericBound::Trait(trait_ref) => {
                 match (ctxt, trait_ref.modifiers.constness, trait_ref.modifiers.polarity) {
@@ -1671,7 +1676,7 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
         visit::walk_param_bound(self, bound)
     }
 
-    fn visit_fn(&mut self, fk: FnKind<'a>, attrs: &AttrVec, span: Span, id: NodeId) {
+    fn visit_fn(&mut self, fk: FnKind<'_>, attrs: &AttrVec, span: Span, id: NodeId) {
         // Only associated `fn`s can have `self` parameters.
         let self_semantic = match fk.ctxt() {
             Some(FnCtxt::Assoc(_)) => SelfSemantic::Yes,
@@ -1784,7 +1789,7 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
         self.with_tilde_const(disallowed, |this| visit::walk_fn(this, fk));
     }
 
-    fn visit_assoc_item(&mut self, item: &'a AssocItem, ctxt: AssocCtxt) {
+    fn visit_assoc_item(&mut self, item: &AssocItem, ctxt: AssocCtxt) {
         if let Some(ident) = item.kind.ident()
             && attr::contains_name(&item.attrs, sym::no_mangle)
         {
@@ -1807,7 +1812,7 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
 
         if let AssocCtxt::Impl { .. } = ctxt {
             match &item.kind {
-                AssocItemKind::Const(box ConstItem { rhs_kind, .. }) => {
+                AssocItemKind::Const(ConstItem { rhs_kind, .. }) => {
                     if !rhs_kind.has_expr() {
                         self.dcx().emit_err(errors::AssocConstWithoutBody {
                             span: item.span,
@@ -1815,7 +1820,7 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
                         });
                     }
                 }
-                AssocItemKind::Fn(box Fn { body, .. }) => {
+                AssocItemKind::Fn(Fn { body, .. }) => {
                     if body.is_none() && !self.is_sdylib_interface {
                         self.dcx().emit_err(errors::AssocFnWithoutBody {
                             span: item.span,
@@ -1823,7 +1828,7 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
                         });
                     }
                 }
-                AssocItemKind::Type(box TyAlias { bounds, ty, .. }) => {
+                AssocItemKind::Type(TyAlias { bounds, ty, .. }) => {
                     if ty.is_none() {
                         self.dcx().emit_err(errors::AssocTypeWithoutBody {
                             span: item.span,
@@ -1878,13 +1883,13 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
                     &item.vis,
                     errors::VisibilityNotPermittedNote::TraitImpl,
                 );
-                if let AssocItemKind::Fn(box Fn { sig, .. }) = &item.kind {
+                if let AssocItemKind::Fn(Fn { sig, .. }) = &item.kind {
                     self.check_trait_fn_not_const(sig.header.constness, parent);
                     self.check_async_fn_in_const_trait_or_impl(sig, parent);
                 }
             }
             Some(parent @ TraitOrImpl::Impl { constness }) => {
-                if let AssocItemKind::Fn(box Fn { sig, .. }) = &item.kind {
+                if let AssocItemKind::Fn(Fn { sig, .. }) = &item.kind {
                     self.check_impl_fn_not_const(sig.header.constness, *constness);
                     self.check_async_fn_in_const_trait_or_impl(sig, parent);
                 }
@@ -1931,7 +1936,7 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
         }
     }
 
-    fn visit_anon_const(&mut self, anon_const: &'a AnonConst) {
+    fn visit_anon_const(&mut self, anon_const: &AnonConst) {
         self.with_tilde_const(
             Some(TildeConstReason::AnonConst { span: anon_const.value.span }),
             |this| visit::walk_anon_const(this, anon_const),

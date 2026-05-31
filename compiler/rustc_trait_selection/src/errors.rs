@@ -277,7 +277,8 @@ pub(crate) enum SourceKindSubdiag<'a> {
                 [const_with_param] value of const parameter
                 [const] value of the constant
             } `{$arg_name}` is specified
-            [underscore] , where the placeholders `_` are specified
+            [underscore_single] , where the placeholder `_` is specified
+            [underscore_multiple] , where the placeholders `_` are specified
             *[empty] {\"\"}
         }",
         style = "verbose",
@@ -330,6 +331,28 @@ pub(crate) enum SourceKindSubdiag<'a> {
         span: Span,
         arg_count: usize,
         args: String,
+    },
+    #[suggestion(
+        "consider specifying a concrete type for the type parameter `{$param}`",
+        style = "verbose",
+        code = "::</* Type */>",
+        applicability = "has-placeholders"
+    )]
+    GenericTypeSuggestion {
+        #[primary_span]
+        span: Span,
+        param: String,
+    },
+    #[suggestion(
+        "consider specifying a const for the const parameter `{$param}`",
+        style = "verbose",
+        code = "::</* CONST */>",
+        applicability = "has-placeholders"
+    )]
+    ConstGenericSuggestion {
+        #[primary_span]
+        span: Span,
+        param: String,
     },
 }
 
@@ -600,7 +623,7 @@ impl Subdiagnostic for AddLifetimeParamsSuggestion<'_> {
                     match self.tcx.parent_hir_node(self.tcx.local_def_id_to_hir_id(anon_reg.scope))
                     {
                         hir::Node::Item(hir::Item {
-                            kind: hir::ItemKind::Trait(_, _, _, _, _, generics, ..),
+                            kind: hir::ItemKind::Trait { generics, .. },
                             ..
                         })
                         | hir::Node::Item(hir::Item {
@@ -846,7 +869,6 @@ pub(crate) enum ExplicitLifetimeRequired<'a> {
             style = "verbose"
         )]
         new_ty_span: Span,
-        #[skip_arg]
         new_ty: Ty<'a>,
     },
     #[diag("explicit lifetime required in parameter type", code = E0621)]
@@ -862,7 +884,6 @@ pub(crate) enum ExplicitLifetimeRequired<'a> {
             style = "verbose"
         )]
         new_ty_span: Span,
-        #[skip_arg]
         new_ty: Ty<'a>,
     },
 }
@@ -1496,7 +1517,6 @@ pub(crate) enum FunctionPointerSuggestion<'a> {
     RemoveRef {
         #[primary_span]
         span: Span,
-        #[skip_arg]
         fn_name: String,
     },
     #[suggestion(
@@ -1508,9 +1528,7 @@ pub(crate) enum FunctionPointerSuggestion<'a> {
     CastRef {
         #[primary_span]
         span: Span,
-        #[skip_arg]
         fn_name: String,
-        #[skip_arg]
         sig: Binder<'a, FnSig<'a>>,
     },
     #[suggestion(
@@ -1522,7 +1540,6 @@ pub(crate) enum FunctionPointerSuggestion<'a> {
     Cast {
         #[primary_span]
         span: Span,
-        #[skip_arg]
         sig: Binder<'a, FnSig<'a>>,
     },
     #[suggestion(
@@ -1534,7 +1551,6 @@ pub(crate) enum FunctionPointerSuggestion<'a> {
     CastBoth {
         #[primary_span]
         span: Span,
-        #[skip_arg]
         found_sig: Binder<'a, FnSig<'a>>,
         expected_sig: Binder<'a, FnSig<'a>>,
     },
@@ -1547,9 +1563,7 @@ pub(crate) enum FunctionPointerSuggestion<'a> {
     CastBothRef {
         #[primary_span]
         span: Span,
-        #[skip_arg]
         fn_name: String,
-        #[skip_arg]
         found_sig: Binder<'a, FnSig<'a>>,
         expected_sig: Binder<'a, FnSig<'a>>,
     },

@@ -10,7 +10,7 @@ use rustc_middle::query::Providers;
 use rustc_middle::ty::layout::{
     FnAbiError, HasTyCtxt, HasTypingEnv, LayoutCx, LayoutOf, TyAndLayout, fn_can_unwind,
 };
-use rustc_middle::ty::{self, InstanceKind, Ty, TyCtxt};
+use rustc_middle::ty::{self, InstanceKind, Ty, TyCtxt, Unnormalized};
 use rustc_span::DUMMY_SP;
 use rustc_span::def_id::DefId;
 use rustc_target::callconv::{
@@ -39,20 +39,15 @@ fn fn_sig_for_fn_abi<'tcx>(
     typing_env: ty::TypingEnv<'tcx>,
 ) -> ty::FnSig<'tcx> {
     if let InstanceKind::ThreadLocalShim(..) = instance.def {
-        return tcx.mk_fn_sig(
-            [],
-            tcx.thread_local_ptr_ty(instance.def_id()),
-            false,
-            hir::Safety::Safe,
-            rustc_abi::ExternAbi::Rust,
-        );
+        return tcx.mk_fn_sig_safe_rust_abi([], tcx.thread_local_ptr_ty(instance.def_id()));
     }
 
     let ty = instance.ty(tcx, typing_env);
     match *ty.kind() {
         ty::FnDef(def_id, args) => {
-            let mut sig = tcx
-                .instantiate_bound_regions_with_erased(tcx.fn_sig(def_id).instantiate(tcx, args));
+            let mut sig = tcx.instantiate_bound_regions_with_erased(
+                tcx.fn_sig(def_id).instantiate(tcx, args).skip_norm_wip(),
+            );
 
             // Modify `fn(self, ...)` to `fn(self: *mut Self, ...)`.
             if let ty::InstanceKind::VTableShim(..) = instance.def {
@@ -74,9 +69,7 @@ fn fn_sig_for_fn_abi<'tcx>(
             tcx.mk_fn_sig(
                 iter::once(env_ty).chain(sig.inputs().iter().cloned()),
                 sig.output(),
-                sig.c_variadic,
-                sig.safety,
-                sig.abi,
+                sig.fn_sig_kind,
             )
         }
         ty::CoroutineClosure(def_id, args) => {
@@ -119,9 +112,7 @@ fn fn_sig_for_fn_abi<'tcx>(
                     args.as_coroutine_closure().tupled_upvars_ty(),
                     args.as_coroutine_closure().coroutine_captures_by_ref_ty(),
                 ),
-                sig.c_variadic,
-                sig.safety,
-                sig.abi,
+                sig.fn_sig_kind,
             )
         }
         ty::Coroutine(did, args) => {
@@ -224,22 +215,10 @@ fn fn_sig_for_fn_abi<'tcx>(
             };
 
             if let Some(resume_ty) = resume_ty {
-                tcx.mk_fn_sig(
-                    [env_ty, resume_ty],
-                    ret_ty,
-                    false,
-                    hir::Safety::Safe,
-                    rustc_abi::ExternAbi::Rust,
-                )
+                tcx.mk_fn_sig_safe_rust_abi([env_ty, resume_ty], ret_ty)
             } else {
                 // `Iterator::next` doesn't have a `resume` argument.
-                tcx.mk_fn_sig(
-                    [env_ty],
-                    ret_ty,
-                    false,
-                    hir::Safety::Safe,
-                    rustc_abi::ExternAbi::Rust,
-                )
+                tcx.mk_fn_sig_safe_rust_abi([env_ty], ret_ty)
             }
         }
         _ => bug!("unexpected type {:?} in Instance::fn_sig", ty),
@@ -268,7 +247,7 @@ impl<'tcx> FnAbiDesc<'tcx> {
             layout_cx: LayoutCx::new(tcx, typing_env),
             sig: tcx.normalize_erasing_regions(
                 typing_env,
-                tcx.instantiate_bound_regions_with_erased(sig),
+                Unnormalized::new_wip(tcx.instantiate_bound_regions_with_erased(sig)),
             ),
             // Parameter attributes can never be deduced for indirect calls, as there is no
             // function body available to use.
@@ -290,7 +269,7 @@ impl<'tcx> FnAbiDesc<'tcx> {
             layout_cx: LayoutCx::new(tcx, typing_env),
             sig: tcx.normalize_erasing_regions(
                 typing_env,
-                fn_sig_for_fn_abi(tcx, instance, typing_env),
+                Unnormalized::new_wip(fn_sig_for_fn_abi(tcx, instance, typing_env)),
             ),
             // Parameter attributes can be deduced from the bodies of neither:
             // - virtual calls, as they might call other functions from the vtable; nor
@@ -334,27 +313,18 @@ fn fn_abi_of_instance_raw<'tcx>(
         // If the function's body can be used to deduce parameter attributes, then adjust such
         // "no deduced attrs" ABI; otherwise, return that ABI unadjusted.
         params.determined_fn_def_id.map_or(fn_abi, |fn_def_id| {
-            fn_abi_adjust_for_deduced_attrs(&params.layout_cx, fn_abi, params.sig.abi, fn_def_id)
+            fn_abi_adjust_for_deduced_attrs(&params.layout_cx, fn_abi, params.sig.abi(), fn_def_id)
         })
     })
 }
 
 /// Returns argument attributes for a scalar argument.
-///
-/// `drop_target_pointee`, if set, causes pointer-typed scalars to be treated like mutable
-/// references to the given type. This is used to special-case the argument of `ptr::drop_in_place`,
-/// interpreting it as `&mut T` instead of `*mut T`, for the purposes of attributes (which is valid
-/// as per its safety contract). If `drop_target_pointee` is set, `offset` must be 0 and `layout.ty`
-/// must be a pointer to the given type. Note that for wide pointers this function is called twice
-/// -- once for the data pointer and once for the vtable pointer. `drop_target_pointee` must only
-/// be set for the data pointer.
 fn arg_attrs_for_rust_scalar<'tcx>(
     cx: LayoutCx<'tcx>,
     scalar: Scalar,
     layout: TyAndLayout<'tcx>,
     offset: Size,
     is_return: bool,
-    drop_target_pointee: Option<Ty<'tcx>>,
     determined_fn_def_id: Option<DefId>,
 ) -> ArgAttributes {
     let mut attrs = ArgAttributes::new();
@@ -373,25 +343,14 @@ fn arg_attrs_for_rust_scalar<'tcx>(
     // Only pointer types handled below.
     let Scalar::Initialized { value: Pointer(_), valid_range } = scalar else { return attrs };
 
-    // Set `nonnull` if the validity range excludes zero, or for the argument to `drop_in_place`,
-    // which must be nonnull per its documented safety requirements.
-    if !valid_range.contains(0) || drop_target_pointee.is_some() {
+    // Set `nonnull` if the validity range excludes zero.
+    if !valid_range.contains(0) {
         attrs.set(ArgAttribute::NonNull);
     }
 
     let tcx = cx.tcx();
 
-    let drop_target_pointee_info = drop_target_pointee.and_then(|pointee| {
-        assert_eq!(pointee, layout.ty.builtin_deref(true).unwrap());
-        assert_eq!(offset, Size::ZERO);
-        // The argument to `drop_in_place` is semantically equivalent to a mutable reference.
-        let mutref = Ty::new_mut_ref(tcx, tcx.lifetimes.re_erased, pointee);
-        let layout = cx.layout_of(mutref).unwrap();
-        layout.pointee_info_at(&cx, offset)
-    });
-
-    if let Some(pointee) = drop_target_pointee_info.or_else(|| layout.pointee_info_at(&cx, offset))
-    {
+    if let Some(pointee) = layout.pointee_info_at(&cx, offset) {
         if pointee.align > Align::ONE {
             attrs.pointee_align =
                 Some(pointee.align.min(cx.tcx().sess.target.max_reliable_alignment()));
@@ -583,11 +542,11 @@ fn fn_abi_new_uncached<'tcx>(
     let tcx = cx.tcx();
 
     let abi_map = AbiMap::from_target(&tcx.sess.target);
-    let conv = abi_map.canonize_abi(sig.abi, sig.c_variadic).unwrap();
+    let conv = abi_map.canonize_abi(sig.abi(), sig.c_variadic()).unwrap();
 
     let mut inputs = sig.inputs();
-    let extra_args = if sig.abi == ExternAbi::RustCall {
-        assert!(!sig.c_variadic && extra_args.is_empty());
+    let extra_args = if sig.abi() == ExternAbi::RustCall {
+        assert!(!sig.c_variadic() && extra_args.is_empty());
 
         if let Some(input) = sig.inputs().last()
             && let ty::Tuple(tupled_arguments) = input.kind()
@@ -601,24 +560,14 @@ fn fn_abi_new_uncached<'tcx>(
             );
         }
     } else {
-        assert!(sig.c_variadic || extra_args.is_empty());
+        assert!(sig.c_variadic() || extra_args.is_empty());
         extra_args
     };
-
-    let is_drop_in_place = determined_fn_def_id.is_some_and(|def_id| {
-        tcx.is_lang_item(def_id, LangItem::DropInPlace)
-            || tcx.is_lang_item(def_id, LangItem::AsyncDropInPlace)
-    });
 
     let arg_of = |ty: Ty<'tcx>, arg_idx: Option<usize>| -> Result<_, &'tcx FnAbiError<'tcx>> {
         let span = tracing::debug_span!("arg_of");
         let _entered = span.enter();
         let is_return = arg_idx.is_none();
-        let is_drop_target = is_drop_in_place && arg_idx == Some(0);
-        let drop_target_pointee = is_drop_target.then(|| match ty.kind() {
-            ty::RawPtr(ty, _) => *ty,
-            _ => bug!("argument to drop_in_place is not a raw ptr: {:?}", ty),
-        });
 
         let layout = cx.layout_of(ty).map_err(|err| &*tcx.arena.alloc(FnAbiError::Layout(*err)))?;
         let layout = if is_virtual_call && arg_idx == Some(0) {
@@ -631,17 +580,7 @@ fn fn_abi_new_uncached<'tcx>(
         };
 
         Ok(ArgAbi::new(cx, layout, |scalar, offset| {
-            arg_attrs_for_rust_scalar(
-                *cx,
-                scalar,
-                layout,
-                offset,
-                is_return,
-                // Only set `drop_target_pointee` for the data part of a wide pointer.
-                // See `arg_attrs_for_rust_scalar` docs for more information.
-                drop_target_pointee.filter(|_| offset == Size::ZERO),
-                determined_fn_def_id,
-            )
+            arg_attrs_for_rust_scalar(*cx, scalar, layout, offset, is_return, determined_fn_def_id)
         }))
     };
 
@@ -655,7 +594,7 @@ fn fn_abi_new_uncached<'tcx>(
             .enumerate()
             .map(|(i, ty)| arg_of(ty, Some(i)))
             .collect::<Result<_, _>>()?,
-        c_variadic: sig.c_variadic,
+        c_variadic: sig.c_variadic(),
         fixed_count: inputs.len() as u32,
         conv,
         // FIXME return false for tls shim
@@ -663,12 +602,12 @@ fn fn_abi_new_uncached<'tcx>(
             tcx,
             // Since `#[rustc_nounwind]` can change unwinding, we cannot infer unwinding by `fn_def_id` for a virtual call.
             determined_fn_def_id,
-            sig.abi,
+            sig.abi(),
         ),
     };
-    fn_abi_adjust_for_abi(cx, &mut fn_abi, sig.abi);
+    fn_abi_adjust_for_abi(cx, &mut fn_abi, sig.abi());
     debug!("fn_abi_new_uncached = {:?}", fn_abi);
-    fn_abi_sanity_check(cx, &fn_abi, sig.abi);
+    fn_abi_sanity_check(cx, &fn_abi, sig.abi());
     Ok(tcx.arena.alloc(fn_abi))
 }
 

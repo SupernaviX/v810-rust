@@ -550,7 +550,7 @@ impl LLVMLink {
 
     /// Alters all the unsigned types from the signature. This is required where
     /// a signed and unsigned variant require the same binding to an exposed
-    /// LLVM instrinsic.
+    /// LLVM intrinsic.
     pub fn sanitise_uints(&mut self) {
         let transform = |tk: &mut TypeKind| {
             if let Some(BaseType::Sized(BaseTypeKind::UInt, size)) = tk.base_type() {
@@ -806,6 +806,7 @@ pub enum UnsafetyComment {
     NonTemporal,
     Neon,
     NoProvenance(String),
+    PointerWrite(String),
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -873,6 +874,10 @@ impl fmt::Display for UnsafetyComment {
                 "Addresses passed in `{arg}` lack provenance, so this is similar to using a \
                 `usize as ptr` cast (or [`core::ptr::with_exposed_provenance`]) on each lane \
                 before  using it."
+            ),
+            Self::PointerWrite(arg) => write!(
+                f,
+                "The pointer in `{arg}` must satisfy the requirements of [`core::ptr::write`]."
             ),
             Self::UnpredictableOnFault => write!(
                 f,
@@ -1054,23 +1059,8 @@ impl Intrinsic {
 
     /// Add a big endian implementation
     fn generate_big_endian(&self, variant: &mut Intrinsic) {
-        /* We can't always blindly reverse the bits only in certain conditions
-         * do we need a different order - thus this allows us to have the
-         * ability to do so without having to play codegolf with the yaml AST */
-        let should_reverse = {
-            if let Some(should_reverse) = variant.big_endian_inverse {
-                should_reverse
-            } else if variant.compose.len() == 1 {
-                match &variant.compose[0] {
-                    Expression::FnCall(fn_call) => fn_call.0.to_string() == "transmute",
-                    _ => false,
-                }
-            } else {
-                false
-            }
-        };
-
-        if !should_reverse {
+        // We only reverse if it was specifically requested
+        if !variant.big_endian_inverse.unwrap_or(false) {
             return;
         }
 
@@ -1138,7 +1128,7 @@ impl Intrinsic {
             } else {
                 /* If we do not need to reorder anything then immediately add
                  * the expressions from the big_endian_expressions and
-                 * concatinate the compose vector */
+                 * concatenate the compose vector */
                 variant.big_endian_compose.extend(big_endian_expressions);
                 variant
                     .big_endian_compose
@@ -1156,11 +1146,11 @@ impl Intrinsic {
 
             /* If we do not create a shuffle call we do not need modify the
              * return value and append to the big endian ast array. A bit confusing
-             * as in code we are making the final call before caputuring the return
+             * as in code we are making the final call before capturing the return
              * value of the intrinsic that has been called.*/
             let ret_val_name = "ret_val".to_string();
             if let Some(simd_shuffle_call) = create_shuffle_call(&ret_val_name, return_type) {
-                /* There is a possibility that the funcion arguments did not
+                /* There is a possibility that the function arguments did not
                  * require big endian treatment, thus we need to now add the
                  * original function body before appending the return value.*/
                 if variant.big_endian_compose.is_empty() {
@@ -1186,9 +1176,10 @@ impl Intrinsic {
                      * re-assigning each tuple however those generated calls do
                      * not make the parent function return. So we add the return
                      * value here */
-                    variant
-                        .big_endian_compose
-                        .push(create_symbol_identifier(&ret_val_name));
+                    variant.big_endian_compose.push(create_symbol_identifier(
+                        &ret_val_name,
+                        IdentifierType::Symbol,
+                    ));
                 }
             }
         }
@@ -1694,8 +1685,8 @@ enum Endianness {
     NA,
 }
 
-/// Based on the endianess will create the appropriate intrinsic, or simply
-/// create the desired intrinsic without any endianess
+/// Based on the endianness will create the appropriate intrinsic, or simply
+/// create the desired intrinsic without any endianness
 fn create_tokens(intrinsic: &Intrinsic, endianness: Endianness, tokens: &mut TokenStream) {
     let signature = &intrinsic.signature;
     let fn_name = signature.fn_name().to_string();
@@ -1735,7 +1726,7 @@ fn create_tokens(intrinsic: &Intrinsic, endianness: Endianness, tokens: &mut Tok
         );
     }
 
-    tokens.append_all(quote! { #[inline(always)] });
+    tokens.append_all(quote! { #[inline] });
 
     match endianness {
         Endianness::Little => tokens.append_all(quote! { #[cfg(target_endian = "little")] }),

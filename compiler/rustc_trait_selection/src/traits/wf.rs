@@ -14,7 +14,7 @@ use rustc_middle::ty::{
     self, GenericArgsRef, Term, TermKind, Ty, TyCtxt, TypeSuperVisitable, TypeVisitable,
     TypeVisitableExt, TypeVisitor,
 };
-use rustc_session::parse::feature_err;
+use rustc_session::errors::feature_err;
 use rustc_span::def_id::{DefId, LocalDefId};
 use rustc_span::{Span, sym};
 use tracing::{debug, instrument, trace};
@@ -478,7 +478,7 @@ impl<'a, 'tcx> WfPredicates<'a, 'tcx> {
         //     `i32: Clone`
         //     `i32: Copy`
         // ]
-        let obligations = self.nominal_obligations(data.def_id, data.args);
+        let obligations = self.nominal_obligations(data.def_id(), data.args);
         self.out.extend(obligations);
 
         self.add_wf_preds_for_projection_args(data.args);
@@ -507,7 +507,7 @@ impl<'a, 'tcx> WfPredicates<'a, 'tcx> {
                 self.recursion_depth,
                 &mut self.out,
             );
-            let obligations = self.nominal_obligations(data.def_id, args);
+            let obligations = self.nominal_obligations(data.def_id(), args);
             self.out.extend(obligations);
         }
 
@@ -574,6 +574,11 @@ impl<'a, 'tcx> WfPredicates<'a, 'tcx> {
         if self.tcx().is_lang_item(def_id, LangItem::Sized) {
             return Default::default();
         }
+        if self.tcx().is_lang_item(def_id, LangItem::ConstParamTy)
+            && self.tcx().features().const_param_ty_unchecked()
+        {
+            return Default::default();
+        }
 
         let predicates = self.tcx().predicates_of(def_id);
         let mut origins = vec![def_id; predicates.predicates.len()];
@@ -596,7 +601,7 @@ impl<'a, 'tcx> WfPredicates<'a, 'tcx> {
                     cause,
                     self.recursion_depth,
                     self.param_env,
-                    pred,
+                    pred.skip_norm_wip(),
                 )
             })
             .filter(|pred| !pred.has_escaping_bound_vars())
@@ -822,7 +827,7 @@ impl<'a, 'tcx> TypeVisitor<TyCtxt<'tcx>> for WfPredicates<'a, 'tcx> {
                 // perfect and there may be ways to abuse the fact that we
                 // ignore requirements with escaping bound vars. That's a
                 // more general issue however.
-                let fn_sig = tcx.fn_sig(did).instantiate(tcx, args);
+                let fn_sig = tcx.fn_sig(did).instantiate(tcx, args).skip_norm_wip();
                 fn_sig.output().skip_binder().visit_with(self);
 
                 let obligations = self.nominal_obligations(did, args);
@@ -1001,8 +1006,9 @@ impl<'a, 'tcx> TypeVisitor<TyCtxt<'tcx>> for WfPredicates<'a, 'tcx> {
                             .map_bound(|p| {
                                 p.term.as_const().map(|ct| {
                                     let assoc_const_ty = tcx
-                                        .type_of(p.projection_term.def_id)
-                                        .instantiate(tcx, p.projection_term.args);
+                                        .type_of(p.projection_term.def_id())
+                                        .instantiate(tcx, p.projection_term.args)
+                                        .skip_norm_wip();
                                     ty::PredicateKind::Clause(ty::ClauseKind::ConstArgHasType(
                                         ct,
                                         assoc_const_ty,
@@ -1059,7 +1065,7 @@ impl<'a, 'tcx> TypeVisitor<TyCtxt<'tcx>> for WfPredicates<'a, 'tcx> {
             ty::ConstKind::Unevaluated(uv) => {
                 if !c.has_escaping_bound_vars() {
                     // Skip type consts as mGCA doesn't support evaluatable clauses
-                    if !tcx.is_type_const(uv.def) {
+                    if !tcx.is_type_const(uv.def) && !tcx.features().generic_const_args() {
                         let predicate = ty::Binder::dummy(ty::PredicateKind::Clause(
                             ty::ClauseKind::ConstEvaluatable(c),
                         ));
@@ -1076,7 +1082,9 @@ impl<'a, 'tcx> TypeVisitor<TyCtxt<'tcx>> for WfPredicates<'a, 'tcx> {
                     if matches!(tcx.def_kind(uv.def), DefKind::AssocConst { .. })
                         && tcx.def_kind(tcx.parent(uv.def)) == (DefKind::Impl { of_trait: false })
                     {
-                        self.add_wf_preds_for_inherent_projection(uv.into());
+                        self.add_wf_preds_for_inherent_projection(
+                            ty::AliasTerm::from_unevaluated_const(tcx, uv),
+                        );
                         return; // Subtree is handled by above function
                     } else {
                         let obligations = self.nominal_obligations(uv.def, uv.args);
@@ -1134,8 +1142,10 @@ impl<'a, 'tcx> TypeVisitor<TyCtxt<'tcx>> for WfPredicates<'a, 'tcx> {
                             let cause = self.cause(ObligationCauseCode::WellFormed(None));
                             self.out.extend(variant_def.fields.iter().zip(adt_val.fields).map(
                                 |(field_def, &field_val)| {
-                                    let field_ty =
-                                        tcx.type_of(field_def.did).instantiate(tcx, args);
+                                    let field_ty = tcx
+                                        .type_of(field_def.did)
+                                        .instantiate(tcx, args)
+                                        .skip_norm_wip();
                                     let predicate = ty::PredicateKind::Clause(
                                         ty::ClauseKind::ConstArgHasType(field_val, field_ty),
                                     );

@@ -344,6 +344,10 @@ impl Cargo {
             self.rustflags.arg("-Clink-arg=-gz");
         }
 
+        // Ignore linker warnings for now. These are complicated to fix and don't affect the build.
+        // FIXME: we should really investigate these...
+        self.rustflags.arg("-Alinker-messages");
+
         // Throughout the build Cargo can execute a number of build scripts
         // compiling C/C++ code and we need to pass compilers, archivers, flags, etc
         // obtained previously to those build scripts.
@@ -687,16 +691,6 @@ impl Builder<'_> {
             rustflags.arg(sysroot_str);
         }
 
-        let use_new_symbol_mangling = self.config.rust_new_symbol_mangling.or_else(|| {
-            if mode != Mode::Std {
-                // The compiler and tools default to the new scheme
-                Some(true)
-            } else {
-                // std follows the flag's default, which per compiler-team#938 is v0 on nightly
-                None
-            }
-        });
-
         // By default, windows-rs depends on a native library that doesn't get copied into the
         // sysroot. Passing this cfg enables raw-dylib support instead, which makes the native
         // library unnecessary. This can be removed when windows-rs enables raw-dylib
@@ -706,7 +700,8 @@ impl Builder<'_> {
             rustflags.arg("--cfg=windows_raw_dylib");
         }
 
-        if let Some(usm) = use_new_symbol_mangling {
+        // When unset, follow the default of the compiler flag - the compiler, tools and std use v0
+        if let Some(usm) = self.config.rust_new_symbol_mangling {
             rustflags.arg(if usm {
                 "-Csymbol-mangling-version=v0"
             } else {
@@ -1082,6 +1077,14 @@ impl Builder<'_> {
                         // rustc creates absolute paths (in part bc of the `rust-src` unremap
                         // and for working directory) so let's remap the build directory as well.
                         format!("{}={map_to}", self.build.src.display()),
+                        // remap OUT_DIR so they don't leak into artifacts.
+                        format!("{}={map_to}/out", self.build.out.display()),
+                        // on windows, rustc may use forward slashes internally
+                        #[cfg(windows)]
+                        format!(
+                            "{}={map_to}\\out",
+                            self.build.out.display().to_string().replace('/', "\\")
+                        ),
                     ]
                     .join("\t");
                     cargo.env("RUSTC_DEBUGINFO_MAP", map);
@@ -1102,6 +1105,14 @@ impl Builder<'_> {
                         // rustc creates absolute paths (in part bc of the `rust-src` unremap
                         // and for working directory) so let's remap the build directory as well.
                         format!("{}={map_to}", self.build.src.display()),
+                        // remap OUT_DIR so they don't leak into artifacts.
+                        format!("{}={map_to}/out", self.build.out.display()),
+                        // on windows, rustc may use forward slashes internally
+                        #[cfg(windows)]
+                        format!(
+                            "{}={map_to}\\out",
+                            self.build.out.display().to_string().replace('/', "\\")
+                        ),
                     ]
                     .join("\t");
                     cargo.env("RUSTC_DEBUGINFO_MAP", map);

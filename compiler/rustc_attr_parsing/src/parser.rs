@@ -12,7 +12,7 @@ use rustc_ast::{
     AttrArgs, Expr, ExprKind, LitKind, MetaItemLit, Path, PathSegment, StmtKind, UnOp,
 };
 use rustc_ast_pretty::pprust;
-use rustc_errors::{Diag, PResult};
+use rustc_errors::{Applicability, Diag, PResult};
 use rustc_hir::{self as hir, AttrPath};
 use rustc_parse::exp;
 use rustc_parse::parser::{ForceCollect, Parser, PathStyle, Recovery, token_descr};
@@ -176,7 +176,7 @@ impl ArgParser {
     ///
     /// - `#[allow(clippy::complexity)]`: `(clippy::complexity)` is a list
     /// - `#[rustfmt::skip::macros(target_macro_name)]`: `(target_macro_name)` is a list
-    pub fn list(&self) -> Option<&MetaItemListParser> {
+    pub fn as_list(&self) -> Option<&MetaItemListParser> {
         match self {
             Self::List(l) => Some(l),
             Self::NameValue(_) | Self::NoArgs => None,
@@ -192,7 +192,7 @@ impl ArgParser {
     ///   to get an `ArgParser`, so this method will effectively only assert that the `= "100"` is
     ///   there
     /// - `#[doc = "hello"]`: `doc = "hello`  is also a name value pair
-    pub fn name_value(&self) -> Option<&NameValueParser> {
+    pub fn as_name_value(&self) -> Option<&NameValueParser> {
         match self {
             Self::NameValue(n) => Some(n),
             Self::List(_) | Self::NoArgs => None,
@@ -202,7 +202,7 @@ impl ArgParser {
     /// Assert that there were no args.
     /// If there were, get a span to the arguments
     /// (to pass to [`AttributeDiagnosticContext::expected_no_args`](crate::context::AttributeDiagnosticContext::expected_no_args)).
-    pub fn no_args(&self) -> Result<(), Span> {
+    pub fn as_no_args(&self) -> Result<(), Span> {
         match self {
             Self::NoArgs => Ok(()),
             Self::List(args) => Err(args.span),
@@ -240,7 +240,7 @@ impl MetaItemOrLitParser {
         }
     }
 
-    pub fn lit(&self) -> Option<&MetaItemLit> {
+    pub fn as_lit(&self) -> Option<&MetaItemLit> {
         match self {
             MetaItemOrLitParser::Lit(meta_item_lit) => Some(meta_item_lit),
             MetaItemOrLitParser::MetaItemParser(_) => None,
@@ -255,6 +255,7 @@ impl MetaItemOrLitParser {
     }
 }
 
+// FIXME(scrabsha): once #155696 is merged, update this and mention the higher-level APIs.
 /// Utility that deconstructs a MetaItem into usable parts.
 ///
 /// MetaItems are syntactically extremely flexible, but specific attributes want to parse
@@ -263,8 +264,9 @@ impl MetaItemOrLitParser {
 /// MetaItems consist of some path, and some args. The args could be empty. In other words:
 ///
 /// - `name` -> args are empty
-/// - `name(...)` -> args are a [`list`](ArgParser::list), which is the bit between the parentheses
-/// - `name = value`-> arg is [`name_value`](ArgParser::name_value), where the argument is the
+/// - `name(...)` -> args are a [`list`](ArgParser::as_list), which is the bit between the
+///   parentheses
+/// - `name = value`-> arg is [`name_value`](ArgParser::as_name_value), where the argument is the
 ///   `= value` part
 ///
 /// The syntax of MetaItems can be found at <https://doc.rust-lang.org/reference/attributes.html>
@@ -408,7 +410,20 @@ fn expr_to_lit<'sess>(
         // - `#[foo = include_str!("nonexistent-file.rs")]`:
         //   results in `ast::ExprKind::Err`.
         let msg = "attribute value must be a literal";
-        let err = psess.dcx().struct_span_err(span, msg);
+        let mut err = psess.dcx().struct_span_err(span, msg);
+
+        // Suggest adding quotation marks to turn an identifier into a string literal
+        if let ExprKind::Path(None, ref path) = expr.kind
+            && let [segment] = path.segments.as_slice()
+        {
+            err.span_suggestion(
+                expr.span,
+                "try adding quotation marks",
+                &format!("\"{}\"", segment.ident),
+                Applicability::MaybeIncorrect,
+            );
+        }
+
         Err(err)
     }
 }
@@ -694,7 +709,7 @@ impl MetaItemListParser {
     /// Returns Some if the list contains only a single element.
     ///
     /// Inside the Some is the parser to parse this single element.
-    pub fn single(&self) -> Option<&MetaItemOrLitParser> {
+    pub fn as_single(&self) -> Option<&MetaItemOrLitParser> {
         let mut iter = self.mixed();
         iter.next().filter(|_| iter.next().is_none())
     }

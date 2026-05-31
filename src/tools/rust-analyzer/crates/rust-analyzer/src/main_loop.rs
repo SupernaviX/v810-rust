@@ -144,12 +144,11 @@ impl fmt::Debug for Event {
         };
 
         match self {
-            Event::Lsp(lsp_server::Message::Notification(not)) => {
-                if notification_is::<lsp_types::notification::DidOpenTextDocument>(not)
-                    || notification_is::<lsp_types::notification::DidChangeTextDocument>(not)
-                {
-                    return debug_non_verbose(not, f);
-                }
+            Event::Lsp(lsp_server::Message::Notification(not))
+                if (notification_is::<lsp_types::notification::DidOpenTextDocument>(not)
+                    || notification_is::<lsp_types::notification::DidChangeTextDocument>(not)) =>
+            {
+                return debug_non_verbose(not, f);
             }
             Event::Task(Task::Response(resp)) => {
                 return f
@@ -661,8 +660,20 @@ impl GlobalState {
                 let subscriptions = subscriptions.clone();
                 // Do not fetch semantic diagnostics (and populate query results) if we haven't even
                 // loaded the initial workspace yet.
-                let fetch_semantic =
-                    self.vfs_done && self.fetch_workspaces_queue.last_op_result().is_some();
+                //
+                // Only fetch semantic diagnostics when
+                // - we have fully populated the VFS
+                // - have a workspace
+                // - have finished fetching the build data once
+                // - and have finished loading the proc-macros once
+                let fetch_semantic = self.vfs_done
+                    && self.fetch_workspaces_queue.last_op_result().is_some()
+                    && (!self.config.run_build_scripts(None)
+                        || (self.fetch_build_data_queue.last_op_result().is_none()
+                            && !self.fetch_build_data_queue.op_in_progress()))
+                    && (!self.config.expand_proc_macros()
+                        || (self.fetch_proc_macros_queue.last_op_result().is_none()
+                            && !self.fetch_proc_macros_queue.op_in_progress()));
                 move |sender| {
                     // We aren't observing the semantics token cache here
                     let snapshot = AssertUnwindSafe(&snapshot);

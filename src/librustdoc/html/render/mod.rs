@@ -36,7 +36,6 @@ mod ordered_json;
 mod print_item;
 pub(crate) mod sidebar;
 mod sorted_template;
-pub(crate) mod span_map;
 mod type_layout;
 mod write_shared;
 
@@ -64,9 +63,8 @@ use rustc_span::symbol::{Symbol, sym};
 use tracing::{debug, info};
 
 pub(crate) use self::context::*;
-pub(crate) use self::span_map::{LinkFromSrc, collect_spans_and_sources};
 pub(crate) use self::write_shared::*;
-use crate::clean::{self, Defaultness, ItemId, RenderedLink};
+use crate::clean::{self, Defaultness, Item, ItemId, RenderedLink};
 use crate::display::{Joined as _, MaybeDisplay as _};
 use crate::error::Error;
 use crate::formats::Impl;
@@ -79,8 +77,9 @@ use crate::html::format::{
     print_type, print_where_clause, visibility_print_with_space,
 };
 use crate::html::markdown::{
-    HeadingOffset, IdMap, Markdown, MarkdownItemInfo, MarkdownSummaryLine,
+    HeadingOffset, IdMap, Markdown, MarkdownItemInfo, MarkdownSummaryLine, short_markdown_summary,
 };
+use crate::html::render::search_index::get_function_type_for_search;
 use crate::html::static_files::SCRAPE_EXAMPLES_HELP_MD;
 use crate::html::{highlight, sources};
 use crate::scrape_examples::{CallData, CallLocation};
@@ -124,25 +123,48 @@ enum RenderMode {
 // Helper structs for rendering items/sidebars and carrying along contextual
 // information
 
+#[derive(Debug, Clone)]
+pub(crate) struct IndexItemInfo {
+    pub(crate) ty: ItemType,
+    pub(crate) desc: String,
+    pub(crate) search_type: Option<IndexItemFunctionType>,
+    pub(crate) aliases: Box<[Symbol]>,
+    pub(crate) deprecation: Option<Deprecation>,
+    pub(crate) is_unstable: bool,
+}
+
+impl IndexItemInfo {
+    pub(crate) fn new(
+        tcx: TyCtxt<'_>,
+        cache: &Cache,
+        item: &Item,
+        parent_did: Option<DefId>,
+        impl_generics: Option<&(clean::Type, clean::Generics)>,
+        ty: ItemType,
+    ) -> Self {
+        let desc = short_markdown_summary(&item.doc_value(), &item.link_names(cache));
+        let search_type = get_function_type_for_search(item, tcx, impl_generics, parent_did, cache);
+        let aliases = item.attrs.get_doc_aliases();
+        let deprecation = item.deprecation(tcx);
+        let is_unstable = item.is_unstable();
+        Self { ty, desc, search_type, aliases, deprecation, is_unstable }
+    }
+}
+
 /// Struct representing one entry in the JS search index. These are all emitted
 /// by hand to a large JS file at the end of cache-creation.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct IndexItem {
-    pub(crate) ty: ItemType,
     pub(crate) defid: Option<DefId>,
     pub(crate) name: Symbol,
     pub(crate) module_path: Vec<Symbol>,
-    pub(crate) desc: String,
     pub(crate) parent: Option<DefId>,
     pub(crate) parent_idx: Option<usize>,
     pub(crate) trait_parent: Option<DefId>,
     pub(crate) trait_parent_idx: Option<usize>,
     pub(crate) exact_module_path: Option<Vec<Symbol>>,
     pub(crate) impl_id: Option<DefId>,
-    pub(crate) search_type: Option<IndexItemFunctionType>,
-    pub(crate) aliases: Box<[Symbol]>,
-    pub(crate) is_deprecated: bool,
-    pub(crate) is_unstable: bool,
+    pub(crate) info: IndexItemInfo,
 }
 
 /// A type used for the search index.
@@ -507,30 +529,38 @@ impl AllTypes {
         }
     }
 
-    fn append(&mut self, item_name: String, item_type: &ItemType) {
+    fn add_item_entry(&mut self, item_type: ItemType, new_url: String, name: String) {
+        match item_type {
+            ItemType::Struct => self.structs.insert(ItemEntry::new(new_url, name)),
+            ItemType::Enum => self.enums.insert(ItemEntry::new(new_url, name)),
+            ItemType::Union => self.unions.insert(ItemEntry::new(new_url, name)),
+            ItemType::Primitive => self.primitives.insert(ItemEntry::new(new_url, name)),
+            ItemType::Trait => self.traits.insert(ItemEntry::new(new_url, name)),
+            ItemType::Macro => self.macros.insert(ItemEntry::new(new_url, name)),
+            ItemType::Function => self.functions.insert(ItemEntry::new(new_url, name)),
+            ItemType::TypeAlias => self.type_aliases.insert(ItemEntry::new(new_url, name)),
+            ItemType::Static => self.statics.insert(ItemEntry::new(new_url, name)),
+            ItemType::Constant => self.constants.insert(ItemEntry::new(new_url, name)),
+            ItemType::ProcAttribute | ItemType::DeclMacroAttribute => {
+                self.attribute_macros.insert(ItemEntry::new(new_url, name))
+            }
+            ItemType::ProcDerive | ItemType::DeclMacroDerive => {
+                self.derive_macros.insert(ItemEntry::new(new_url, name))
+            }
+            ItemType::TraitAlias => self.trait_aliases.insert(ItemEntry::new(new_url, name)),
+            _ => true,
+        };
+    }
+
+    fn append(&mut self, item_name: String, item: &clean::Item) {
         let mut url: Vec<_> = item_name.split("::").skip(1).collect();
         if let Some(name) = url.pop() {
-            let new_url = format!("{}/{item_type}.{name}.html", url.join("/"));
+            let new_url = format!("{}/{}", url.join("/"), item.html_filename());
             url.push(name);
             let name = url.join("::");
-            match *item_type {
-                ItemType::Struct => self.structs.insert(ItemEntry::new(new_url, name)),
-                ItemType::Enum => self.enums.insert(ItemEntry::new(new_url, name)),
-                ItemType::Union => self.unions.insert(ItemEntry::new(new_url, name)),
-                ItemType::Primitive => self.primitives.insert(ItemEntry::new(new_url, name)),
-                ItemType::Trait => self.traits.insert(ItemEntry::new(new_url, name)),
-                ItemType::Macro => self.macros.insert(ItemEntry::new(new_url, name)),
-                ItemType::Function => self.functions.insert(ItemEntry::new(new_url, name)),
-                ItemType::TypeAlias => self.type_aliases.insert(ItemEntry::new(new_url, name)),
-                ItemType::Static => self.statics.insert(ItemEntry::new(new_url, name)),
-                ItemType::Constant => self.constants.insert(ItemEntry::new(new_url, name)),
-                ItemType::ProcAttribute => {
-                    self.attribute_macros.insert(ItemEntry::new(new_url, name))
-                }
-                ItemType::ProcDerive => self.derive_macros.insert(ItemEntry::new(new_url, name)),
-                ItemType::TraitAlias => self.trait_aliases.insert(ItemEntry::new(new_url, name)),
-                _ => true,
-            };
+            for type_ in item.types() {
+                self.add_item_entry(type_, new_url.clone(), name.clone());
+            }
         }
     }
 
@@ -785,7 +815,8 @@ fn document_full_inner(
         }
 
         let kind = match &item.kind {
-            clean::ItemKind::StrippedItem(box kind) | kind => kind,
+            clean::ItemKind::StrippedItem(kind) => kind,
+            kind => kind,
         };
 
         if let clean::ItemKind::FunctionItem(..) | clean::ItemKind::MethodItem(..) = kind {
@@ -1558,7 +1589,7 @@ fn render_deref_methods(
         .items
         .iter()
         .find_map(|item| match item.kind {
-            clean::AssocTypeItem(box ref t, _) => Some(match *t {
+            clean::AssocTypeItem(ref t, _) => Some(match *t {
                 clean::TypeAlias { item_type: Some(ref type_), .. } => (type_, &t.type_),
                 _ => (&t.type_, &t.type_),
             }),
@@ -2573,7 +2604,7 @@ impl ItemSection {
             Self::AssociatedConstants => "associated-consts",
             Self::ForeignTypes => "foreign-types",
             Self::Keywords => "keywords",
-            Self::Attributes => "attributes",
+            Self::Attributes => "attribute-docs",
             Self::AttributeMacros => "attributes",
             Self::DeriveMacros => "derives",
             Self::TraitAliases => "trait-aliases",
@@ -2635,8 +2666,8 @@ fn item_ty_to_section(ty: ItemType) -> ItemSection {
         ItemType::ForeignType => ItemSection::ForeignTypes,
         ItemType::Keyword => ItemSection::Keywords,
         ItemType::Attribute => ItemSection::Attributes,
-        ItemType::ProcAttribute => ItemSection::AttributeMacros,
-        ItemType::ProcDerive => ItemSection::DeriveMacros,
+        ItemType::ProcAttribute | ItemType::DeclMacroAttribute => ItemSection::AttributeMacros,
+        ItemType::ProcDerive | ItemType::DeclMacroDerive => ItemSection::DeriveMacros,
         ItemType::TraitAlias => ItemSection::TraitAliases,
     }
 }
@@ -2685,7 +2716,7 @@ fn collect_paths_for_type(first_ty: &clean::Type, cache: &Cache) -> Vec<String> 
             clean::Type::BorrowedRef { type_, .. } => {
                 work.push_back(type_);
             }
-            clean::Type::QPath(box clean::QPathData { self_type, trait_, .. }) => {
+            clean::Type::QPath(clean::QPathData { self_type, trait_, .. }) => {
                 work.push_back(self_type);
                 if let Some(trait_) = trait_ {
                     process_path(trait_.def_id());
@@ -2995,7 +3026,7 @@ fn repr_attribute<'tcx>(
             // Side note: There can only ever be one or zero non-1-ZST fields.
             let non_1zst_field = var.fields.iter().find(|field| {
                 let ty = ty::TypingEnv::post_analysis(tcx, field.did)
-                    .as_query_input(tcx.type_of(field.did).instantiate_identity());
+                    .as_query_input(tcx.type_of(field.did).instantiate_identity().skip_norm_wip());
                 tcx.layout_of(ty).is_ok_and(|layout| !layout.is_1zst())
             });
 

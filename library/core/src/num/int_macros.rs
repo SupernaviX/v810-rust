@@ -268,6 +268,94 @@ macro_rules! int_impl {
             self as $UnsignedT
         }
 
+        /// Saturating conversion of `self` to an unsigned integer of the same size.
+        ///
+        /// Negative values are clamped to `0`.
+        ///
+        /// For other kinds of unsigned integer casts, see
+        /// [`cast_unsigned`](Self::cast_unsigned),
+        /// [`checked_cast_unsigned`](Self::checked_cast_unsigned),
+        /// or [`strict_cast_unsigned`](Self::strict_cast_unsigned).
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// #![feature(integer_cast_extras)]
+        #[doc = concat!("let n = ", stringify!($SelfT), "::MIN;")]
+        ///
+        #[doc = concat!("assert_eq!(n.saturating_cast_unsigned(), 0", stringify!($UnsignedT), ");")]
+        #[doc = concat!("assert_eq!(64", stringify!($SelfT), ".saturating_cast_unsigned(), 64", stringify!($UnsignedT), ");")]
+        /// ```
+        #[rustc_const_unstable(feature = "integer_cast_extras", issue = "154650")]
+        #[unstable(feature = "integer_cast_extras", issue = "154650")]
+        #[must_use = "this returns the result of the operation, \
+                      without modifying the original"]
+        #[inline(always)]
+        pub const fn saturating_cast_unsigned(self) -> $UnsignedT {
+            if self >= 0 {
+                self.cast_unsigned()
+            } else {
+                0
+            }
+        }
+
+        /// Checked conversion of `self` to an unsigned integer of the same size,
+        /// returning `None` if `self` is negative.
+        ///
+        /// For other kinds of unsigned integer casts, see
+        /// [`cast_unsigned`](Self::cast_unsigned),
+        /// [`saturating_cast_unsigned`](Self::saturating_cast_unsigned),
+        /// or [`strict_cast_unsigned`](Self::strict_cast_unsigned).
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// #![feature(integer_cast_extras)]
+        #[doc = concat!("let n = ", stringify!($SelfT), "::MIN;")]
+        ///
+        #[doc = concat!("assert_eq!(n.checked_cast_unsigned(), None);")]
+        #[doc = concat!("assert_eq!(64", stringify!($SelfT), ".checked_cast_unsigned(), Some(64", stringify!($UnsignedT), "));")]
+        /// ```
+        #[rustc_const_unstable(feature = "integer_cast_extras", issue = "154650")]
+        #[unstable(feature = "integer_cast_extras", issue = "154650")]
+        #[must_use = "this returns the result of the operation, \
+                      without modifying the original"]
+        #[inline(always)]
+        pub const fn checked_cast_unsigned(self) -> Option<$UnsignedT> {
+            if self >= 0 {
+                Some(self.cast_unsigned())
+            } else {
+                None
+            }
+        }
+
+        /// Strict conversion of `self` to an unsigned integer of the same size,
+        /// which panics if `self` is negative.
+        ///
+        /// For other kinds of unsigned integer casts, see
+        /// [`cast_unsigned`](Self::cast_unsigned),
+        /// [`checked_cast_unsigned`](Self::checked_cast_unsigned),
+        /// or [`saturating_cast_unsigned`](Self::saturating_cast_unsigned).
+        ///
+        /// # Examples
+        ///
+        /// ```should_panic
+        /// #![feature(integer_cast_extras)]
+        #[doc = concat!("let _ = ", stringify!($SelfT), "::MIN.strict_cast_unsigned();")]
+        /// ```
+        #[rustc_const_unstable(feature = "integer_cast_extras", issue = "154650")]
+        #[unstable(feature = "integer_cast_extras", issue = "154650")]
+        #[must_use = "this returns the result of the operation, \
+                      without modifying the original"]
+        #[inline]
+        #[track_caller]
+        pub const fn strict_cast_unsigned(self) -> $UnsignedT {
+            match self.checked_cast_unsigned() {
+                Some(n) => n,
+                None => imp::overflow_panic::cast_integer(),
+            }
+        }
+
         /// Shifts the bits to the left by a specified amount, `n`,
         /// wrapping the truncated bits to the end of the resulting integer.
         ///
@@ -386,13 +474,9 @@ macro_rules! int_impl {
         #[must_use]
         #[inline]
         pub const fn from_be(x: Self) -> Self {
-            #[cfg(target_endian = "big")]
-            {
-                x
-            }
-            #[cfg(not(target_endian = "big"))]
-            {
-                x.swap_bytes()
+            cfg_select! {
+                target_endian = "big" => x,
+                _ => x.swap_bytes(),
             }
         }
 
@@ -418,13 +502,9 @@ macro_rules! int_impl {
         #[must_use]
         #[inline]
         pub const fn from_le(x: Self) -> Self {
-            #[cfg(target_endian = "little")]
-            {
-                x
-            }
-            #[cfg(not(target_endian = "little"))]
-            {
-                x.swap_bytes()
+            cfg_select! {
+                target_endian = "little" => x,
+                _ => x.swap_bytes(),
             }
         }
 
@@ -455,13 +535,9 @@ macro_rules! int_impl {
                       without modifying the original"]
         #[inline]
         pub const fn to_be(self) -> Self { // or not to be?
-            #[cfg(target_endian = "big")]
-            {
-                self
-            }
-            #[cfg(not(target_endian = "big"))]
-            {
-                self.swap_bytes()
+            cfg_select! {
+                target_endian = "big" => self,
+                _ => self.swap_bytes(),
             }
         }
 
@@ -492,13 +568,9 @@ macro_rules! int_impl {
                       without modifying the original"]
         #[inline]
         pub const fn to_le(self) -> Self {
-            #[cfg(target_endian = "little")]
-            {
-                self
-            }
-            #[cfg(not(target_endian = "little"))]
-            {
-                self.swap_bytes()
+            cfg_select! {
+                target_endian = "little" => self,
+                _ => self.swap_bytes(),
             }
         }
 
@@ -1823,7 +1895,11 @@ macro_rules! int_impl {
             }
         }
 
-        /// Returns the square root of the number, rounded down.
+        /// Returns the integer square root of the number, rounded down.
+        ///
+        /// This function returns the **principal (non-negative) square root**.
+        /// For a given number `n`, although both `x` and `-x` satisfy x<sup>2</sup> = n,
+        /// this function always returns the non-negative value.
         ///
         /// Returns `None` if `self` is negative.
         ///
@@ -1841,10 +1917,9 @@ macro_rules! int_impl {
             if self < 0 {
                 None
             } else {
-                // SAFETY: Input is nonnegative in this `else` branch.
-                let result = unsafe {
-                    imp::int_sqrt::$ActualT(self as $ActualT) as $SelfT
-                };
+                // The upper bound of `$UnsignedT::MAX.isqrt()` told to the compiler
+                // in the unsigned function also tells it that `result >= 0`
+                let result = self.cast_unsigned().isqrt().cast_signed();
 
                 // Inform the optimizer what the range of outputs is. If
                 // testing `core` crashes with no panic message and a
@@ -1858,15 +1933,9 @@ macro_rules! int_impl {
                 // `[0, <$ActualT>::MAX]`, sqrt(n) will be bounded by
                 // `[sqrt(0), sqrt(<$ActualT>::MAX)]`.
                 unsafe {
-                    // SAFETY: `<$ActualT>::MAX` is nonnegative.
-                    const MAX_RESULT: $SelfT = unsafe {
-                        imp::int_sqrt::$ActualT(<$ActualT>::MAX) as $SelfT
-                    };
-
-                    crate::hint::assert_unchecked(result >= 0);
+                    const MAX_RESULT: $SelfT = <$SelfT>::MAX.cast_unsigned().isqrt().cast_signed();
                     crate::hint::assert_unchecked(result <= MAX_RESULT);
                 }
-
                 Some(result)
             }
         }
@@ -2708,32 +2777,6 @@ macro_rules! int_impl {
             (a as Self, b)
         }
 
-        /// Calculates the complete product `self * rhs` without the possibility to overflow.
-        ///
-        /// This returns the low-order (wrapping) bits and the high-order (overflow) bits
-        /// of the result as two separate values, in that order.
-        ///
-        /// If you also need to add a carry to the wide result, then you want
-        /// [`Self::carrying_mul`] instead.
-        ///
-        /// # Examples
-        ///
-        /// Please note that this example is shared among integer types, which is why `i32` is used.
-        ///
-        /// ```
-        /// #![feature(widening_mul)]
-        /// assert_eq!(5i32.widening_mul(-2), (4294967286, -1));
-        /// assert_eq!(1_000_000_000i32.widening_mul(-10), (2884901888, -3));
-        /// ```
-        #[unstable(feature = "widening_mul", issue = "152016")]
-        #[rustc_const_unstable(feature = "widening_mul", issue = "152016")]
-        #[must_use = "this returns the result of the operation, \
-                      without modifying the original"]
-        #[inline]
-        pub const fn widening_mul(self, rhs: Self) -> ($UnsignedT, Self) {
-            Self::carrying_mul_add(self, rhs, 0, 0)
-        }
-
         /// Calculates the "full multiplication" `self * rhs + carry`
         /// without the possibility to overflow.
         ///
@@ -2743,8 +2786,6 @@ macro_rules! int_impl {
         /// Performs "long multiplication" which takes in an extra amount to add, and may return an
         /// additional amount of overflow. This allows for chaining together multiple
         /// multiplications to create "big integers" which represent larger values.
-        ///
-        /// If you don't need the `carry`, then you can use [`Self::widening_mul`] instead.
         ///
         /// # Examples
         ///
@@ -2780,8 +2821,7 @@ macro_rules! int_impl {
         /// additional amount of overflow. This allows for chaining together multiple
         /// multiplications to create "big integers" which represent larger values.
         ///
-        /// If you don't need either `carry`, then you can use [`Self::widening_mul`] instead,
-        /// and if you only need one `carry`, then you can use [`Self::carrying_mul`] instead.
+        /// If you only need one `carry`, then you can use [`Self::carrying_mul`] instead.
         ///
         /// # Examples
         ///
@@ -3118,7 +3158,11 @@ macro_rules! int_impl {
             }
         }
 
-        /// Returns the square root of the number, rounded down.
+        /// Returns the integer square root of the number, rounded down.
+        ///
+        /// This function returns the **principal (non-negative) square root**.
+        /// For a given number `n`, although both `x` and `-x` satisfy x<sup>2</sup> = n,
+        /// this function always returns the non-negative value.
         ///
         /// # Panics
         ///
@@ -3947,14 +3991,14 @@ macro_rules! int_impl {
         /// # Examples
         ///
         /// ```
-        /// #![feature(integer_extend_truncate)]
+        /// #![feature(integer_widen_truncate)]
         #[doc = concat!("assert_eq!(120i8, 120", stringify!($SelfT), ".truncate());")]
         #[doc = concat!("assert_eq!(-120i8, (-120", stringify!($SelfT), ").truncate());")]
         /// assert_eq!(120i8, 376i32.truncate());
         /// ```
         #[must_use = "this returns the truncated value and does not modify the original"]
-        #[unstable(feature = "integer_extend_truncate", issue = "154330")]
-        #[rustc_const_unstable(feature = "integer_extend_truncate", issue = "154330")]
+        #[unstable(feature = "integer_widen_truncate", issue = "154330")]
+        #[rustc_const_unstable(feature = "integer_widen_truncate", issue = "154330")]
         #[inline]
         pub const fn truncate<Target>(self) -> Target
             where Self: [const] traits::TruncateTarget<Target>
@@ -3968,15 +4012,15 @@ macro_rules! int_impl {
         /// # Examples
         ///
         /// ```
-        /// #![feature(integer_extend_truncate)]
+        /// #![feature(integer_widen_truncate)]
         #[doc = concat!("assert_eq!(120i8, 120", stringify!($SelfT), ".saturating_truncate());")]
         #[doc = concat!("assert_eq!(-120i8, (-120", stringify!($SelfT), ").saturating_truncate());")]
         /// assert_eq!(127i8, 376i32.saturating_truncate());
         /// assert_eq!(-128i8, (-1000i32).saturating_truncate());
         /// ```
         #[must_use = "this returns the truncated value and does not modify the original"]
-        #[unstable(feature = "integer_extend_truncate", issue = "154330")]
-        #[rustc_const_unstable(feature = "integer_extend_truncate", issue = "154330")]
+        #[unstable(feature = "integer_widen_truncate", issue = "154330")]
+        #[rustc_const_unstable(feature = "integer_widen_truncate", issue = "154330")]
         #[inline]
         pub const fn saturating_truncate<Target>(self) -> Target
             where Self: [const] traits::TruncateTarget<Target>
@@ -3990,15 +4034,15 @@ macro_rules! int_impl {
         /// # Examples
         ///
         /// ```
-        /// #![feature(integer_extend_truncate)]
+        /// #![feature(integer_widen_truncate)]
         #[doc = concat!("assert_eq!(Some(120i8), 120", stringify!($SelfT), ".checked_truncate());")]
         #[doc = concat!("assert_eq!(Some(-120i8), (-120", stringify!($SelfT), ").checked_truncate());")]
         /// assert_eq!(None, 376i32.checked_truncate::<i8>());
         /// assert_eq!(None, (-1000i32).checked_truncate::<i8>());
         /// ```
         #[must_use = "this returns the truncated value and does not modify the original"]
-        #[unstable(feature = "integer_extend_truncate", issue = "154330")]
-        #[rustc_const_unstable(feature = "integer_extend_truncate", issue = "154330")]
+        #[unstable(feature = "integer_widen_truncate", issue = "154330")]
+        #[rustc_const_unstable(feature = "integer_widen_truncate", issue = "154330")]
         #[inline]
         pub const fn checked_truncate<Target>(self) -> Option<Target>
             where Self: [const] traits::TruncateTarget<Target>
@@ -4006,23 +4050,23 @@ macro_rules! int_impl {
             traits::TruncateTarget::internal_checked_truncate(self)
         }
 
-        /// Extend to an integer of the same size or larger, preserving its value.
+        /// Widen to an integer of the same size or larger, preserving its value.
         ///
         /// # Examples
         ///
         /// ```
-        /// #![feature(integer_extend_truncate)]
-        #[doc = concat!("assert_eq!(120i128, 120i8.extend());")]
-        #[doc = concat!("assert_eq!(-120i128, (-120i8).extend());")]
+        /// #![feature(integer_widen_truncate)]
+        #[doc = concat!("assert_eq!(120i128, 120i8.widen());")]
+        #[doc = concat!("assert_eq!(-120i128, (-120i8).widen());")]
         /// ```
-        #[must_use = "this returns the extended value and does not modify the original"]
-        #[unstable(feature = "integer_extend_truncate", issue = "154330")]
-        #[rustc_const_unstable(feature = "integer_extend_truncate", issue = "154330")]
+        #[must_use = "this returns the widened value and does not modify the original"]
+        #[unstable(feature = "integer_widen_truncate", issue = "154330")]
+        #[rustc_const_unstable(feature = "integer_widen_truncate", issue = "154330")]
         #[inline]
-        pub const fn extend<Target>(self) -> Target
-            where Self: [const] traits::ExtendTarget<Target>
+        pub const fn widen<Target>(self) -> Target
+            where Self: [const] traits::WidenTarget<Target>
         {
-            traits::ExtendTarget::internal_extend(self)
+            traits::WidenTarget::internal_widen(self)
         }
     }
 }

@@ -15,7 +15,7 @@
 //! crate as a kind of pass. This should eventually be factored away.
 
 use std::cell::Cell;
-use std::ops::{Bound, ControlFlow};
+use std::ops::ControlFlow;
 use std::{assert_matches, iter};
 
 use rustc_abi::{ExternAbi, Size};
@@ -34,7 +34,8 @@ use rustc_middle::hir::nested_filter;
 use rustc_middle::query::Providers;
 use rustc_middle::ty::util::{Discr, IntTypeExt};
 use rustc_middle::ty::{
-    self, AdtKind, Const, IsSuggestable, Ty, TyCtxt, TypeVisitableExt, TypingMode, fold_regions,
+    self, AdtKind, Const, IsSuggestable, Ty, TyCtxt, TypeVisitableExt, TypingMode, Unnormalized,
+    fold_regions,
 };
 use rustc_middle::{bug, span_bug};
 use rustc_span::{DUMMY_SP, Ident, Span, Symbol, kw, sym};
@@ -388,7 +389,7 @@ impl<'tcx> HirTyLowerer<'tcx> for ItemCtxt<'tcx> {
         let candidates = candidates
             .into_iter()
             .filter(|&InherentAssocCandidate { impl_, .. }| {
-                let impl_ty = self.tcx().type_of(impl_).instantiate_identity();
+                let impl_ty = self.tcx().type_of(impl_).instantiate_identity().skip_norm_wip();
 
                 // See comment on doing this operation for `self_ty`
                 let impl_ty = self.tcx.expand_free_alias_tys(impl_ty);
@@ -894,7 +895,7 @@ fn trait_def(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::TraitDef {
     let item = tcx.hir_expect_item(def_id);
 
     let (constness, is_alias, is_auto, safety, impl_restriction) = match item.kind {
-        hir::ItemKind::Trait(constness, is_auto, safety, impl_restriction, ..) => (
+        hir::ItemKind::Trait { impl_restriction, constness, is_auto, safety, .. } => (
             constness,
             false,
             is_auto == hir::IsAuto::Yes,
@@ -919,26 +920,26 @@ fn trait_def(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::TraitDef {
     #[allow(deprecated)]
     let attrs = tcx.get_all_attrs(def_id);
 
-    let paren_sugar = find_attr!(attrs, RustcParenSugar(_));
+    let paren_sugar = find_attr!(attrs, RustcParenSugar);
     if paren_sugar && !tcx.features().unboxed_closures() {
         tcx.dcx().emit_err(errors::ParenSugarAttribute { span: item.span });
     }
 
     // Only regular traits can be marker.
-    let is_marker = !is_alias && find_attr!(attrs, Marker(_));
+    let is_marker = !is_alias && find_attr!(attrs, Marker);
 
-    let rustc_coinductive = find_attr!(attrs, RustcCoinductive(_));
+    let rustc_coinductive = find_attr!(attrs, RustcCoinductive);
     let is_fundamental = find_attr!(attrs, Fundamental);
 
     let [skip_array_during_method_dispatch, skip_boxed_slice_during_method_dispatch] = find_attr!(
         attrs,
-        RustcSkipDuringMethodDispatch { array, boxed_slice, span: _ } => [*array, *boxed_slice]
+        RustcSkipDuringMethodDispatch { array, boxed_slice } => [*array, *boxed_slice]
     )
     .unwrap_or([false; 2]);
 
-    let specialization_kind = if find_attr!(attrs, RustcUnsafeSpecializationMarker(_)) {
+    let specialization_kind = if find_attr!(attrs, RustcUnsafeSpecializationMarker) {
         ty::trait_def::TraitSpecializationKind::Marker
-    } else if find_attr!(attrs, RustcSpecializationTrait(_)) {
+    } else if find_attr!(attrs, RustcSpecializationTrait) {
         ty::trait_def::TraitSpecializationKind::AlwaysApplicable
     } else {
         ty::trait_def::TraitSpecializationKind::None
@@ -953,14 +954,14 @@ fn trait_def(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::TraitDef {
                 .collect::<Box<[_]>>()
     );
 
-    let deny_explicit_impl = find_attr!(attrs, RustcDenyExplicitImpl(_));
+    let deny_explicit_impl = find_attr!(attrs, RustcDenyExplicitImpl);
     let force_dyn_incompatible = find_attr!(attrs, RustcDynIncompatibleTrait(span) => *span);
 
     ty::TraitDef {
         def_id: def_id.to_def_id(),
+        impl_restriction,
         safety,
         constness,
-        impl_restriction,
         paren_sugar,
         has_auto_impl: is_auto,
         is_marker,
@@ -1033,14 +1034,12 @@ fn fn_sig(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::EarlyBinder<'_, ty::PolyFn
         Ctor(data) => {
             assert_matches!(data.ctor(), Some(_));
             let adt_def_id = tcx.hir_get_parent_item(hir_id).def_id.to_def_id();
-            let ty = tcx.type_of(adt_def_id).instantiate_identity();
-            let inputs = data.fields().iter().map(|f| tcx.type_of(f.def_id).instantiate_identity());
-            // constructors for structs with `layout_scalar_valid_range` are unsafe to call
-            let safety = match tcx.layout_scalar_valid_range(adt_def_id) {
-                (Bound::Unbounded, Bound::Unbounded) => hir::Safety::Safe,
-                _ => hir::Safety::Unsafe,
-            };
-            ty::Binder::dummy(tcx.mk_fn_sig(inputs, ty, false, safety, ExternAbi::Rust))
+            let ty = tcx.type_of(adt_def_id).instantiate_identity().skip_norm_wip();
+            let inputs = data
+                .fields()
+                .iter()
+                .map(|f| tcx.type_of(f.def_id).instantiate_identity().skip_norm_wip());
+            ty::Binder::dummy(tcx.mk_fn_sig_rust_abi(inputs, ty, hir::Safety::Safe))
         }
 
         Expr(&hir::Expr { kind: hir::ExprKind::Closure { .. }, .. }) => {
@@ -1233,9 +1232,7 @@ fn recover_infer_ret_ty<'tcx>(
     let fn_sig = tcx.mk_fn_sig(
         fn_sig.inputs().iter().copied(),
         recovered_ret_ty.unwrap_or_else(|| Ty::new_error(tcx, guar)),
-        fn_sig.c_variadic,
-        fn_sig.safety,
-        fn_sig.abi,
+        fn_sig.fn_sig_kind,
     );
 
     late_param_regions_to_bound(tcx, scope, bound_vars, fn_sig)
@@ -1341,7 +1338,7 @@ pub fn suggest_impl_trait<'tcx>(
             let item_ty = ocx.normalize(
                 &ObligationCause::dummy(),
                 param_env,
-                Ty::new_projection_from_args(infcx.tcx, assoc_item_def_id, args),
+                Unnormalized::new(Ty::new_projection_from_args(infcx.tcx, assoc_item_def_id, args)),
             );
             // FIXME(compiler-errors): We may benefit from resolving regions here.
             if ocx.try_evaluate_obligations().is_empty()
@@ -1375,7 +1372,7 @@ fn impl_trait_header(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::ImplTraitHeader
     let of_trait = impl_
         .of_trait
         .unwrap_or_else(|| panic!("expected impl trait, found inherent impl on {def_id:?}"));
-    let selfty = tcx.type_of(def_id).instantiate_identity();
+    let selfty = tcx.type_of(def_id).instantiate_identity().skip_norm_wip();
     let is_rustc_reservation = find_attr!(tcx, def_id, RustcReservationImpl(..));
 
     check_impl_constness(tcx, impl_.constness, &of_trait.trait_ref);
@@ -1599,9 +1596,10 @@ fn const_param_default<'tcx>(
     let def_id = local_def_id.to_def_id();
     let identity_args = ty::GenericArgs::identity_for_item(tcx, tcx.parent(def_id));
 
-    let ct = icx
-        .lowerer()
-        .lower_const_arg(default_ct, tcx.type_of(def_id).instantiate(tcx, identity_args));
+    let ct = icx.lowerer().lower_const_arg(
+        default_ct,
+        tcx.type_of(def_id).instantiate(tcx, identity_args).skip_norm_wip(),
+    );
     ty::EarlyBinder::bind(ct)
 }
 
@@ -1715,9 +1713,10 @@ fn const_of_item<'tcx>(
     };
     let icx = ItemCtxt::new(tcx, def_id);
     let identity_args = ty::GenericArgs::identity_for_item(tcx, def_id);
-    let ct = icx
-        .lowerer()
-        .lower_const_arg(ct_arg, tcx.type_of(def_id.to_def_id()).instantiate(tcx, identity_args));
+    let ct = icx.lowerer().lower_const_arg(
+        ct_arg,
+        tcx.type_of(def_id.to_def_id()).instantiate(tcx, identity_args).skip_norm_wip(),
+    );
     if let Err(e) = icx.check_tainted_by_errors()
         && !ct.references_error()
     {

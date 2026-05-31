@@ -70,7 +70,8 @@ fn eval_body_using_ecx<'tcx, R: InterpretationResult<'tcx>>(
     body: &'tcx mir::Body<'tcx>,
 ) -> InterpResult<'tcx, R> {
     let tcx = *ecx.tcx;
-    let layout = ecx.layout_of(body.bound_return_ty().instantiate(tcx, cid.instance.args))?;
+    let layout =
+        ecx.layout_of(body.bound_return_ty().instantiate(tcx, cid.instance.args).skip_norm_wip())?;
     let (intern_kind, ret) = setup_for_eval(ecx, cid, layout)?;
 
     trace!(
@@ -373,7 +374,7 @@ pub fn eval_to_allocation_raw_provider<'tcx>(
     assert!(key.value.promoted.is_some() || !tcx.is_static(key.value.instance.def_id()));
 
     if cfg!(debug_assertions) {
-        match key.typing_env.typing_mode() {
+        match key.typing_env.typing_mode().assert_not_erased() {
             ty::TypingMode::PostAnalysis => {}
             ty::TypingMode::Coherence
             | ty::TypingMode::Analysis { .. }

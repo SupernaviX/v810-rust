@@ -8,17 +8,16 @@ use rustc_hir::{MethodKind, Target};
 use rustc_span::{Symbol, sym};
 use thin_vec::ThinVec;
 
+use crate::attributes::SingleAttributeParser;
 use crate::attributes::prelude::Allow;
-use crate::attributes::{OnDuplicate, SingleAttributeParser};
-use crate::context::{AcceptContext, Stage};
+use crate::context::AcceptContext;
 use crate::parser::{ArgParser, MetaItemOrLitParser};
 use crate::target_checking::AllowedTargets;
 
 pub(crate) struct RustcAutodiffParser;
 
-impl<S: Stage> SingleAttributeParser<S> for RustcAutodiffParser {
+impl SingleAttributeParser for RustcAutodiffParser {
     const PATH: &[Symbol] = &[sym::rustc_autodiff];
-    const ON_DUPLICATE: OnDuplicate<S> = OnDuplicate::Error;
     const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowList(&[
         Allow(Target::Fn),
         Allow(Target::Method(MethodKind::Inherent)),
@@ -31,7 +30,7 @@ impl<S: Stage> SingleAttributeParser<S> for RustcAutodiffParser {
         "https://doc.rust-lang.org/std/autodiff/index.html"
     );
 
-    fn convert(cx: &mut AcceptContext<'_, '_, S>, args: &ArgParser) -> Option<AttributeKind> {
+    fn convert(cx: &mut AcceptContext<'_, '_>, args: &ArgParser) -> Option<AttributeKind> {
         let list = match args {
             ArgParser::NoArgs => return Some(AttributeKind::RustcAutodiff(None)),
             ArgParser::List(list) => list,
@@ -53,10 +52,7 @@ impl<S: Stage> SingleAttributeParser<S> for RustcAutodiffParser {
             cx.adcx().expected_identifier(mode.span());
             return None;
         };
-        let Ok(()) = mode.args().no_args() else {
-            cx.adcx().expected_identifier(mode.span());
-            return None;
-        };
+        cx.expect_no_args(mode.args())?;
         let Some(mode) = mode.path().word() else {
             cx.adcx().expected_identifier(mode.span());
             return None;
@@ -86,11 +82,7 @@ impl<S: Stage> SingleAttributeParser<S> for RustcAutodiffParser {
                     .expected_specific_argument(activity.span(), DiffActivity::all_activities());
                 return None;
             };
-            let Ok(()) = activity.args().no_args() else {
-                cx.adcx()
-                    .expected_specific_argument(activity.span(), DiffActivity::all_activities());
-                return None;
-            };
+            cx.expect_no_args(activity.args())?;
             let Some(activity) = activity.path().word() else {
                 cx.adcx()
                     .expected_specific_argument(activity.span(), DiffActivity::all_activities());

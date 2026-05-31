@@ -65,7 +65,7 @@ use rustc_middle::ty::error::{ExpectedFound, TypeError, TypeErrorToStringExt};
 use rustc_middle::ty::print::{PrintTraitRefExt as _, WrapBinderMode, with_forced_trimmed_paths};
 use rustc_middle::ty::{
     self, List, ParamEnv, Region, Ty, TyCtxt, TypeFoldable, TypeSuperVisitable, TypeVisitable,
-    TypeVisitableExt,
+    TypeVisitableExt, Unnormalized,
 };
 use rustc_span::{BytePos, DUMMY_SP, DesugaringKind, Pos, Span, sym};
 use tracing::{debug, instrument};
@@ -196,12 +196,13 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
         self.tcx
             .explicit_item_self_bounds(def_id)
             .iter_instantiated_copied(self.tcx, args)
+            .map(Unnormalized::skip_norm_wip)
             .find_map(|(predicate, _)| {
                 predicate
                     .kind()
                     .map_bound(|kind| match kind {
                         ty::ClauseKind::Projection(projection_predicate)
-                            if projection_predicate.projection_term.def_id == item_def_id =>
+                            if projection_predicate.projection_term.def_id() == item_def_id =>
                         {
                             projection_predicate.term.as_type()
                         }
@@ -277,7 +278,8 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
 
             let is_shadowed = self.infcx.probe(|_| {
                 let impl_substs = self.infcx.fresh_args_for_item(DUMMY_SP, impl_def_id);
-                let impl_trait_ref = tcx.impl_trait_ref(impl_def_id).instantiate(tcx, impl_substs);
+                let impl_trait_ref =
+                    tcx.impl_trait_ref(impl_def_id).instantiate(tcx, impl_substs).skip_norm_wip();
 
                 let expected_trait_ref = alias.trait_ref(tcx);
 
@@ -307,7 +309,8 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                 if !tcx.check_args_compatible(impl_item_def_id, rebased_args) {
                     return false;
                 }
-                let impl_assoc_ty = tcx.type_of(impl_item_def_id).instantiate(tcx, rebased_args);
+                let impl_assoc_ty =
+                    tcx.type_of(impl_item_def_id).instantiate(tcx, rebased_args).skip_norm_wip();
 
                 self.infcx.can_eq(param_env, impl_assoc_ty, concrete)
             });
@@ -429,7 +432,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                     }
                 }
             }
-            ObligationCauseCode::MatchExpressionArm(box MatchExpressionArmCause {
+            ObligationCauseCode::MatchExpressionArm(MatchExpressionArmCause {
                 arm_block_id,
                 arm_span,
                 arm_ty,
@@ -760,8 +763,8 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
         sig2: &ty::PolyFnSig<'tcx>,
         fn_def2: Option<(DefId, Option<&'tcx [ty::GenericArg<'tcx>]>)>,
     ) -> (DiagStyledString, DiagStyledString) {
-        let sig1 = &(self.normalize_fn_sig)(*sig1);
-        let sig2 = &(self.normalize_fn_sig)(*sig2);
+        let sig1 = &(self.normalize_fn_sig)(Unnormalized::new_wip(*sig1));
+        let sig2 = &(self.normalize_fn_sig)(Unnormalized::new_wip(*sig2));
 
         let get_lifetimes = |sig| {
             use rustc_hir::def::Namespace;
@@ -776,49 +779,54 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
         let (lt1, sig1) = get_lifetimes(sig1);
         let (lt2, sig2) = get_lifetimes(sig2);
 
-        // unsafe extern "C" for<'a> fn(&'a T) -> &'a T
+        // #[target_features] for<'a> unsafe extern "C" fn(&'a T) -> &'a T
         let mut values =
             (DiagStyledString::normal("".to_string()), DiagStyledString::normal("".to_string()));
 
-        // unsafe extern "C" for<'a> fn(&'a T) -> &'a T
-        // ^^^^^^
-        let safety = |fn_def, sig: ty::FnSig<'_>| match fn_def {
-            None => sig.safety.prefix_str(),
+        // #[target_features] for<'a> unsafe extern "C" fn(&'a T) -> &'a T
+        // ^^^^^^^^^^^^^^^^^^
+        let fn_item_prefix_and_safety = |fn_def, sig: ty::FnSig<'_>| match fn_def {
+            None => ("", sig.safety().prefix_str()),
             Some((did, _)) => {
                 if self.tcx.codegen_fn_attrs(did).safe_target_features {
-                    "#[target_features] "
+                    ("#[target_features] ", "")
                 } else {
-                    sig.safety.prefix_str()
+                    ("", sig.safety().prefix_str())
                 }
             }
         };
-        let safety1 = safety(fn_def1, sig1);
-        let safety2 = safety(fn_def2, sig2);
-        values.0.push(safety1, safety1 != safety2);
-        values.1.push(safety2, safety1 != safety2);
+        let (prefix1, safety1) = fn_item_prefix_and_safety(fn_def1, sig1);
+        let (prefix2, safety2) = fn_item_prefix_and_safety(fn_def2, sig2);
+        values.0.push(prefix1, prefix1 != prefix2);
+        values.1.push(prefix2, prefix1 != prefix2);
 
-        // unsafe extern "C" for<'a> fn(&'a T) -> &'a T
-        //        ^^^^^^^^^^
-        if sig1.abi != ExternAbi::Rust {
-            values.0.push(format!("extern {} ", sig1.abi), sig1.abi != sig2.abi);
-        }
-        if sig2.abi != ExternAbi::Rust {
-            values.1.push(format!("extern {} ", sig2.abi), sig1.abi != sig2.abi);
-        }
-
-        // unsafe extern "C" for<'a> fn(&'a T) -> &'a T
-        //                   ^^^^^^^^
+        // #[target_features] for<'a> unsafe extern "C" fn(&'a T) -> &'a T
+        //                    ^^^^^^^^
         let lifetime_diff = lt1 != lt2;
         values.0.push(lt1, lifetime_diff);
         values.1.push(lt2, lifetime_diff);
 
-        // unsafe extern "C" for<'a> fn(&'a T) -> &'a T
-        //                           ^^^
+        // #[target_features] for<'a> unsafe extern "C" fn(&'a T) -> &'a T
+        //                            ^^^^^^
+        values.0.push(safety1, safety1 != safety2);
+        values.1.push(safety2, safety1 != safety2);
+
+        // #[target_features] for<'a> unsafe extern "C" fn(&'a T) -> &'a T
+        //                                   ^^^^^^^^^^
+        if sig1.abi() != ExternAbi::Rust {
+            values.0.push(format!("extern {} ", sig1.abi()), sig1.abi() != sig2.abi());
+        }
+        if sig2.abi() != ExternAbi::Rust {
+            values.1.push(format!("extern {} ", sig2.abi()), sig1.abi() != sig2.abi());
+        }
+
+        // #[target_features] for<'a> unsafe extern "C" fn(&'a T) -> &'a T
+        //                                              ^^^
         values.0.push_normal("fn(");
         values.1.push_normal("fn(");
 
-        // unsafe extern "C" for<'a> fn(&'a T) -> &'a T
-        //                              ^^^^^
+        // #[target_features] for<'a> unsafe extern "C" fn(&'a T) -> &'a T
+        //                                                 ^^^^^
         let len1 = sig1.inputs().len();
         let len2 = sig2.inputs().len();
         if len1 == len2 {
@@ -843,26 +851,26 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
             }
         }
 
-        if sig1.c_variadic {
+        if sig1.c_variadic() {
             if len1 > 0 {
                 values.0.push_normal(", ");
             }
-            values.0.push("...", !sig2.c_variadic);
+            values.0.push("...", !sig2.c_variadic());
         }
-        if sig2.c_variadic {
+        if sig2.c_variadic() {
             if len2 > 0 {
                 values.1.push_normal(", ");
             }
-            values.1.push("...", !sig1.c_variadic);
+            values.1.push("...", !sig1.c_variadic());
         }
 
-        // unsafe extern "C" for<'a> fn(&'a T) -> &'a T
-        //                                   ^
+        // #[target_features] for<'a> unsafe extern "C" fn(&'a T) -> &'a T
+        //                                                      ^
         values.0.push_normal(")");
         values.1.push_normal(")");
 
-        // unsafe extern "C" for<'a> fn(&'a T) -> &'a T
-        //                                     ^^^^^^^^
+        // #[target_features] for<'a> unsafe extern "C" fn(&'a T) -> &'a T
+        //                                                        ^^^^^^^^
         let output1 = sig1.output();
         let output2 = sig2.output();
         let (x1, x2) = self.cmp(output1, output2);
@@ -1272,8 +1280,8 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
             }
 
             (ty::FnDef(did1, args1), ty::FnDef(did2, args2)) => {
-                let sig1 = self.tcx.fn_sig(*did1).instantiate(self.tcx, args1);
-                let sig2 = self.tcx.fn_sig(*did2).instantiate(self.tcx, args2);
+                let sig1 = self.tcx.fn_sig(*did1).instantiate(self.tcx, args1).skip_norm_wip();
+                let sig2 = self.tcx.fn_sig(*did2).instantiate(self.tcx, args2).skip_norm_wip();
                 self.cmp_fn_sig(
                     &sig1,
                     Some((*did1, Some(args1))),
@@ -1283,12 +1291,12 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
             }
 
             (ty::FnDef(did1, args1), ty::FnPtr(sig_tys2, hdr2)) => {
-                let sig1 = self.tcx.fn_sig(*did1).instantiate(self.tcx, args1);
+                let sig1 = self.tcx.fn_sig(*did1).instantiate(self.tcx, args1).skip_norm_wip();
                 self.cmp_fn_sig(&sig1, Some((*did1, Some(args1))), &sig_tys2.with(*hdr2), None)
             }
 
             (ty::FnPtr(sig_tys1, hdr1), ty::FnDef(did2, args2)) => {
-                let sig2 = self.tcx.fn_sig(*did2).instantiate(self.tcx, args2);
+                let sig2 = self.tcx.fn_sig(*did2).instantiate(self.tcx, args2).skip_norm_wip();
                 self.cmp_fn_sig(&sig_tys1.with(*hdr1), None, &sig2, Some((*did2, Some(args2))))
             }
 
@@ -1465,7 +1473,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                     }
                     ValuePairs::TraitRefs(_) => (false, Mismatch::Fixed("trait")),
                     ValuePairs::Aliases(ExpectedFound { expected, .. }) => {
-                        (false, Mismatch::Fixed(self.tcx.def_descr(expected.def_id)))
+                        (false, Mismatch::Fixed(self.tcx.def_descr(expected.def_id())))
                     }
                     ValuePairs::Regions(_) => (false, Mismatch::Fixed("lifetime")),
                     ValuePairs::ExistentialTraitRef(_) => {
@@ -1902,9 +1910,8 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
             }
         }
         let code = trace.cause.code();
-        if let &(ObligationCauseCode::MatchExpressionArm(box MatchExpressionArmCause {
-            source,
-            ..
+        if let &(ObligationCauseCode::MatchExpressionArm(MatchExpressionArmCause {
+            source, ..
         })
         | ObligationCauseCode::BlockTailExpression(.., source)) = code
             && let hir::MatchSource::TryDesugar(_) = source
@@ -2294,14 +2301,14 @@ impl<'tcx> ObligationCause<'tcx> {
             ObligationCauseCode::BlockTailExpression(.., hir::MatchSource::TryDesugar(_)) => {
                 ObligationCauseFailureCode::TryCompat { span, subdiags }
             }
-            ObligationCauseCode::MatchExpressionArm(box MatchExpressionArmCause {
-                source, ..
-            }) => match source {
-                hir::MatchSource::TryDesugar(_) => {
-                    ObligationCauseFailureCode::TryCompat { span, subdiags }
+            ObligationCauseCode::MatchExpressionArm(MatchExpressionArmCause { source, .. }) => {
+                match source {
+                    hir::MatchSource::TryDesugar(_) => {
+                        ObligationCauseFailureCode::TryCompat { span, subdiags }
+                    }
+                    _ => ObligationCauseFailureCode::MatchCompat { span, subdiags },
                 }
-                _ => ObligationCauseFailureCode::MatchCompat { span, subdiags },
-            },
+            }
             ObligationCauseCode::IfExpression { .. } => {
                 ObligationCauseFailureCode::IfElseDifferent { span, subdiags }
             }

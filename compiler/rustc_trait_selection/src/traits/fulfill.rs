@@ -1,4 +1,5 @@
 use std::marker::PhantomData;
+use std::ops::ControlFlow;
 
 use rustc_data_structures::obligation_forest::{
     Error, ForestObligation, ObligationForest, ObligationProcessor, Outcome, ProcessResult,
@@ -13,10 +14,9 @@ use rustc_middle::bug;
 use rustc_middle::ty::abstract_const::NotConstEvaluatable;
 use rustc_middle::ty::error::{ExpectedFound, TypeError};
 use rustc_middle::ty::{
-    self, Binder, Const, GenericArgsRef, TypeVisitable, TypeVisitableExt, TypingMode,
-    may_use_unstable_feature,
+    self, Binder, Const, DelayedSet, GenericArgsRef, Ty, TyCtxt, TypeSuperVisitable, TypeVisitable,
+    TypeVisitableExt, TypeVisitor, TypingMode, may_use_unstable_feature,
 };
-use rustc_span::DUMMY_SP;
 use thin_vec::{ThinVec, thin_vec};
 use tracing::{debug, debug_span, instrument};
 
@@ -29,7 +29,6 @@ use super::{
 };
 use crate::error_reporting::InferCtxtErrorExt;
 use crate::infer::{InferCtxt, TyOrConstInferVar};
-use crate::solve::StalledOnCoroutines;
 use crate::traits::normalize::normalize_with_depth_to;
 use crate::traits::project::{PolyProjectionObligation, ProjectionCacheKeyExt as _};
 use crate::traits::query::evaluate_obligation::InferCtxtExt;
@@ -172,7 +171,7 @@ where
         &mut self,
         infcx: &InferCtxt<'tcx>,
     ) -> PredicateObligations<'tcx> {
-        let stalled_coroutines = match infcx.typing_mode() {
+        let stalled_coroutines = match infcx.typing_mode_raw().assert_not_erased() {
             TypingMode::Analysis { defining_opaque_types_and_generators } => {
                 defining_opaque_types_and_generators
             }
@@ -207,11 +206,37 @@ where
             type OUT = Outcome<Self::Obligation, Self::Error>;
 
             fn needs_process_obligation(&self, pending_obligation: &Self::Obligation) -> bool {
+                struct StalledOnCoroutines<'tcx> {
+                    pub stalled_coroutines: &'tcx ty::List<LocalDefId>,
+                    pub cache: DelayedSet<Ty<'tcx>>,
+                }
+
+                impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for StalledOnCoroutines<'tcx> {
+                    type Result = ControlFlow<()>;
+
+                    fn visit_ty(&mut self, ty: Ty<'tcx>) -> Self::Result {
+                        if !self.cache.insert(ty) {
+                            return ControlFlow::Continue(());
+                        }
+
+                        if let ty::Coroutine(def_id, _) = ty.kind()
+                            && def_id
+                                .as_local()
+                                .is_some_and(|def_id| self.stalled_coroutines.contains(&def_id))
+                        {
+                            ControlFlow::Break(())
+                        } else if ty.has_coroutines() {
+                            ty.super_visit_with(self)
+                        } else {
+                            ControlFlow::Continue(())
+                        }
+                    }
+                }
+
                 self.infcx
                     .resolve_vars_if_possible(pending_obligation.obligation.predicate)
                     .visit_with(&mut StalledOnCoroutines {
                         stalled_coroutines: self.stalled_coroutines,
-                        span: DUMMY_SP,
                         cache: Default::default(),
                     })
                     .is_break()
@@ -300,6 +325,10 @@ impl<'a, 'tcx> ObligationProcessor for FulfillProcessor<'a, 'tcx> {
     /// compile-time benchmarks are very sensitive to even small changes.
     #[inline(always)]
     fn needs_process_obligation(&self, pending_obligation: &Self::Obligation) -> bool {
+        if self.selcx.infcx.disable_trait_solver_fast_paths() {
+            return true;
+        }
+
         // If we were stalled on some unresolved variables, first check whether
         // any of them have been resolved; if not, don't bother doing more work
         // yet.
@@ -363,7 +392,9 @@ impl<'a, 'tcx> ObligationProcessor for FulfillProcessor<'a, 'tcx> {
 
         let infcx = self.selcx.infcx;
 
-        if sizedness_fast_path(infcx.tcx, obligation.predicate, obligation.param_env) {
+        if !infcx.disable_trait_solver_fast_paths()
+            && sizedness_fast_path(infcx.tcx, obligation.predicate, obligation.param_env)
+        {
             return ProcessResult::Changed(thin_vec![]);
         }
 
@@ -433,7 +464,7 @@ impl<'a, 'tcx> ObligationProcessor for FulfillProcessor<'a, 'tcx> {
                     bug!("AliasRelate is only used by the new solver")
                 }
                 ty::PredicateKind::Clause(ty::ClauseKind::UnstableFeature(_)) => {
-                   unreachable!("unexpected higher ranked `UnstableFeature` goal")
+                    unreachable!("unexpected higher ranked `UnstableFeature` goal")
                 }
             },
             Some(pred) => match pred {
@@ -459,7 +490,11 @@ impl<'a, 'tcx> ObligationProcessor for FulfillProcessor<'a, 'tcx> {
 
                 ty::PredicateKind::Clause(ty::ClauseKind::RegionOutlives(data)) => {
                     if infcx.considering_regions {
-                        infcx.register_region_outlives_constraint(data, &obligation.cause);
+                        infcx.register_region_outlives_constraint(
+                            data,
+                            ty::VisibleForLeakCheck::Yes,
+                            &obligation.cause,
+                        );
                     }
 
                     ProcessResult::Changed(Default::default())
@@ -523,9 +558,11 @@ impl<'a, 'tcx> ObligationProcessor for FulfillProcessor<'a, 'tcx> {
                             return ProcessResult::Changed(PendingPredicateObligations::new());
                         }
                         ty::ConstKind::Value(cv) => cv.ty,
-                        ty::ConstKind::Unevaluated(uv) => {
-                            infcx.tcx.type_of(uv.def).instantiate(infcx.tcx, uv.args)
-                        }
+                        ty::ConstKind::Unevaluated(uv) => infcx
+                            .tcx
+                            .type_of(uv.def)
+                            .instantiate(infcx.tcx, uv.args)
+                            .skip_norm_wip(),
                         // FIXME(generic_const_exprs): we should construct an alias like
                         // `<lhs_ty as Add<rhs_ty>>::Output` when this is an `Expr` representing
                         // `lhs + rhs`.
@@ -697,8 +734,8 @@ impl<'a, 'tcx> ObligationProcessor for FulfillProcessor<'a, 'tcx> {
                                     // `generic_const_exprs`
                                     .eq(
                                         DefineOpaqueTypes::Yes,
-                                        ty::AliasTerm::from(a),
-                                        ty::AliasTerm::from(b),
+                                        ty::AliasTerm::from_unevaluated_const(tcx, a),
+                                        ty::AliasTerm::from_unevaluated_const(tcx, b),
                                     )
                                 {
                                     return ProcessResult::Changed(mk_pending(
@@ -841,7 +878,7 @@ impl<'a, 'tcx> FulfillProcessor<'a, 'tcx> {
         stalled_on: &mut Vec<TyOrConstInferVar>,
     ) -> ProcessResult<PendingPredicateObligation<'tcx>, FulfillmentErrorCode<'tcx>> {
         let infcx = self.selcx.infcx;
-        if obligation.predicate.is_global() && !infcx.typing_mode().is_coherence() {
+        if obligation.predicate.is_global() && !self.selcx.typing_mode().is_coherence() {
             // no type variables present, can use evaluation for better caching.
             // FIXME: consider caching errors too.
             if infcx.predicate_must_hold_considering_regions(obligation) {
@@ -895,7 +932,7 @@ impl<'a, 'tcx> FulfillProcessor<'a, 'tcx> {
     ) -> ProcessResult<PendingPredicateObligation<'tcx>, FulfillmentErrorCode<'tcx>> {
         let tcx = self.selcx.tcx();
         let infcx = self.selcx.infcx;
-        if obligation.predicate.is_global() && !infcx.typing_mode().is_coherence() {
+        if obligation.predicate.is_global() && !self.selcx.typing_mode().is_coherence() {
             // no type variables present, can use evaluation for better caching.
             // FIXME: consider caching errors too.
             if infcx.predicate_must_hold_considering_regions(obligation) {

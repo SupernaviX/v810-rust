@@ -15,6 +15,8 @@ pub(crate) mod wrong_number_of_generic_args;
 mod precise_captures;
 pub(crate) use precise_captures::*;
 
+pub(crate) mod remove_or_use_generic;
+
 #[derive(Diagnostic)]
 #[diag("ambiguous associated {$assoc_kind} `{$assoc_ident}` in bounds of `{$qself}`")]
 pub(crate) struct AmbiguousAssocItem<'a> {
@@ -315,6 +317,16 @@ pub(crate) struct ConstParamTyImplOnNonAdt {
     #[primary_span]
     #[label("type is not a structure or enumeration")]
     pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag("the trait `ConstParamTy` may not be implemented for this type")]
+pub(crate) struct ConstParamTyImplOnNonExhaustive {
+    #[primary_span]
+    #[label("non exhaustive const params are forbidden")]
+    pub defn_span: Span,
+    #[label("caused by this attribute")]
+    pub attr_span: Span,
 }
 
 #[derive(Diagnostic)]
@@ -1349,6 +1361,24 @@ pub(crate) struct CoerceMulti {
 }
 
 #[derive(Diagnostic)]
+#[diag(
+    "implementing `{$trait_name}` requires that a single lifetime parameter is passed between source and target"
+)]
+pub(crate) struct CoerceSharedNotSingleLifetimeParam {
+    #[primary_span]
+    pub span: Span,
+    pub trait_name: &'static str,
+}
+
+#[derive(Diagnostic)]
+#[diag("implementing `{$trait_name}` does not allow multiple lifetimes or fields to be coerced")]
+pub(crate) struct CoerceSharedMulti {
+    #[primary_span]
+    pub span: Span,
+    pub trait_name: &'static str,
+}
+
+#[derive(Diagnostic)]
 #[diag("the trait `{$trait_name}` may only be implemented for a coercion between structures", code = E0377)]
 pub(crate) struct CoerceUnsizedNonStruct {
     #[primary_span]
@@ -1640,6 +1670,14 @@ pub(crate) struct UnsupportedDelegation<'a> {
     pub descr: &'a str,
     #[label("callee defined here")]
     pub callee_span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag("delegation self type is not specified")]
+#[help("consider explicitly specifying self type: `reuse </* Type */ as Trait>::function`")]
+pub(crate) struct DelegationSelfTypeNotSpecified {
+    #[primary_span]
+    pub span: Span,
 }
 
 #[derive(Diagnostic)]
@@ -1957,4 +1995,36 @@ pub(crate) struct EiiDefkindMismatchStaticSafety {
     #[primary_span]
     pub span: Span,
     pub eii_name: Symbol,
+}
+
+#[derive(Diagnostic)]
+#[diag("conflicting implementations of `Drop::drop` and `Drop::pin_drop`")]
+pub(crate) struct ConflictImplDropAndPinDrop {
+    #[primary_span]
+    pub span: Span,
+    #[label("`drop(&mut self)` implemented here")]
+    pub drop_span: Span,
+    #[label("`pin_drop(&pin mut self)` implemented here")]
+    pub pin_drop_span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag("`{$adt_name}` must implement `pin_drop`")]
+#[help("structurally pinned types must keep `Pin`'s safety contract")]
+pub(crate) struct PinV2WithoutPinDrop {
+    #[primary_span]
+    #[suggestion(
+        "implement `pin_drop` instead",
+        code = "fn pin_drop(&pin mut self)",
+        applicability = "maybe-incorrect"
+    )]
+    pub span: Span,
+    #[note("`{$adt_name}` is marked `#[pin_v2]` here")]
+    #[suggestion(
+        "remove the `#[pin_v2]` attribute if it is not intended for structurally pinning",
+        code = "",
+        applicability = "maybe-incorrect"
+    )]
+    pub pin_v2_span: Option<Span>,
+    pub adt_name: Symbol,
 }

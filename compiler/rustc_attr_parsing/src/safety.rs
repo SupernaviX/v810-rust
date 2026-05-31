@@ -1,25 +1,23 @@
 use rustc_ast::Safety;
-use rustc_errors::MultiSpan;
+use rustc_errors::{Diagnostic, MultiSpan};
 use rustc_hir::AttrPath;
-use rustc_hir::lints::AttributeLintKind;
 use rustc_session::lint::LintId;
 use rustc_session::lint::builtin::UNSAFE_ATTR_OUTSIDE_UNSAFE;
 use rustc_span::Span;
 
 use crate::attributes::AttributeSafety;
-use crate::context::Stage;
-use crate::{AttributeParser, ShouldEmit};
+use crate::{AttributeParser, EmitAttribute, ShouldEmit, errors};
 
-impl<'sess, S: Stage> AttributeParser<'sess, S> {
+impl<'sess> AttributeParser<'sess> {
     pub fn check_attribute_safety(
         &mut self,
         attr_path: &AttrPath,
         attr_span: Span,
         attr_safety: Safety,
         expected_safety: AttributeSafety,
-        emit_lint: &mut impl FnMut(LintId, MultiSpan, AttributeLintKind),
+        emit_lint: &mut impl FnMut(LintId, MultiSpan, EmitAttribute),
     ) {
-        if matches!(self.stage.should_emit(), ShouldEmit::Nothing) {
+        if matches!(self.should_emit, ShouldEmit::Nothing) {
             return;
         }
 
@@ -64,27 +62,30 @@ impl<'sess, S: Stage> AttributeParser<'sess, S> {
                 }
 
                 if emit_error {
-                    self.stage.emit_err(
-                        self.sess,
-                        crate::session_diagnostics::UnsafeAttrOutsideUnsafe {
-                            span: path_span,
-                            suggestion: not_from_proc_macro.then(|| {
-                                crate::session_diagnostics::UnsafeAttrOutsideUnsafeSuggestion {
-                                    left: diag_span.shrink_to_lo(),
-                                    right: diag_span.shrink_to_hi(),
-                                }
-                            }),
-                        },
-                    );
+                    self.emit_err(crate::session_diagnostics::UnsafeAttrOutsideUnsafe {
+                        span: path_span,
+                        suggestion: not_from_proc_macro.then(|| {
+                            crate::session_diagnostics::UnsafeAttrOutsideUnsafeSuggestion {
+                                left: diag_span.shrink_to_lo(),
+                                right: diag_span.shrink_to_hi(),
+                            }
+                        }),
+                    });
                 } else {
                     emit_lint(
                         LintId::of(UNSAFE_ATTR_OUTSIDE_UNSAFE),
                         path_span.into(),
-                        AttributeLintKind::UnsafeAttrOutsideUnsafe {
-                            attribute_name_span: path_span,
-                            sugg_spans: not_from_proc_macro
-                                .then(|| (diag_span.shrink_to_lo(), diag_span.shrink_to_hi())),
-                        },
+                        EmitAttribute(Box::new(move |dcx, level, _| {
+                            errors::UnsafeAttrOutsideUnsafeLint {
+                                span: path_span,
+                                suggestion: not_from_proc_macro
+                                    .then(|| (diag_span.shrink_to_lo(), diag_span.shrink_to_hi()))
+                                    .map(|(left, right)| {
+                                        crate::session_diagnostics::UnsafeAttrOutsideUnsafeSuggestion { left, right }
+                                    }),
+                            }
+                            .into_diag(dcx, level)
+                        })),
                     )
                 }
             }
@@ -92,13 +93,10 @@ impl<'sess, S: Stage> AttributeParser<'sess, S> {
             // - Normal builtin attribute
             // - Writing `#[unsafe(..)]` is not permitted on normal builtin attributes
             (AttributeSafety::Normal, Safety::Unsafe(unsafe_span)) => {
-                self.stage.emit_err(
-                    self.sess,
-                    crate::session_diagnostics::InvalidAttrUnsafe {
-                        span: unsafe_span,
-                        name: attr_path.clone(),
-                    },
-                );
+                self.emit_err(crate::session_diagnostics::InvalidAttrUnsafe {
+                    span: unsafe_span,
+                    name: attr_path.clone(),
+                });
             }
 
             // - Normal builtin attribute
