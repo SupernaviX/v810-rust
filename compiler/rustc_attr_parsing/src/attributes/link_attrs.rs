@@ -561,9 +561,9 @@ impl NoArgsAttributeParser for RustcStdInternalSymbolParser {
 }
 
 pub(crate) struct InterruptParser;
-impl<S: Stage> NoArgsAttributeParser<S> for InterruptParser {
+impl NoArgsAttributeParser for InterruptParser {
     const PATH: &[Symbol] = &[sym::interrupt];
-    const ON_DUPLICATE: OnDuplicate<S> = OnDuplicate::Warn;
+    const ON_DUPLICATE: OnDuplicate = OnDuplicate::Warn;
     const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowList(&[Allow(Target::Fn)]);
     const CREATE: fn(Span) -> AttributeKind = AttributeKind::Interrupt;
 }
