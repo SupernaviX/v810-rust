@@ -7,11 +7,12 @@
 use std::fmt::{self, Write};
 use std::hash::Hash;
 
-use rustc_data_structures::stable_hasher::StableHasher;
-use rustc_data_structures::unord::UnordMap;
+use rustc_data_structures::fx::FxHashMap;
+use rustc_data_structures::stable_hash::StableHasher;
 use rustc_hashes::Hash64;
 use rustc_index::IndexVec;
-use rustc_macros::{BlobDecodable, Decodable, Encodable};
+use rustc_macros::{BlobDecodable, Decodable, Encodable, extension};
+use rustc_span::def_id::LocalDefIdMap;
 use rustc_span::{Symbol, kw, sym};
 use tracing::{debug, instrument};
 
@@ -19,132 +20,38 @@ pub use crate::def_id::DefPathHash;
 use crate::def_id::{CRATE_DEF_INDEX, CrateNum, DefIndex, LOCAL_CRATE, LocalDefId, StableCrateId};
 use crate::def_path_hash_map::DefPathHashMap;
 
-/// The `DefPathTable` maps `DefIndex`es to `DefKey`s and vice versa.
-/// Internally the `DefPathTable` holds a tree of `DefKey`s, where each `DefKey`
-/// stores the `DefIndex` of its parent.
-/// There is one `DefPathTable` for each crate.
-#[derive(Debug)]
-pub struct DefPathTable {
-    stable_crate_id: StableCrateId,
-    index_to_key: IndexVec<DefIndex, DefKey>,
-    // We do only store the local hash, as all the definitions are from the current crate.
-    def_path_hashes: IndexVec<DefIndex, Hash64>,
-    def_path_hash_to_index: DefPathHashMap,
-}
-
-impl DefPathTable {
-    fn new(stable_crate_id: StableCrateId) -> DefPathTable {
-        DefPathTable {
-            stable_crate_id,
-            index_to_key: Default::default(),
-            def_path_hashes: Default::default(),
-            def_path_hash_to_index: Default::default(),
-        }
-    }
-
-    fn allocate(&mut self, key: DefKey, def_path_hash: DefPathHash) -> DefIndex {
-        // Assert that all DefPathHashes correctly contain the local crate's StableCrateId.
-        debug_assert_eq!(self.stable_crate_id, def_path_hash.stable_crate_id());
-        let local_hash = def_path_hash.local_hash();
-
-        let index = self.index_to_key.push(key);
-        debug!("DefPathTable::insert() - {key:?} <-> {index:?}");
-
-        self.def_path_hashes.push(local_hash);
-        debug_assert!(self.def_path_hashes.len() == self.index_to_key.len());
-
-        // Check for hash collisions of DefPathHashes. These should be
-        // exceedingly rare.
-        if let Some(existing) = self.def_path_hash_to_index.insert(&local_hash, &index) {
-            let def_path1 = DefPath::make(LOCAL_CRATE, existing, |idx| self.def_key(idx));
-            let def_path2 = DefPath::make(LOCAL_CRATE, index, |idx| self.def_key(idx));
-
-            // Continuing with colliding DefPathHashes can lead to correctness
-            // issues. We must abort compilation.
-            //
-            // The likelihood of such a collision is very small, so actually
-            // running into one could be indicative of a poor hash function
-            // being used.
-            //
-            // See the documentation for DefPathHash for more information.
-            panic!(
-                "found DefPathHash collision between {def_path1:#?} and {def_path2:#?}. \
-                    Compilation cannot continue."
-            );
-        }
-
-        index
-    }
-
-    #[inline(always)]
-    pub fn def_key(&self, index: DefIndex) -> DefKey {
-        self.index_to_key[index]
-    }
-
-    #[instrument(level = "trace", skip(self), ret)]
-    #[inline(always)]
-    pub fn def_path_hash(&self, index: DefIndex) -> DefPathHash {
-        let hash = self.def_path_hashes[index];
-        DefPathHash::new(self.stable_crate_id, hash)
-    }
-
-    pub fn enumerated_keys_and_path_hashes(
-        &self,
-    ) -> impl Iterator<Item = (DefIndex, &DefKey, DefPathHash)> + ExactSizeIterator {
-        self.index_to_key
-            .iter_enumerated()
-            .map(move |(index, key)| (index, key, self.def_path_hash(index)))
-    }
-}
-
-pub trait Disambiguator {
-    fn entry(&mut self, parent: LocalDefId, data: DefPathData) -> &mut u32;
-}
-
 #[derive(Debug, Default, Clone)]
 pub struct PerParentDisambiguatorState {
-    next: UnordMap<DefPathData, u32>,
+    #[cfg(debug_assertions)]
+    parent: Option<LocalDefId>,
+    next: FxHashMap<DefPathData, u32>,
 }
 
-impl Disambiguator for PerParentDisambiguatorState {
-    #[inline]
-    fn entry(&mut self, _: LocalDefId, data: DefPathData) -> &mut u32 {
-        self.next.entry(data).or_insert(0)
+impl PerParentDisambiguatorState {
+    #[inline(always)]
+    pub fn new(_parent: LocalDefId) -> PerParentDisambiguatorState {
+        PerParentDisambiguatorState {
+            #[cfg(debug_assertions)]
+            parent: Some(_parent),
+            next: Default::default(),
+        }
     }
 }
 
-#[derive(Debug, Default, Clone)]
-pub struct DisambiguatorState {
-    next: UnordMap<(LocalDefId, DefPathData), u32>,
-}
-
-impl Disambiguator for DisambiguatorState {
-    #[inline]
-    fn entry(&mut self, parent: LocalDefId, data: DefPathData) -> &mut u32 {
-        self.next.entry((parent, data)).or_insert(0)
+#[extension(pub trait PerParentDisambiguatorsMap)]
+impl LocalDefIdMap<PerParentDisambiguatorState> {
+    fn get_or_create(&mut self, parent: LocalDefId) -> &mut PerParentDisambiguatorState {
+        self.entry(parent).or_insert_with(|| PerParentDisambiguatorState::new(parent))
     }
 }
 
-impl DisambiguatorState {
-    pub const fn new() -> Self {
-        Self { next: Default::default() }
-    }
-
-    /// Creates a `DisambiguatorState` where the next allocated `(LocalDefId, DefPathData)` pair
-    /// will have `index` as the disambiguator.
-    pub fn with(def_id: LocalDefId, data: DefPathData, index: u32) -> Self {
-        let mut this = Self::new();
-        this.next.insert((def_id, data), index);
-        this
-    }
-}
-
-/// The definition table containing node definitions.
-/// It holds the `DefPathTable` for `LocalDefId`s/`DefPath`s.
-/// It also stores mappings to convert `LocalDefId`s to/from `HirId`s.
 #[derive(Debug)]
 pub struct Definitions {
-    table: DefPathTable,
+    stable_crate_id: StableCrateId,
+    def_id_to_key: IndexVec<LocalDefId, DefKey>,
+    // We do only store the local hash, as all the definitions are from the current crate.
+    def_path_hashes: IndexVec<LocalDefId, Hash64>,
+    def_path_hash_to_index: DefPathHashMap,
 }
 
 /// A unique identifier that we can use to lookup a definition
@@ -183,7 +90,7 @@ impl DefKey {
         // Construct the new DefPathHash, making sure that the `crate_id`
         // portion of the hash is properly copied from the parent. This way the
         // `crate_id` part will be recursively propagated from the root to all
-        // DefPathHashes in this DefPathTable.
+        // DefPathHashes in this Definitions.
         DefPathHash::new(parent.stable_crate_id(), local_hash)
     }
 
@@ -340,23 +247,15 @@ pub enum DefPathData {
 }
 
 impl Definitions {
-    pub fn def_path_table(&self) -> &DefPathTable {
-        &self.table
-    }
-
-    /// Gets the number of definitions.
-    pub fn def_index_count(&self) -> usize {
-        self.table.index_to_key.len()
-    }
-
-    #[inline]
+    #[inline(always)]
     pub fn def_key(&self, id: LocalDefId) -> DefKey {
-        self.table.def_key(id.local_def_index)
+        self.def_id_to_key[id]
     }
 
+    #[instrument(level = "trace", skip(self), ret)]
     #[inline(always)]
     pub fn def_path_hash(&self, id: LocalDefId) -> DefPathHash {
-        self.table.def_path_hash(id.local_def_index)
+        DefPathHash::new(self.stable_crate_id, self.def_path_hashes[id])
     }
 
     /// Returns the path from the crate root to `index`. The root
@@ -364,6 +263,7 @@ impl Definitions {
     /// empty vector for the crate root). For an inlined item, this
     /// will be the path of the item in the external crate (but the
     /// path will begin with the path to the external crate).
+    #[inline]
     pub fn def_path(&self, id: LocalDefId) -> DefPath {
         DefPath::make(LOCAL_CRATE, id.local_def_index, |index| {
             self.def_key(LocalDefId { local_def_index: index })
@@ -391,12 +291,62 @@ impl Definitions {
         let def_path_hash =
             DefPathHash::new(stable_crate_id, Hash64::new(stable_crate_id.as_u64()));
 
+        let mut defs = Definitions {
+            stable_crate_id,
+            def_path_hashes: Default::default(),
+            def_id_to_key: Default::default(),
+            def_path_hash_to_index: Default::default(),
+        };
+
         // Create the root definition.
-        let mut table = DefPathTable::new(stable_crate_id);
-        let root = LocalDefId { local_def_index: table.allocate(key, def_path_hash) };
+        let root = defs.allocate(key, def_path_hash);
         assert_eq!(root.local_def_index, CRATE_DEF_INDEX);
 
-        Definitions { table }
+        defs
+    }
+
+    fn allocate(&mut self, key: DefKey, def_path_hash: DefPathHash) -> LocalDefId {
+        // Assert that all DefPathHashes correctly contain the local crate's StableCrateId.
+        debug_assert_eq!(self.stable_crate_id, def_path_hash.stable_crate_id());
+        let local_hash = def_path_hash.local_hash();
+
+        let def_id = self.def_id_to_key.push(key);
+        debug!("def_id_to_key.push() - {key:?} <-> {:?}", def_id.local_def_index);
+
+        self.def_path_hashes.push(local_hash);
+        debug_assert!(self.def_path_hashes.len() == self.def_id_to_key.len());
+
+        // Check for hash collisions of DefPathHashes. These should be
+        // exceedingly rare.
+        if let Some(existing) =
+            self.def_path_hash_to_index.insert(&local_hash, &def_id.local_def_index)
+        {
+            let def_path1 = self.def_path(LocalDefId { local_def_index: existing });
+            let def_path2 = self.def_path(def_id);
+
+            // Continuing with colliding DefPathHashes can lead to correctness
+            // issues. We must abort compilation.
+            //
+            // The likelihood of such a collision is very small, so actually
+            // running into one could be indicative of a poor hash function
+            // being used.
+            //
+            // See the documentation for DefPathHash for more information.
+            panic!(
+                "found DefPathHash collision between {def_path1:#?} and {def_path2:#?}. \
+                    Compilation cannot continue."
+            );
+        }
+
+        def_id
+    }
+
+    pub fn enumerated_keys_and_path_hashes(
+        &self,
+    ) -> impl Iterator<Item = (DefIndex, &DefKey, DefPathHash)> + ExactSizeIterator {
+        self.def_id_to_key
+            .iter_enumerated()
+            .map(move |(def_id, key)| (def_id.local_def_index, key, self.def_path_hash(def_id)))
     }
 
     /// Creates a definition with a parent definition.
@@ -408,7 +358,7 @@ impl Definitions {
         &mut self,
         parent: LocalDefId,
         data: DefPathData,
-        disambiguator: &mut impl Disambiguator,
+        disambiguator: &mut PerParentDisambiguatorState,
     ) -> LocalDefId {
         // We can't use `Debug` implementation for `LocalDefId` here, since it tries to acquire a
         // reference to `Definitions` and we're already holding a mutable reference.
@@ -422,7 +372,14 @@ impl Definitions {
 
         // Find the next free disambiguator for this key.
         let disambiguator = {
-            let next_disamb = disambiguator.entry(parent, data);
+            #[cfg(debug_assertions)]
+            debug_assert_eq!(
+                parent,
+                disambiguator.parent.expect("must be set"),
+                "provided parent and parent in disambiguator must be the same"
+            );
+
+            let next_disamb = disambiguator.next.entry(data).or_insert(0);
             let disambiguator = *next_disamb;
             *next_disamb = next_disamb.checked_add(1).expect("disambiguator overflow");
             disambiguator
@@ -432,13 +389,13 @@ impl Definitions {
             disambiguated_data: DisambiguatedDefPathData { data, disambiguator },
         };
 
-        let parent_hash = self.table.def_path_hash(parent.local_def_index);
+        let parent_hash = self.def_path_hash(parent);
         let def_path_hash = key.compute_stable_hash(parent_hash);
 
         debug!("create_def: after disambiguation, key = {:?}", key);
 
         // Create the definition.
-        LocalDefId { local_def_index: self.table.allocate(key, def_path_hash) }
+        self.allocate(key, def_path_hash)
     }
 
     #[inline(always)]
@@ -448,19 +405,18 @@ impl Definitions {
     /// if the `DefPathHash` is from a previous compilation session and
     /// the def-path does not exist anymore.
     pub fn local_def_path_hash_to_def_id(&self, hash: DefPathHash) -> Option<LocalDefId> {
-        debug_assert!(hash.stable_crate_id() == self.table.stable_crate_id);
-        self.table
-            .def_path_hash_to_index
+        debug_assert!(hash.stable_crate_id() == self.stable_crate_id);
+        self.def_path_hash_to_index
             .get(&hash.local_hash())
             .map(|local_def_index| LocalDefId { local_def_index })
     }
 
     pub fn def_path_hash_to_def_index_map(&self) -> &DefPathHashMap {
-        &self.table.def_path_hash_to_index
+        &self.def_path_hash_to_index
     }
 
     pub fn num_definitions(&self) -> usize {
-        self.table.def_path_hashes.len()
+        self.def_path_hashes.len()
     }
 }
 

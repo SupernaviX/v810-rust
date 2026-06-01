@@ -1,60 +1,54 @@
 use rustc_abi::{Align, Size};
 use rustc_ast::{IntTy, LitIntType, LitKind, UintTy};
-use rustc_hir::attrs::{IntType, ReprAttr};
+use rustc_hir::attrs::IntType::{SignedInt, UnsignedInt};
+use rustc_hir::attrs::ReprAttr;
 
 use super::prelude::*;
-use crate::session_diagnostics::{self, IncorrectReprFormatGenericCause};
+use crate::session_diagnostics;
 
 /// Parse #[repr(...)] forms.
 ///
-/// Valid repr contents: any of the primitive integral type names (see
-/// `int_type_of_word`, below) to specify enum discriminant type; `C`, to use
-/// the same discriminant size that the corresponding C enum would or C
-/// structure layout, `packed` to remove padding, and `transparent` to delegate representation
-/// concerns to the only non-ZST field.
-// FIXME(jdonszelmann): is a vec the right representation here even? isn't it just a struct?
+/// Valid repr contents:
+/// * any of the primitive integral type names to specify enum discriminant type
+/// * `Rust`, to use the default `Rust` layout of the type
+/// * `C`, to use the same layout for the type that C would use
+/// * `align(...)`, to change the alignment requirements of the type
+/// * `packed`, to remove padding
+/// * `transparent`, to delegate representation concerns to the only non-ZST field.
 pub(crate) struct ReprParser;
 
-impl<S: Stage> CombineAttributeParser<S> for ReprParser {
+impl CombineAttributeParser for ReprParser {
     type Item = (ReprAttr, Span);
     const PATH: &[Symbol] = &[sym::repr];
     const CONVERT: ConvertFn<Self::Item> =
         |items, first_span| AttributeKind::Repr { reprs: items, first_span };
-    // FIXME(jdonszelmann): never used
     const TEMPLATE: AttributeTemplate = template!(
         List: &["C", "Rust", "transparent", "align(...)", "packed(...)", "<integer type>"],
         "https://doc.rust-lang.org/reference/type-layout.html#representations"
     );
 
     fn extend(
-        cx: &mut AcceptContext<'_, '_, S>,
+        cx: &mut AcceptContext<'_, '_>,
         args: &ArgParser,
     ) -> impl IntoIterator<Item = Self::Item> {
-        let mut reprs = Vec::new();
-
-        let Some(list) = args.list() else {
-            let attr_span = cx.attr_span;
-            cx.adcx().expected_list(attr_span, args);
-            return reprs;
+        let Some(list) = cx.expect_list(args, cx.attr_span) else {
+            return vec![];
         };
 
         if list.is_empty() {
             let attr_span = cx.attr_span;
             cx.adcx().warn_empty_attribute(attr_span);
-            return reprs;
+            return vec![];
         }
 
+        let mut reprs = Vec::new();
         for param in list.mixed() {
-            if let Some(_) = param.lit() {
-                cx.emit_err(session_diagnostics::ReprIdent { span: cx.attr_span });
+            let Some(item) = param.meta_item() else {
+                cx.adcx().expected_identifier(param.span());
                 continue;
-            }
-
-            reprs.extend(
-                param.meta_item().and_then(|mi| parse_repr(cx, &mi)).map(|r| (r, param.span())),
-            );
+            };
+            reprs.extend(parse_repr(cx, &item).map(|r| (r, param.span())));
         }
-
         reprs
     }
 
@@ -63,122 +57,69 @@ impl<S: Stage> CombineAttributeParser<S> for ReprParser {
     const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowList(ALL_TARGETS);
 }
 
-macro_rules! int_pat {
-    () => {
-        sym::i8
-            | sym::u8
-            | sym::i16
-            | sym::u16
-            | sym::i32
-            | sym::u32
-            | sym::i64
-            | sym::u64
-            | sym::i128
-            | sym::u128
-            | sym::isize
-            | sym::usize
-    };
-}
-
-fn int_type_of_word(s: Symbol) -> Option<IntType> {
-    use IntType::*;
-
-    match s {
-        sym::i8 => Some(SignedInt(IntTy::I8)),
-        sym::u8 => Some(UnsignedInt(UintTy::U8)),
-        sym::i16 => Some(SignedInt(IntTy::I16)),
-        sym::u16 => Some(UnsignedInt(UintTy::U16)),
-        sym::i32 => Some(SignedInt(IntTy::I32)),
-        sym::u32 => Some(UnsignedInt(UintTy::U32)),
-        sym::i64 => Some(SignedInt(IntTy::I64)),
-        sym::u64 => Some(UnsignedInt(UintTy::U64)),
-        sym::i128 => Some(SignedInt(IntTy::I128)),
-        sym::u128 => Some(UnsignedInt(UintTy::U128)),
-        sym::isize => Some(SignedInt(IntTy::Isize)),
-        sym::usize => Some(UnsignedInt(UintTy::Usize)),
-        _ => None,
-    }
-}
-
-fn parse_repr<S: Stage>(cx: &AcceptContext<'_, '_, S>, param: &MetaItemParser) -> Option<ReprAttr> {
+fn parse_repr(cx: &mut AcceptContext<'_, '_>, param: &MetaItemParser) -> Option<ReprAttr> {
     use ReprAttr::*;
 
-    // FIXME(jdonszelmann): invert the parsing here to match on the word first and then the
-    // structure.
-    let (name, ident_span) = if let Some(ident) = param.path().word() {
-        (Some(ident.name), ident.span)
-    } else {
-        (None, DUMMY_SP)
-    };
+    macro_rules! no_args {
+        ($constructor: expr) => {{
+            cx.expect_no_args(param.args())?;
+            Some($constructor)
+        }};
+    }
 
-    let args = param.args();
-
-    match (name, args) {
-        (Some(sym::align), ArgParser::NoArgs) => {
-            cx.emit_err(session_diagnostics::InvalidReprAlignNeedArg { span: ident_span });
-            None
+    match param.path().word_sym() {
+        Some(sym::align) => {
+            let l = cx.expect_list(param.args(), param.span())?;
+            parse_repr_align(cx, l, AlignKind::Align)
         }
-        (Some(sym::align), ArgParser::List(l)) => {
-            parse_repr_align(cx, l, param.span(), AlignKind::Align)
-        }
-
-        (Some(sym::packed), ArgParser::NoArgs) => Some(ReprPacked(Align::ONE)),
-        (Some(sym::packed), ArgParser::List(l)) => {
-            parse_repr_align(cx, l, param.span(), AlignKind::Packed)
-        }
-
-        (Some(name @ sym::align | name @ sym::packed), ArgParser::NameValue(l)) => {
-            cx.emit_err(session_diagnostics::IncorrectReprFormatGeneric {
-                span: param.span(),
-                // FIXME(jdonszelmann) can just be a string in the diag type
-                repr_arg: name,
-                cause: IncorrectReprFormatGenericCause::from_lit_kind(
-                    param.span(),
-                    &l.value_as_lit().kind,
-                    name,
-                ),
-            });
-            None
-        }
-
-        (Some(sym::Rust), ArgParser::NoArgs) => Some(ReprRust),
-        (Some(sym::C), ArgParser::NoArgs) => Some(ReprC),
-        (Some(sym::simd), ArgParser::NoArgs) => Some(ReprSimd),
-        (Some(sym::transparent), ArgParser::NoArgs) => Some(ReprTransparent),
-        (Some(name @ int_pat!()), ArgParser::NoArgs) => {
-            // int_pat!() should make sure it always parses
-            Some(ReprInt(int_type_of_word(name).unwrap()))
-        }
-
-        (
-            Some(
-                name @ sym::Rust
-                | name @ sym::C
-                | name @ sym::simd
-                | name @ sym::transparent
-                | name @ int_pat!(),
-            ),
-            ArgParser::NameValue(_),
-        ) => {
-            cx.emit_err(session_diagnostics::InvalidReprHintNoValue { span: param.span(), name });
-            None
-        }
-        (
-            Some(
-                name @ sym::Rust
-                | name @ sym::C
-                | name @ sym::simd
-                | name @ sym::transparent
-                | name @ int_pat!(),
-            ),
-            ArgParser::List(_),
-        ) => {
-            cx.emit_err(session_diagnostics::InvalidReprHintNoParen { span: param.span(), name });
-            None
-        }
-
+        Some(sym::packed) => match param.args() {
+            ArgParser::NoArgs => Some(ReprPacked(Align::ONE)),
+            ArgParser::List(l) => parse_repr_align(cx, l, AlignKind::Packed),
+            ArgParser::NameValue(_) => {
+                cx.adcx().expected_list_or_no_args(param.span());
+                None
+            }
+        },
+        Some(sym::Rust) => no_args!(ReprRust),
+        Some(sym::C) => no_args!(ReprC),
+        Some(sym::simd) => no_args!(ReprSimd),
+        Some(sym::transparent) => no_args!(ReprTransparent),
+        Some(sym::i8) => no_args!(ReprInt(SignedInt(IntTy::I8))),
+        Some(sym::u8) => no_args!(ReprInt(UnsignedInt(UintTy::U8))),
+        Some(sym::i16) => no_args!(ReprInt(SignedInt(IntTy::I16))),
+        Some(sym::u16) => no_args!(ReprInt(UnsignedInt(UintTy::U16))),
+        Some(sym::i32) => no_args!(ReprInt(SignedInt(IntTy::I32))),
+        Some(sym::u32) => no_args!(ReprInt(UnsignedInt(UintTy::U32))),
+        Some(sym::i64) => no_args!(ReprInt(SignedInt(IntTy::I64))),
+        Some(sym::u64) => no_args!(ReprInt(UnsignedInt(UintTy::U64))),
+        Some(sym::i128) => no_args!(ReprInt(SignedInt(IntTy::I128))),
+        Some(sym::u128) => no_args!(ReprInt(UnsignedInt(UintTy::U128))),
+        Some(sym::isize) => no_args!(ReprInt(SignedInt(IntTy::Isize))),
+        Some(sym::usize) => no_args!(ReprInt(UnsignedInt(UintTy::Usize))),
         _ => {
-            cx.emit_err(session_diagnostics::UnrecognizedReprHint { span: param.span() });
+            cx.adcx().expected_specific_argument(
+                param.span(),
+                &[
+                    sym::align,
+                    sym::packed,
+                    sym::Rust,
+                    sym::C,
+                    sym::simd,
+                    sym::transparent,
+                    sym::i8,
+                    sym::u8,
+                    sym::i16,
+                    sym::u16,
+                    sym::i32,
+                    sym::u32,
+                    sym::i64,
+                    sym::u64,
+                    sym::i128,
+                    sym::u128,
+                    sym::isize,
+                    sym::usize,
+                ],
+            );
             None
         }
     }
@@ -189,45 +130,18 @@ enum AlignKind {
     Align,
 }
 
-fn parse_repr_align<S: Stage>(
-    cx: &AcceptContext<'_, '_, S>,
+fn parse_repr_align(
+    cx: &mut AcceptContext<'_, '_>,
     list: &MetaItemListParser,
-    param_span: Span,
     align_kind: AlignKind,
 ) -> Option<ReprAttr> {
-    use AlignKind::*;
-
-    let Some(align) = list.single() else {
-        match align_kind {
-            Packed => {
-                cx.emit_err(session_diagnostics::IncorrectReprFormatPackedOneOrZeroArg {
-                    span: param_span,
-                });
-            }
-            Align => {
-                cx.emit_err(session_diagnostics::IncorrectReprFormatAlignOneArg {
-                    span: param_span,
-                });
-            }
-        }
-
+    let Some(align) = list.as_single() else {
+        cx.adcx().expected_single_argument(list.span, list.len());
         return None;
     };
 
-    let Some(lit) = align.lit() else {
-        match align_kind {
-            Packed => {
-                cx.emit_err(session_diagnostics::IncorrectReprFormatPackedExpectInteger {
-                    span: align.span(),
-                });
-            }
-            Align => {
-                cx.emit_err(session_diagnostics::IncorrectReprFormatExpectInteger {
-                    span: align.span(),
-                });
-            }
-        }
-
+    let Some(lit) = align.as_lit() else {
+        cx.adcx().expected_integer_literal(align.span());
         return None;
     };
 
@@ -237,12 +151,8 @@ fn parse_repr_align<S: Stage>(
             AlignKind::Align => ReprAttr::ReprAlign(literal),
         }),
         Err(message) => {
-            cx.emit_err(session_diagnostics::InvalidReprGeneric {
+            cx.emit_err(session_diagnostics::InvalidAlignmentValue {
                 span: lit.span,
-                repr_arg: match align_kind {
-                    Packed => "packed".to_string(),
-                    Align => "align".to_string(),
-                },
                 error_part: message,
             });
             None
@@ -250,10 +160,7 @@ fn parse_repr_align<S: Stage>(
     }
 }
 
-fn parse_alignment<S: Stage>(
-    node: &LitKind,
-    cx: &AcceptContext<'_, '_, S>,
-) -> Result<Align, String> {
+fn parse_alignment(node: &LitKind, cx: &AcceptContext<'_, '_>) -> Result<Align, String> {
     let LitKind::Int(literal, LitIntType::Unsuffixed) = node else {
         return Err("not an unsuffixed integer".to_string());
     };
@@ -289,42 +196,34 @@ impl RustcAlignParser {
     const PATH: &[Symbol] = &[sym::rustc_align];
     const TEMPLATE: AttributeTemplate = template!(List: &["<alignment in bytes>"]);
 
-    fn parse<S: Stage>(&mut self, cx: &mut AcceptContext<'_, '_, S>, args: &ArgParser) {
-        match args {
-            ArgParser::NoArgs | ArgParser::NameValue(_) => {
-                let attr_span = cx.attr_span;
-                cx.adcx().expected_list(attr_span, args);
-            }
-            ArgParser::List(list) => {
-                let Some(align) = list.single() else {
-                    cx.adcx().expected_single_argument(list.span, list.len());
-                    return;
-                };
+    fn parse(&mut self, cx: &mut AcceptContext<'_, '_>, args: &ArgParser) {
+        let Some(list) = cx.expect_list(args, cx.attr_span) else {
+            return;
+        };
 
-                let Some(lit) = align.lit() else {
-                    cx.emit_err(session_diagnostics::IncorrectReprFormatExpectInteger {
-                        span: align.span(),
-                    });
+        let Some(align) = cx.expect_single(list) else {
+            return;
+        };
 
-                    return;
-                };
+        let Some(lit) = align.as_lit() else {
+            cx.adcx().expected_integer_literal(align.span());
+            return;
+        };
 
-                match parse_alignment(&lit.kind, cx) {
-                    Ok(literal) => self.0 = Ord::max(self.0, Some((literal, cx.attr_span))),
-                    Err(message) => {
-                        cx.emit_err(session_diagnostics::InvalidAlignmentValue {
-                            span: lit.span,
-                            error_part: message,
-                        });
-                    }
-                }
+        match parse_alignment(&lit.kind, cx) {
+            Ok(literal) => self.0 = Ord::max(self.0, Some((literal, cx.attr_span))),
+            Err(message) => {
+                cx.emit_err(session_diagnostics::InvalidAlignmentValue {
+                    span: lit.span,
+                    error_part: message,
+                });
             }
         }
     }
 }
 
-impl<S: Stage> AttributeParser<S> for RustcAlignParser {
-    const ATTRIBUTES: AcceptMapping<Self, S> = &[(Self::PATH, Self::TEMPLATE, Self::parse)];
+impl AttributeParser for RustcAlignParser {
+    const ATTRIBUTES: AcceptMapping<Self> = &[(Self::PATH, Self::TEMPLATE, Self::parse)];
     const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowList(&[
         Allow(Target::Fn),
         Allow(Target::Method(MethodKind::Inherent)),
@@ -334,7 +233,7 @@ impl<S: Stage> AttributeParser<S> for RustcAlignParser {
         Allow(Target::ForeignFn),
     ]);
 
-    fn finalize(self, _cx: &FinalizeContext<'_, '_, S>) -> Option<AttributeKind> {
+    fn finalize(self, _cx: &FinalizeContext<'_, '_>) -> Option<AttributeKind> {
         let (align, span) = self.0?;
         Some(AttributeKind::RustcAlign { align, span })
     }
@@ -347,17 +246,17 @@ impl RustcAlignStaticParser {
     const PATH: &[Symbol] = &[sym::rustc_align_static];
     const TEMPLATE: AttributeTemplate = RustcAlignParser::TEMPLATE;
 
-    fn parse<S: Stage>(&mut self, cx: &mut AcceptContext<'_, '_, S>, args: &ArgParser) {
+    fn parse(&mut self, cx: &mut AcceptContext<'_, '_>, args: &ArgParser) {
         self.0.parse(cx, args)
     }
 }
 
-impl<S: Stage> AttributeParser<S> for RustcAlignStaticParser {
-    const ATTRIBUTES: AcceptMapping<Self, S> = &[(Self::PATH, Self::TEMPLATE, Self::parse)];
+impl AttributeParser for RustcAlignStaticParser {
+    const ATTRIBUTES: AcceptMapping<Self> = &[(Self::PATH, Self::TEMPLATE, Self::parse)];
     const ALLOWED_TARGETS: AllowedTargets =
         AllowedTargets::AllowList(&[Allow(Target::Static), Allow(Target::ForeignStatic)]);
 
-    fn finalize(self, _cx: &FinalizeContext<'_, '_, S>) -> Option<AttributeKind> {
+    fn finalize(self, _cx: &FinalizeContext<'_, '_>) -> Option<AttributeKind> {
         let (align, span) = self.0.0?;
         Some(AttributeKind::RustcAlign { align, span })
     }

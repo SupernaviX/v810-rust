@@ -116,6 +116,7 @@ impl Target {
         forward!(asm_args);
         forward!(cpu);
         forward!(need_explicit_cpu);
+        forward!(unsupported_cpus);
         forward!(features);
         forward!(dynamic_linking);
         forward_opt!(direct_access_external_data);
@@ -152,7 +153,6 @@ impl Target {
         forward!(is_like_vexos);
         forward!(binary_format);
         forward!(default_dwarf_version);
-        forward!(allows_weak_linkage);
         forward!(has_rpath);
         forward!(no_default_libraries);
         forward!(position_independent_executables);
@@ -320,6 +320,7 @@ impl ToJson for Target {
         target_option_val!(asm_args);
         target_option_val!(cpu);
         target_option_val!(need_explicit_cpu);
+        target_option_val!(unsupported_cpus);
         target_option_val!(features);
         target_option_val!(dynamic_linking);
         target_option_val!(direct_access_external_data);
@@ -350,7 +351,6 @@ impl ToJson for Target {
         target_option_val!(is_like_vexos);
         target_option_val!(binary_format);
         target_option_val!(default_dwarf_version);
-        target_option_val!(allows_weak_linkage);
         target_option_val!(has_rpath);
         target_option_val!(no_default_libraries);
         target_option_val!(position_independent_executables);
@@ -543,6 +543,7 @@ struct TargetSpecJson {
     asm_args: Option<StaticCow<[StaticCow<str>]>>,
     cpu: Option<StaticCow<str>>,
     need_explicit_cpu: Option<bool>,
+    unsupported_cpus: Option<StaticCow<[StaticCow<str>]>>,
     features: Option<StaticCow<str>>,
     dynamic_linking: Option<bool>,
     direct_access_external_data: Option<bool>,
@@ -572,7 +573,6 @@ struct TargetSpecJson {
     is_like_vexos: Option<bool>,
     binary_format: Option<BinaryFormat>,
     default_dwarf_version: Option<u32>,
-    allows_weak_linkage: Option<bool>,
     has_rpath: Option<bool>,
     no_default_libraries: Option<bool>,
     position_independent_executables: Option<bool>,

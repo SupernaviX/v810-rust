@@ -120,6 +120,7 @@ pub enum SyntaxKind {
     CFG_KW,
     CLOBBER_ABI_KW,
     DEFAULT_KW,
+    DEREF_KW,
     DYN_KW,
     FORMAT_ARGS_KW,
     GEN_KW,
@@ -198,6 +199,7 @@ pub enum SyntaxKind {
     CONST_BLOCK_PAT,
     CONST_PARAM,
     CONTINUE_EXPR,
+    DEREF_PAT,
     DYN_TRAIT_TYPE,
     ENUM,
     EXPR_STMT,
@@ -218,6 +220,7 @@ pub enum SyntaxKind {
     IDENT_PAT,
     IF_EXPR,
     IMPL,
+    IMPL_RESTRICTION,
     IMPL_TRAIT_TYPE,
     INDEX_EXPR,
     INFER_TYPE,
@@ -247,6 +250,7 @@ pub enum SyntaxKind {
     MATCH_GUARD,
     METHOD_CALL_EXPR,
     MODULE,
+    MUT_RESTRICTION,
     NAME,
     NAME_REF,
     NEVER_TYPE,
@@ -318,6 +322,7 @@ pub enum SyntaxKind {
     VARIANT,
     VARIANT_LIST,
     VISIBILITY,
+    VISIBILITY_INNER,
     WHERE_CLAUSE,
     WHERE_PRED,
     WHILE_EXPR,
@@ -379,6 +384,7 @@ impl SyntaxKind {
             | CONST_BLOCK_PAT
             | CONST_PARAM
             | CONTINUE_EXPR
+            | DEREF_PAT
             | DYN_TRAIT_TYPE
             | ENUM
             | EXPR_STMT
@@ -399,6 +405,7 @@ impl SyntaxKind {
             | IDENT_PAT
             | IF_EXPR
             | IMPL
+            | IMPL_RESTRICTION
             | IMPL_TRAIT_TYPE
             | INDEX_EXPR
             | INFER_TYPE
@@ -428,6 +435,7 @@ impl SyntaxKind {
             | MATCH_GUARD
             | METHOD_CALL_EXPR
             | MODULE
+            | MUT_RESTRICTION
             | NAME
             | NAME_REF
             | NEVER_TYPE
@@ -499,6 +507,7 @@ impl SyntaxKind {
             | VARIANT
             | VARIANT_LIST
             | VISIBILITY
+            | VISIBILITY_INNER
             | WHERE_CLAUSE
             | WHERE_PRED
             | WHILE_EXPR
@@ -621,6 +630,7 @@ impl SyntaxKind {
             CFG_ATTR_KW => "cfg_attr",
             CLOBBER_ABI_KW => "clobber_abi",
             DEFAULT_KW => "default",
+            DEREF_KW => "deref",
             DYN_KW => "dyn",
             FORMAT_ARGS_KW => "format_args",
             GLOBAL_ASM_KW => "global_asm",
@@ -726,6 +736,7 @@ impl SyntaxKind {
             CFG_ATTR_KW => true,
             CLOBBER_ABI_KW => true,
             DEFAULT_KW => true,
+            DEREF_KW => true,
             DYN_KW if edition < Edition::Edition2018 => true,
             FORMAT_ARGS_KW => true,
             GLOBAL_ASM_KW => true,
@@ -819,6 +830,7 @@ impl SyntaxKind {
             CFG_ATTR_KW => true,
             CLOBBER_ABI_KW => true,
             DEFAULT_KW => true,
+            DEREF_KW => true,
             DYN_KW if edition < Edition::Edition2018 => true,
             FORMAT_ARGS_KW => true,
             GLOBAL_ASM_KW => true,
@@ -975,6 +987,7 @@ impl SyntaxKind {
             "cfg_attr" => CFG_ATTR_KW,
             "clobber_abi" => CLOBBER_ABI_KW,
             "default" => DEFAULT_KW,
+            "deref" => DEREF_KW,
             "dyn" if edition < Edition::Edition2018 => DYN_KW,
             "format_args" => FORMAT_ARGS_KW,
             "global_asm" => GLOBAL_ASM_KW,
@@ -1149,6 +1162,7 @@ macro_rules ! T_ {
     [cfg_attr] => { $ crate :: SyntaxKind :: CFG_ATTR_KW };
     [clobber_abi] => { $ crate :: SyntaxKind :: CLOBBER_ABI_KW };
     [default] => { $ crate :: SyntaxKind :: DEFAULT_KW };
+    [deref] => { $ crate :: SyntaxKind :: DEREF_KW };
     [dyn] => { $ crate :: SyntaxKind :: DYN_KW };
     [format_args] => { $ crate :: SyntaxKind :: FORMAT_ARGS_KW };
     [global_asm] => { $ crate :: SyntaxKind :: GLOBAL_ASM_KW };

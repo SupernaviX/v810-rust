@@ -151,7 +151,7 @@ impl<'p, 'tcx: 'p> RustcPatCtxt<'p, 'tcx> {
         self.typeck_results
             .hidden_types
             .get(&key.def_id)
-            .map(|x| x.ty.instantiate(self.tcx, key.args))
+            .map(|x| x.ty.instantiate(self.tcx, key.args).skip_norm_wip())
     }
     // This can take a non-revealed `Ty` because it reveals opaques itself.
     pub fn is_uninhabited(&self, ty: Ty<'tcx>) -> bool {
@@ -204,7 +204,7 @@ impl<'p, 'tcx: 'p> RustcPatCtxt<'p, 'tcx> {
                             self.typing_env,
                         ),
                     );
-                    ty
+                    ty.skip_norm_wip()
                 });
             let ty = self.reveal_opaque_ty(ty);
             (field, ty)

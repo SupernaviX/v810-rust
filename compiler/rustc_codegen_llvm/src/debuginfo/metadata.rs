@@ -2,7 +2,6 @@ use std::borrow::Cow;
 use std::fmt::{self, Write};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::{assert_matches, iter, ptr};
 
 use libc::{c_longlong, c_uint};
@@ -16,7 +15,8 @@ use rustc_middle::ty::layout::{
     HasTypingEnv, LayoutOf, TyAndLayout, WIDE_PTR_ADDR, WIDE_PTR_EXTRA,
 };
 use rustc_middle::ty::{
-    self, AdtDef, AdtKind, CoroutineArgsExt, ExistentialTraitRef, Instance, Ty, TyCtxt, Visibility,
+    self, AdtDef, AdtKind, CoroutineArgsExt, ExistentialTraitRef, Instance, Ty, TyCtxt,
+    Unnormalized, Visibility,
 };
 use rustc_session::config::{self, DebugInfo, Lto};
 use rustc_span::{DUMMY_SP, FileName, RemapPathScopeComponents, SourceFile, Span, Symbol, hygiene};
@@ -606,8 +606,16 @@ pub(crate) fn file_metadata<'ll>(cx: &CodegenCx<'ll, '_>, source_file: &SourceFi
         };
         let hash_value = hex_encode(source_file.src_hash.hash_bytes());
 
-        let source =
-            cx.sess().opts.unstable_opts.embed_source.then_some(()).and(source_file.src.as_ref());
+        let mut source = None;
+        let external_src;
+        if cx.sess().opts.unstable_opts.embed_source {
+            source = source_file.src.as_deref().map(String::as_str);
+            if source.is_none() {
+                cx.tcx.sess.source_map().ensure_source_file_source_present(source_file);
+                external_src = source_file.external_src.read();
+                source = external_src.get_source();
+            }
+        }
 
         create_file(DIB(cx), &file_name, &directory, &hash_value, hash_kind, source)
     }
@@ -625,7 +633,7 @@ fn create_file<'ll>(
     directory: &str,
     hash_value: &str,
     hash_kind: llvm::ChecksumKind,
-    source: Option<&Arc<String>>,
+    source: Option<&str>,
 ) -> &'ll DIFile {
     unsafe {
         llvm::LLVMRustDIBuilderCreateFile(
@@ -895,7 +903,6 @@ pub(crate) fn build_compile_unit_di_node<'ll, 'tcx>(
             tcx.sess.split_debuginfo(),
             tcx.sess.opts.unstable_opts.split_dwarf_kind,
             codegen_unit_name,
-            tcx.sess.invocation_temp.as_deref(),
         ) {
         // We get a path relative to the working directory from split_dwarf_path
         Some(tcx.sess.source_map().path_mapping().to_real_filename(work_dir, f))
@@ -1234,7 +1241,9 @@ fn build_upvar_field_di_nodes<'ll, 'tcx>(
         }
     };
 
-    assert!(up_var_tys.iter().all(|t| t == cx.tcx.normalize_erasing_regions(cx.typing_env(), t)));
+    for ty in up_var_tys.iter() {
+        cx.tcx.assert_fully_normalized(cx.typing_env(), ty);
+    }
 
     let capture_names = cx.tcx.closure_saved_names_of_captured_variables(def_id);
     let layout = cx.layout_of(closure_or_coroutine_ty);
@@ -1418,7 +1427,9 @@ fn build_generic_type_param_di_nodes<'ll, 'tcx>(
             let template_params: SmallVec<_> = iter::zip(args, names)
                 .filter_map(|(kind, name)| {
                     kind.as_type().map(|ty| {
-                        let actual_type = cx.tcx.normalize_erasing_regions(cx.typing_env(), ty);
+                        let actual_type = cx
+                            .tcx
+                            .normalize_erasing_regions(cx.typing_env(), Unnormalized::new_wip(ty));
                         let actual_type_di_node = type_di_node(cx, actual_type);
                         Some(cx.create_template_type_parameter(name.as_str(), actual_type_di_node))
                     })

@@ -2,9 +2,8 @@ use super::prelude::*;
 
 pub(crate) struct RustcAllocatorParser;
 
-impl<S: Stage> NoArgsAttributeParser<S> for RustcAllocatorParser {
+impl NoArgsAttributeParser for RustcAllocatorParser {
     const PATH: &[Symbol] = &[sym::rustc_allocator];
-    const ON_DUPLICATE: OnDuplicate<S> = OnDuplicate::Error;
     const ALLOWED_TARGETS: AllowedTargets =
         AllowedTargets::AllowList(&[Allow(Target::Fn), Allow(Target::ForeignFn)]);
     const CREATE: fn(Span) -> AttributeKind = |_| AttributeKind::RustcAllocator;
@@ -12,9 +11,8 @@ impl<S: Stage> NoArgsAttributeParser<S> for RustcAllocatorParser {
 
 pub(crate) struct RustcAllocatorZeroedParser;
 
-impl<S: Stage> NoArgsAttributeParser<S> for RustcAllocatorZeroedParser {
+impl NoArgsAttributeParser for RustcAllocatorZeroedParser {
     const PATH: &[Symbol] = &[sym::rustc_allocator_zeroed];
-    const ON_DUPLICATE: OnDuplicate<S> = OnDuplicate::Error;
     const ALLOWED_TARGETS: AllowedTargets =
         AllowedTargets::AllowList(&[Allow(Target::Fn), Allow(Target::ForeignFn)]);
     const CREATE: fn(Span) -> AttributeKind = |_| AttributeKind::RustcAllocatorZeroed;
@@ -22,18 +20,14 @@ impl<S: Stage> NoArgsAttributeParser<S> for RustcAllocatorZeroedParser {
 
 pub(crate) struct RustcAllocatorZeroedVariantParser;
 
-impl<S: Stage> SingleAttributeParser<S> for RustcAllocatorZeroedVariantParser {
+impl SingleAttributeParser for RustcAllocatorZeroedVariantParser {
     const PATH: &[Symbol] = &[sym::rustc_allocator_zeroed_variant];
-    const ON_DUPLICATE: OnDuplicate<S> = OnDuplicate::Error;
     const ALLOWED_TARGETS: AllowedTargets =
         AllowedTargets::AllowList(&[Allow(Target::Fn), Allow(Target::ForeignFn)]);
     const TEMPLATE: AttributeTemplate = template!(NameValueStr: "function");
-    fn convert(cx: &mut AcceptContext<'_, '_, S>, args: &ArgParser) -> Option<AttributeKind> {
-        let Some(name) = args.name_value().and_then(NameValueParser::value_as_str) else {
-            let attr_span = cx.attr_span;
-            cx.adcx().expected_name_value(attr_span, None);
-            return None;
-        };
+    fn convert(cx: &mut AcceptContext<'_, '_>, args: &ArgParser) -> Option<AttributeKind> {
+        let nv = cx.expect_name_value(args, cx.attr_span, None)?;
+        let name = cx.expect_string_literal(nv)?;
 
         Some(AttributeKind::RustcAllocatorZeroedVariant { name })
     }
@@ -41,9 +35,8 @@ impl<S: Stage> SingleAttributeParser<S> for RustcAllocatorZeroedVariantParser {
 
 pub(crate) struct RustcDeallocatorParser;
 
-impl<S: Stage> NoArgsAttributeParser<S> for RustcDeallocatorParser {
+impl NoArgsAttributeParser for RustcDeallocatorParser {
     const PATH: &[Symbol] = &[sym::rustc_deallocator];
-    const ON_DUPLICATE: OnDuplicate<S> = OnDuplicate::Error;
     const ALLOWED_TARGETS: AllowedTargets =
         AllowedTargets::AllowList(&[Allow(Target::Fn), Allow(Target::ForeignFn)]);
     const CREATE: fn(Span) -> AttributeKind = |_| AttributeKind::RustcDeallocator;
@@ -51,9 +44,8 @@ impl<S: Stage> NoArgsAttributeParser<S> for RustcDeallocatorParser {
 
 pub(crate) struct RustcReallocatorParser;
 
-impl<S: Stage> NoArgsAttributeParser<S> for RustcReallocatorParser {
+impl NoArgsAttributeParser for RustcReallocatorParser {
     const PATH: &[Symbol] = &[sym::rustc_reallocator];
-    const ON_DUPLICATE: OnDuplicate<S> = OnDuplicate::Error;
     const ALLOWED_TARGETS: AllowedTargets =
         AllowedTargets::AllowList(&[Allow(Target::Fn), Allow(Target::ForeignFn)]);
     const CREATE: fn(Span) -> AttributeKind = |_| AttributeKind::RustcReallocator;

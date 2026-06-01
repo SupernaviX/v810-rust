@@ -32,6 +32,8 @@ pub(crate) struct GenericParamsFromOuterItem {
     #[subdiagnostic]
     pub(crate) refer_to_type_directly: Option<UseTypeDirectly>,
     #[subdiagnostic]
+    pub(crate) use_let: Option<GenericParamsFromOuterItemUseLet>,
+    #[subdiagnostic]
     pub(crate) sugg: Option<GenericParamsFromOuterItemSugg>,
     #[subdiagnostic]
     pub(crate) static_or_const: Option<GenericParamsFromOuterItemStaticOrConst>,
@@ -86,6 +88,19 @@ pub(crate) struct GenericParamsFromOuterItemSugg {
     pub(crate) span: Span,
     pub(crate) snippet: String,
 }
+
+#[derive(Subdiagnostic)]
+#[suggestion(
+    "try using a local `let` binding instead",
+    code = "let",
+    applicability = "maybe-incorrect",
+    style = "verbose"
+)]
+pub(crate) struct GenericParamsFromOuterItemUseLet {
+    #[primary_span]
+    pub(crate) span: Span,
+}
+
 #[derive(Subdiagnostic)]
 #[suggestion(
     "refer to the type directly here instead",
@@ -299,40 +314,6 @@ pub(crate) struct AttemptToUseNonConstantValueInConstantWithoutSuggestion<'a> {
     #[primary_span]
     pub(crate) ident_span: Span,
     pub(crate) suggestion: &'a str,
-}
-
-#[derive(Diagnostic)]
-#[diag("`self` imports are only allowed within a {\"{\"} {\"}\"} list", code = E0429)]
-pub(crate) struct SelfImportsOnlyAllowedWithin {
-    #[primary_span]
-    pub(crate) span: Span,
-    #[subdiagnostic]
-    pub(crate) suggestion: Option<SelfImportsOnlyAllowedWithinSuggestion>,
-    #[subdiagnostic]
-    pub(crate) mpart_suggestion: Option<SelfImportsOnlyAllowedWithinMultipartSuggestion>,
-}
-
-#[derive(Subdiagnostic)]
-#[suggestion(
-    "consider importing the module directly",
-    code = "",
-    applicability = "machine-applicable"
-)]
-pub(crate) struct SelfImportsOnlyAllowedWithinSuggestion {
-    #[primary_span]
-    pub(crate) span: Span,
-}
-
-#[derive(Subdiagnostic)]
-#[multipart_suggestion(
-    "alternatively, use the multi-path `use` syntax to import `self`",
-    applicability = "machine-applicable"
-)]
-pub(crate) struct SelfImportsOnlyAllowedWithinMultipartSuggestion {
-    #[suggestion_part(code = "{{")]
-    pub(crate) multipart_start: Span,
-    #[suggestion_part(code = "}}")]
-    pub(crate) multipart_end: Span,
 }
 
 #[derive(Diagnostic)]
@@ -998,7 +979,7 @@ pub(crate) struct UnnamedImport {
     #[primary_span]
     pub(crate) span: Span,
     #[subdiagnostic]
-    pub(crate) sugg: Option<UnnamedImportSugg>,
+    pub(crate) sugg: UnnamedImportSugg,
 }
 
 #[derive(Diagnostic)]
@@ -1761,7 +1742,7 @@ pub(crate) struct ElidedLifetimesInPaths {
 )]
 pub(crate) struct UnusedImports {
     #[subdiagnostic]
-    pub sugg: UnusedImportsSugg,
+    pub sugg: Option<UnusedImportsSugg>,
     #[help("if this is a test module, consider adding a `#[cfg(test)]` to the containing module")]
     pub test_module_span: Option<Span>,
 

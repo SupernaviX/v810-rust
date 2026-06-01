@@ -1449,7 +1449,7 @@ fn generate_functions(intrinsics: &[IntrinsicInfo]) -> String {
         output.push_str(&format!("/// Execution Slots: {}\n", info.exec_slots));
 
         // Generate attributes
-        output.push_str("#[inline(always)]\n");
+        output.push_str("#[inline]\n");
         output.push_str(&format!(
             "#[cfg_attr(target_arch = \"hexagon\", target_feature(enable = \"hvxv{}\"))]\n",
             info.min_arch
@@ -1532,7 +1532,7 @@ fn generate_functions(intrinsics: &[IntrinsicInfo]) -> String {
             }
 
             // Generate attributes
-            output.push_str("#[inline(always)]\n");
+            output.push_str("#[inline]\n");
             output.push_str(&format!(
                 "#[cfg_attr(target_arch = \"hexagon\", target_feature(enable = \"hvxv{}\"))]\n",
                 info.min_arch
@@ -1691,7 +1691,11 @@ fn main() -> Result<(), String> {
     }
 
     // Generate output files
-    let hexagon_dir = crate_dir.join("../core_arch/src/hexagon");
+    let hexagon_dir = std::env::args()
+        .nth(1)
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| crate_dir.join("../core_arch/src/hexagon"));
+    std::fs::create_dir_all(&hexagon_dir).map_err(|e| e.to_string())?;
 
     // Generate v64.rs (64-byte vector mode)
     let v64_path = hexagon_dir.join("v64.rs");

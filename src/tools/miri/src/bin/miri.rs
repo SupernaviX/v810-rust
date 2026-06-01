@@ -1,5 +1,6 @@
-#![feature(rustc_private, stmt_expr_attributes)]
+#![feature(rustc_private, stmt_expr_attributes, cfg_target_has_reliable_f16_f128)]
 #![allow(
+    internal_features, // cfg_target_has_reliable_f16_f128
     clippy::manual_range_contains,
     clippy::useless_format,
     clippy::field_reassign_with_default,
@@ -7,7 +8,6 @@
 )]
 
 // The rustc crates we need
-extern crate rustc_abi;
 extern crate rustc_codegen_ssa;
 extern crate rustc_data_structures;
 extern crate rustc_driver;
@@ -47,7 +47,6 @@ use miri::{
     BacktraceStyle, BorrowTrackerMethod, GenmcConfig, GenmcCtx, MiriConfig, MiriEntryFnType,
     ProvenanceMode, TreeBorrowsParams, ValidationMode, run_genmc_mode,
 };
-use rustc_abi::ExternAbi;
 use rustc_codegen_ssa::traits::CodegenBackend;
 use rustc_data_structures::sync::{self, DynSync};
 use rustc_driver::Compilation;
@@ -98,12 +97,9 @@ fn entry_fn(tcx: TyCtxt<'_>) -> (DefId, MiriEntryFnType) {
         let start_def_id = id.expect_local();
         let start_span = tcx.def_span(start_def_id);
 
-        let expected_sig = ty::Binder::dummy(tcx.mk_fn_sig(
+        let expected_sig = ty::Binder::dummy(tcx.mk_fn_sig_safe_rust_abi(
             [tcx.types.isize, Ty::new_imm_ptr(tcx, Ty::new_imm_ptr(tcx, tcx.types.u8))],
             tcx.types.isize,
-            false,
-            hir::Safety::Safe,
-            ExternAbi::Rust,
         ));
 
         let correct_func_sig = check_function_signature(
@@ -186,7 +182,16 @@ fn make_miri_codegen_backend(sess: &Session) -> Box<dyn CodegenBackend> {
 
     Box::new(DummyCodegenBackend {
         target_config_override: Some(Box::new(move |sess| {
-            target_config_backend.target_config(sess)
+            let mut cfg = target_config_backend.target_config(sess);
+            // The basic types and ABI always work.
+            cfg.has_reliable_f16 = true;
+            cfg.has_reliable_f128 = true;
+            // We always provide the f16 intrinsics, but some are provided via the host,
+            // so forward its reliability.
+            cfg.has_reliable_f16_math = cfg!(target_has_reliable_f16_math);
+            // Many f128 operations are still missing.
+            cfg.has_reliable_f128_math = false;
+            cfg
         })),
     })
 }
@@ -520,6 +525,7 @@ fn main() -> ExitCode {
             miri_config.borrow_tracker =
                 Some(BorrowTrackerMethod::TreeBorrows(TreeBorrowsParams {
                     precise_interior_mut: true,
+                    implicit_writes: false,
                 }));
         } else if arg == "-Zmiri-tree-borrows-no-precise-interior-mut" {
             match &mut miri_config.borrow_tracker {
@@ -529,6 +535,16 @@ fn main() -> ExitCode {
                 _ =>
                     fatal_error!(
                         "`-Zmiri-tree-borrows` is required before `-Zmiri-tree-borrows-no-precise-interior-mut`"
+                    ),
+            };
+        } else if arg == "-Zmiri-tree-borrows-implicit-writes" {
+            match &mut miri_config.borrow_tracker {
+                Some(BorrowTrackerMethod::TreeBorrows(params)) => {
+                    params.implicit_writes = true;
+                }
+                _ =>
+                    fatal_error!(
+                        "`-Zmiri-tree-borrows` is required before `-Zmiri-tree-borrows-implicit-writes`"
                     ),
             };
         } else if arg == "-Zmiri-disable-data-race-detector" {
@@ -713,6 +729,11 @@ fn main() -> ExitCode {
             // Forward to rustc.
             rustc_args.push(arg);
         }
+    }
+
+    // Disabling validation also disables aliasing checks (as retags are done during validation).
+    if miri_config.validation == ValidationMode::No {
+        miri_config.borrow_tracker = None;
     }
 
     // Native calls and strict provenance are not compatible.

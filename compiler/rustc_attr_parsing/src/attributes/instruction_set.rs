@@ -5,7 +5,7 @@ use crate::session_diagnostics;
 
 pub(crate) struct InstructionSetParser;
 
-impl<S: Stage> SingleAttributeParser<S> for InstructionSetParser {
+impl SingleAttributeParser for InstructionSetParser {
     const PATH: &[Symbol] = &[sym::instruction_set];
     const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowListWarnRest(&[
         Allow(Target::Fn),
@@ -15,12 +15,11 @@ impl<S: Stage> SingleAttributeParser<S> for InstructionSetParser {
         Allow(Target::Method(MethodKind::Trait { body: true })),
     ]);
     const TEMPLATE: AttributeTemplate = template!(List: &["set"], "https://doc.rust-lang.org/reference/attributes/codegen.html#the-instruction_set-attribute");
-    const ON_DUPLICATE: OnDuplicate<S> = OnDuplicate::Error;
 
-    fn convert(cx: &mut AcceptContext<'_, '_, S>, args: &ArgParser) -> Option<AttributeKind> {
+    fn convert(cx: &mut AcceptContext<'_, '_>, args: &ArgParser) -> Option<AttributeKind> {
         const POSSIBLE_SYMBOLS: &[Symbol] = &[sym::arm_a32, sym::arm_t32];
         const POSSIBLE_ARM_SYMBOLS: &[Symbol] = &[sym::a32, sym::t32];
-        let maybe_meta_item = cx.single_element_list(args, cx.attr_span)?;
+        let maybe_meta_item = cx.expect_single_element_list(args, cx.attr_span)?;
 
         let Some(meta_item) = maybe_meta_item.meta_item() else {
             cx.adcx().expected_specific_argument(maybe_meta_item.span(), POSSIBLE_SYMBOLS);

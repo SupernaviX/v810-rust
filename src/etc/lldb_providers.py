@@ -1,6 +1,6 @@
 from __future__ import annotations
 import sys
-from typing import Generator, List, TYPE_CHECKING
+from typing import Generator, List, TYPE_CHECKING, Optional
 
 from lldb import (
     SBData,
@@ -15,7 +15,7 @@ from lldb import (
 from rust_types import is_tuple_fields
 
 if TYPE_CHECKING:
-    from lldb import SBValue, SBType, SBTypeStaticField, SBTarget
+    from lldb import SBValue, SBType, SBTypeStaticField, SBTarget, SBProcess
 
 # from lldb.formatters import Logger
 
@@ -108,11 +108,9 @@ class DefaultSyntheticProvider:
         return self.valobj.GetNumChildren()
 
     def get_child_index(self, name: str) -> int:
-        if self.is_ptr and name == "$$dereference$$":
-            return self.valobj.Dereference().GetSyntheticValue()
         return self.valobj.GetIndexOfChildWithName(name)
 
-    def get_child_at_index(self, index: int) -> SBValue:
+    def get_child_at_index(self, index: int) -> Optional[SBValue]:
         return self.valobj.GetChildAtIndex(index)
 
     def update(self):
@@ -133,13 +131,17 @@ class IndirectionSyntheticProvider:
         return 1
 
     def get_child_index(self, name: str) -> int:
-        if self.is_ptr and name == "$$dereference$$":
+        if name == "$$dereference$$":
             return 0
         return -1
 
-    def get_child_at_index(self, index: int) -> SBValue:
+    def get_child_at_index(self, index: int) -> Optional[SBValue]:
         if index == 0:
-            return self.valobj.Dereference().GetSyntheticValue()
+            value = self.valobj.Dereference()
+            if (synth := value.GetSyntheticValue()).IsValid():
+                return synth
+            else:
+                return value
         return None
 
     def update(self):
@@ -164,7 +166,7 @@ class EmptySyntheticProvider:
     def get_child_index(self, name: str) -> int:
         return -1
 
-    def get_child_at_index(self, index: int) -> SBValue:
+    def get_child_at_index(self, index: int) -> Optional[SBValue]:
         return None
 
     def update(self):
@@ -233,8 +235,6 @@ def resolve_msvc_template_arg(arg_name: str, target: SBTarget) -> SBType:
             return result.GetPointerType()
 
     if arg_name.startswith("array$<"):
-        arg_name = arg_name[7:-1].strip()
-
         template_args = get_template_args(arg_name)
 
         element_name = next(template_args)
@@ -268,7 +268,7 @@ def aggregate_field_summary(valobj: SBValue, _dict) -> Generator[str, None, None
         if summary is None:
             summary = child.value
             if summary is None:
-                if is_tuple_fields(child):
+                if is_tuple_fields(child.GetType().fields):
                     summary = TupleSummaryProvider(child, _dict)
                 else:
                     summary = StructSummaryProvider(child, _dict)
@@ -289,6 +289,28 @@ def vec_to_string(vec: SBValue) -> str:
     )
 
 
+def read_string(
+    process: SBProcess, address: int, length: int, error: Optional[SBError] = None
+) -> str:
+    """Reads a string from running process's memory. If `error` is passed in, it will be passed
+    to the `SBProcess.ReadMemory` call, and will reflect any errors after the function is called.
+
+    If any error or exception occurs, a placeholder byte array of the form "<error: [reason]>" will
+    be returned instead."""
+
+    if error is None:
+        error = SBError()
+    try:
+        data = process.ReadMemory(address, length, error)
+        if error.Success():
+            return '"' + data.decode("utf-8", "replace") + '"'
+        else:
+            return f"<error: {error.GetCString()}>"
+    except Exception as e:
+        print(f"Unable to generate String summary: {e.__cause__}")
+        return "<error: Unable to read memory>"
+
+
 def StdStringSummaryProvider(valobj: SBValue, dict: LLDBOpaque):
     inner_vec = (
         valobj.GetNonSyntheticValue()
@@ -305,16 +327,25 @@ def StdStringSummaryProvider(valobj: SBValue, dict: LLDBOpaque):
     )
 
     length = inner_vec.GetChildMemberWithName("len").GetValueAsUnsigned()
+    capacity = (
+        inner_vec.GetChildMemberWithName("buf")
+        .GetChildMemberWithName("cap")
+        .GetValueAsUnsigned()
+    )
 
     if length <= 0:
         return '""'
-    error = SBError()
+
+    no_hi_bit_max: int = 1 << ((pointer.GetByteSize() * 8) - 1)
+    # technically length isn't a NoHighBit<usize>, but length should always be <= capacity
+    if length >= no_hi_bit_max or capacity >= no_hi_bit_max:
+        return "<error: invalid len/capacity>"
+    if pointer.GetValueAsUnsigned() == 0:
+        return "<error: String pointer is null>"
+
     process = pointer.GetProcess()
-    data = process.ReadMemory(pointer.GetValueAsUnsigned(), length, error)
-    if error.Success():
-        return '"' + data.decode("utf8", "replace") + '"'
-    else:
-        raise Exception("ReadMemory error: %s", error.GetCString())
+
+    return read_string(process, pointer.GetValueAsAddress(), length)
 
 
 def StdOsStringSummaryProvider(valobj: SBValue, _dict: LLDBOpaque) -> str:
@@ -363,15 +394,9 @@ def StdPathSummaryProvider(valobj: SBValue, _dict: LLDBOpaque) -> str:
     data_ptr = valobj.GetChildMemberWithName("data_ptr")
 
     start = data_ptr.GetValueAsUnsigned()
-    error = SBError()
     process = data_ptr.GetProcess()
-    data = process.ReadMemory(start, length, error)
-    if PY3:
-        try:
-            data = data.decode(encoding="UTF-8")
-        except UnicodeDecodeError:
-            return "%r" % data
-    return '"%s"' % data
+
+    return read_string(process, start, length)
 
 
 def sequence_formatter(output: str, valobj: SBValue, _dict: LLDBOpaque):
@@ -425,7 +450,7 @@ class StructSyntheticProvider:
     def get_child_index(self, name: str) -> int:
         return self.fields.get(name, -1)
 
-    def get_child_at_index(self, index: int) -> SBValue:
+    def get_child_at_index(self, index: int) -> Optional[SBValue]:
         if self.is_variant:
             field = self.type.GetFieldAtIndex(index + 1)
         else:
@@ -443,6 +468,9 @@ class StructSyntheticProvider:
 class StdStringSyntheticProvider:
     def __init__(self, valobj: SBValue, _dict: LLDBOpaque):
         self.valobj = valobj
+        ptr_size = valobj.GetTarget().GetAddressByteSize() * 8
+        self.no_hi_bit_max = 1 << (ptr_size - 1)
+
         self.update()
 
     def update(self):
@@ -454,7 +482,25 @@ class StdStringSyntheticProvider:
             .GetChildMemberWithName("pointer")
             .GetChildMemberWithName("pointer")
         )
-        self.length = inner_vec.GetChildMemberWithName("len").GetValueAsUnsigned()
+
+        self.capacity = (
+            inner_vec.GetChildMemberWithName("buf")
+            .GetChildMemberWithName("cap")
+            .GetValueAsUnsigned()
+        )
+
+        # As of 4/18/2026, LLDB cannot accurately determine the difference between Some("") and None
+        # this just makes sure we're not trying to access data when the string is clearly in an
+        # invalid state.
+        if (
+            self.capacity >= self.no_hi_bit_max
+            or self.data_ptr.GetValueAsUnsigned() == 0
+        ):
+            self.capacity = 0
+            self.length = 0
+        else:
+            self.length = inner_vec.GetChildMemberWithName("len").GetValueAsUnsigned()
+
         self.element_type = self.data_ptr.GetType().GetPointeeType()
 
     def has_children(self) -> bool:
@@ -470,7 +516,7 @@ class StdStringSyntheticProvider:
 
         return -1
 
-    def get_child_at_index(self, index: int) -> SBValue:
+    def get_child_at_index(self, index: int) -> Optional[SBValue]:
         if not 0 <= index < self.length:
             return None
         start = self.data_ptr.GetValueAsUnsigned()
@@ -506,7 +552,7 @@ class MSVCStrSyntheticProvider:
 
         return -1
 
-    def get_child_at_index(self, index: int) -> SBValue:
+    def get_child_at_index(self, index: int) -> Optional[SBValue]:
         if not 0 <= index < self.length:
             return None
         start = self.data_ptr.GetValueAsUnsigned()
@@ -562,7 +608,7 @@ class ClangEncodedEnumProvider:
     def get_child_index(self, name: str) -> int:
         return self.value.GetIndexOfChildWithName(name)
 
-    def get_child_at_index(self, index: int) -> SBValue:
+    def get_child_at_index(self, index: int) -> Optional[SBValue]:
         return self.value.GetChildAtIndex(index)
 
     def update(self):
@@ -571,7 +617,9 @@ class ClangEncodedEnumProvider:
         self.variant = all_variants.GetChildAtIndex(index)
         self.value = self.variant.GetChildMemberWithName(
             ClangEncodedEnumProvider.VALUE_MEMBER_NAME
-        ).GetSyntheticValue()
+        )
+        if (synth := self.value.GetSyntheticValue()).IsValid():
+            self.value = synth
 
     def _getCurrentVariantIndex(self, all_variants: SBValue) -> int:
         default_index = 0
@@ -653,9 +701,10 @@ class MSVCEnumSyntheticProvider:
                     ).GetValueAsUnsigned()
                     if tag == discr:
                         self.variant = child
-                        self.value = child.GetChildMemberWithName(
-                            "value"
-                        ).GetSyntheticValue()
+                        self.value = child.GetChildMemberWithName("value")
+                        if (synth := self.value.GetSyntheticValue()).IsValid():
+                            self.value = synth
+
                         return
                 else:  # if invalid, DISCR must be a range
                     begin: int = (
@@ -673,16 +722,18 @@ class MSVCEnumSyntheticProvider:
                     if begin < end:
                         if begin <= tag <= end:
                             self.variant = child
-                            self.value = child.GetChildMemberWithName(
-                                "value"
-                            ).GetSyntheticValue()
+                            self.value = child.GetChildMemberWithName("value")
+                            if (synth := self.value.GetSyntheticValue()).IsValid():
+                                self.value = synth
+
                             return
                     else:
                         if tag >= begin or tag <= end:
                             self.variant = child
-                            self.value = child.GetChildMemberWithName(
-                                "value"
-                            ).GetSyntheticValue()
+                            self.value = child.GetChildMemberWithName("value")
+                            if (synth := self.value.GetSyntheticValue()).IsValid():
+                                self.value = synth
+
                             return
         else:  # if invalid, tag is a 128 bit value
             tag_lo: int = self.valobj.GetChildMemberWithName(
@@ -716,9 +767,9 @@ class MSVCEnumSyntheticProvider:
                     discr: int = (exact_hi << 64) | exact_lo
                     if tag == discr:
                         self.variant = child
-                        self.value = child.GetChildMemberWithName(
-                            "value"
-                        ).GetSyntheticValue()
+                        self.value = child.GetChildMemberWithName("value")
+                        if (synth := self.value.GetSyntheticValue()).IsValid():
+                            self.value = synth
                         return
                 else:  # if invalid, DISCR must be a range
                     begin_lo: int = (
@@ -750,16 +801,16 @@ class MSVCEnumSyntheticProvider:
                     if begin < end:
                         if begin <= tag <= end:
                             self.variant = child
-                            self.value = child.GetChildMemberWithName(
-                                "value"
-                            ).GetSyntheticValue()
+                            self.value = child.GetChildMemberWithName("value")
+                        if (synth := self.value.GetSyntheticValue()).IsValid():
+                            self.value = synth
                             return
                     else:
                         if tag >= begin or tag <= end:
                             self.variant = child
-                            self.value = child.GetChildMemberWithName(
-                                "value"
-                            ).GetSyntheticValue()
+                            self.value = child.GetChildMemberWithName("value")
+                        if (synth := self.value.GetSyntheticValue()).IsValid():
+                            self.value = synth
                             return
 
     def num_children(self) -> int:
@@ -768,7 +819,7 @@ class MSVCEnumSyntheticProvider:
     def get_child_index(self, name: str) -> int:
         return self.value.GetIndexOfChildWithName(name)
 
-    def get_child_at_index(self, index: int) -> SBValue:
+    def get_child_at_index(self, index: int) -> Optional[SBValue]:
         return self.value.GetChildAtIndex(index)
 
     def has_children(self) -> bool:
@@ -858,7 +909,7 @@ class TupleSyntheticProvider:
         else:
             return -1
 
-    def get_child_at_index(self, index: int) -> SBValue:
+    def get_child_at_index(self, index: int) -> Optional[SBValue]:
         if self.is_variant:
             field = self.type.GetFieldAtIndex(index + 1)
         else:
@@ -887,7 +938,7 @@ class MSVCTupleSyntheticProvider:
     def get_child_index(self, name: str) -> int:
         return self.valobj.GetIndexOfChildWithName(name)
 
-    def get_child_at_index(self, index: int) -> SBValue:
+    def get_child_at_index(self, index: int) -> Optional[SBValue]:
         child: SBValue = self.valobj.GetChildAtIndex(index)
         offset = self.valobj.GetType().GetFieldAtIndex(index).byte_offset
         return self.valobj.CreateChildAtOffset(str(index), offset, child.GetType())
@@ -923,6 +974,8 @@ class StdVecSyntheticProvider:
         # logger >> "[StdVecSyntheticProvider] for " + str(valobj.GetName())
         self.valobj = valobj
         self.element_type = None
+        ptr_size = valobj.GetTarget().GetAddressByteSize() * 8
+        self.no_hi_bit_max = 1 << (ptr_size - 1)
         self.update()
 
     def num_children(self) -> int:
@@ -935,7 +988,7 @@ class StdVecSyntheticProvider:
         else:
             return -1
 
-    def get_child_at_index(self, index: int) -> SBValue:
+    def get_child_at_index(self, index: int) -> Optional[SBValue]:
         start = self.data_ptr.GetValueAsUnsigned()
         address = start + index * self.element_type_size
         element = self.data_ptr.CreateValueFromAddress(
@@ -944,14 +997,18 @@ class StdVecSyntheticProvider:
         return element
 
     def update(self):
-        self.length = self.valobj.GetChildMemberWithName("len").GetValueAsUnsigned()
-        self.buf = self.valobj.GetChildMemberWithName("buf").GetChildMemberWithName(
-            "inner"
+        buf: SBValue = self.valobj.GetChildMemberWithName("buf")
+        self.data_ptr = unwrap_unique_or_non_null(
+            buf.GetChildMemberWithName("inner").GetChildMemberWithName("ptr")
         )
 
-        self.data_ptr = unwrap_unique_or_non_null(
-            self.buf.GetChildMemberWithName("ptr")
-        )
+        capacity: int = buf.GetChildMemberWithName("cap").GetValueAsUnsigned()
+
+        if capacity >= self.no_hi_bit_max or self.data_ptr.GetValueAsUnsigned() == 0:
+            self.capacity = 0
+            self.length = 0
+        else:
+            self.length = self.valobj.GetChildMemberWithName("len").GetValueAsUnsigned()
 
         self.element_type = self.valobj.GetType().GetTemplateArgumentType(0)
 
@@ -983,7 +1040,7 @@ class StdSliceSyntheticProvider:
         else:
             return -1
 
-    def get_child_at_index(self, index: int) -> SBValue:
+    def get_child_at_index(self, index: int) -> Optional[SBValue]:
         start = self.data_ptr.GetValueAsUnsigned()
         address = start + index * self.element_size
         element = self.data_ptr.CreateValueFromAddress(
@@ -1027,7 +1084,7 @@ def StdSliceSummaryProvider(valobj, dict):
 class StdVecDequeSyntheticProvider:
     """Pretty-printer for alloc::collections::vec_deque::VecDeque<T>
 
-    struct VecDeque<T> { head: usize, len: usize, buf: RawVec<T> }
+    struct VecDeque<T> { head: WrappedIndex, len: usize, buf: RawVec<T> }
     """
 
     def __init__(self, valobj: SBValue, _dict: LLDBOpaque):
@@ -1047,7 +1104,7 @@ class StdVecDequeSyntheticProvider:
         else:
             return -1
 
-    def get_child_at_index(self, index: int) -> SBValue:
+    def get_child_at_index(self, index: int) -> Optional[SBValue]:
         start = self.data_ptr.GetValueAsUnsigned()
         address = start + ((index + self.head) % self.cap) * self.element_type_size
         element = self.data_ptr.CreateValueFromAddress(
@@ -1056,7 +1113,11 @@ class StdVecDequeSyntheticProvider:
         return element
 
     def update(self):
-        self.head = self.valobj.GetChildMemberWithName("head").GetValueAsUnsigned()
+        head = self.valobj.GetChildMemberWithName("head")
+        # BACKCOMPAT: rust 1.95
+        if head.GetType().num_fields == 1:
+            head = head.GetChildAtIndex(0)
+        self.head = head.GetValueAsUnsigned()
         self.size = self.valobj.GetChildMemberWithName("len").GetValueAsUnsigned()
         self.buf = self.valobj.GetChildMemberWithName("buf").GetChildMemberWithName(
             "inner"
@@ -1106,7 +1167,7 @@ class StdOldHashMapSyntheticProvider:
         else:
             return -1
 
-    def get_child_at_index(self, index: int) -> SBValue:
+    def get_child_at_index(self, index: int) -> Optional[SBValue]:
         # logger = Logger.Logger()
         start = self.data_ptr.GetValueAsUnsigned() & ~1
 
@@ -1195,7 +1256,7 @@ class StdHashMapSyntheticProvider:
         else:
             return -1
 
-    def get_child_at_index(self, index: int) -> SBValue:
+    def get_child_at_index(self, index: int) -> Optional[SBValue]:
         pairs_start = self.data_ptr.GetValueAsUnsigned()
         idx = self.valid_indices[index]
         if self.new_layout:
@@ -1318,7 +1379,7 @@ class StdRcSyntheticProvider:
             return 2
         return -1
 
-    def get_child_at_index(self, index: int) -> SBValue:
+    def get_child_at_index(self, index: int) -> Optional[SBValue]:
         if index == 0:
             return self.value
         if index == 1:
@@ -1351,7 +1412,7 @@ class StdCellSyntheticProvider:
             return 0
         return -1
 
-    def get_child_at_index(self, index: int) -> SBValue:
+    def get_child_at_index(self, index: int) -> Optional[SBValue]:
         if index == 0:
             return self.value
         return None
@@ -1406,7 +1467,7 @@ class StdRefSyntheticProvider:
             return 1
         return -1
 
-    def get_child_at_index(self, index: int) -> SBValue:
+    def get_child_at_index(self, index: int) -> Optional[SBValue]:
         if index == 0:
             return self.value
         if index == 1:

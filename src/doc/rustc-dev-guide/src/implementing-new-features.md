@@ -162,7 +162,7 @@ The below steps needs to be followed in order to implement a new unstable featur
 
    ```rust ignore
    /// Allows defining identifiers beyond ASCII.
-   (unstable, non_ascii_idents, "CURRENT_RUSTC_VERSION", Some(55467), None),
+   (unstable, non_ascii_idents, "CURRENT_RUSTC_VERSION", Some(55467)),
    ```
 
    Features can be marked as incomplete,
@@ -173,7 +173,7 @@ The below steps needs to be followed in order to implement a new unstable featur
 
    ```rust ignore
    /// Allows deref patterns.
-   (incomplete, deref_patterns, "CURRENT_RUSTC_VERSION", Some(87121), None),
+   (incomplete, deref_patterns, "CURRENT_RUSTC_VERSION", Some(87121)),
    ```
 
    Feature flags related to a lang experiment must be marked as `incomplete`
@@ -197,7 +197,7 @@ The below steps needs to be followed in order to implement a new unstable featur
    For features introducing new syntax, pre-expansion gating should be used instead.
    During parsing, when the new syntax is parsed,
    the symbol must be inserted to the current crate's [`GatedSpans`]
-   via `self.sess.gated_span.gate(sym::my_feature, span)`.
+   via `self.psess.gated_spans.gate(sym::my_feature, span)`.
 
    After being inserted to the gated spans,
    the span must be checked in the [`rustc_ast_passes::feature_gate::check_crate`] function,

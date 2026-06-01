@@ -15,7 +15,7 @@ use rustc_codegen_ssa::mir::place::PlaceRef;
 use rustc_codegen_ssa::traits::*;
 use rustc_data_structures::small_c_str::SmallCStr;
 use rustc_hir::def_id::DefId;
-use rustc_middle::middle::codegen_fn_attrs::{CodegenFnAttrs, TargetFeature, TargetFeatureKind};
+use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrs;
 use rustc_middle::ty::layout::{
     FnAbiError, FnAbiOfHelpers, FnAbiRequest, HasTypingEnv, LayoutError, LayoutOfHelpers,
     TyAndLayout,
@@ -1289,6 +1289,10 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
         ret
     }
 
+    fn get_funclet_cleanuppad(&self, funclet: &Funclet<'ll>) -> &'ll Value {
+        funclet.cleanuppad()
+    }
+
     // Atomic Operations
     fn atomic_cmpxchg(
         &mut self,
@@ -1418,20 +1422,9 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
         if let Some(callee_instance) = callee_instance {
             // Attributes on the function definition being called
             let callee_attrs = self.cx.tcx.codegen_fn_attrs(callee_instance.def_id());
-            if let Some(caller_attrs) = caller_attrs
-                // If there is an inline attribute and a target feature that matches
-                // we will add the attribute to the callsite otherwise we'll omit
-                // this and not add the attribute to prevent soundness issues.
-                && let Some(inlining_rule) = attributes::inline_attr(&self.cx, self.cx.tcx, callee_instance)
-                && self.cx.tcx.is_target_feature_call_safe(
-                    &callee_attrs.target_features,
-                    &caller_attrs.target_features.iter().cloned().chain(
-                        self.cx.tcx.sess.target_features.iter().map(|feat| TargetFeature {
-                            name: *feat,
-                            kind: TargetFeatureKind::Implied,
-                        })
-                    ).collect::<Vec<_>>(),
-                )
+
+            if let Some(inlining_rule) =
+                attributes::inline_attr(&self.cx, self.cx.tcx, callee_instance, callee_attrs)
             {
                 attributes::apply_to_callsite(
                     call,
@@ -1667,12 +1660,6 @@ impl<'a, 'll, 'tcx> Builder<'a, 'll, 'tcx> {
     }
     pub(crate) fn vector_reduce_xor(&mut self, src: &'ll Value) -> &'ll Value {
         self.call_intrinsic("llvm.vector.reduce.xor", &[self.val_ty(src)], &[src])
-    }
-    pub(crate) fn vector_reduce_fmin(&mut self, src: &'ll Value) -> &'ll Value {
-        self.call_intrinsic("llvm.vector.reduce.fmin", &[self.val_ty(src)], &[src])
-    }
-    pub(crate) fn vector_reduce_fmax(&mut self, src: &'ll Value) -> &'ll Value {
-        self.call_intrinsic("llvm.vector.reduce.fmax", &[self.val_ty(src)], &[src])
     }
     pub(crate) fn vector_reduce_min(&mut self, src: &'ll Value, is_signed: bool) -> &'ll Value {
         self.call_intrinsic(

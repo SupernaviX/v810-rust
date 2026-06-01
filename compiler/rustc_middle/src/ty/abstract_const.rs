@@ -1,7 +1,7 @@
 //! A subset of a mir body used for const evaluability checking.
 
 use rustc_errors::ErrorGuaranteed;
-use rustc_macros::{HashStable, TyDecodable, TyEncodable, TypeVisitable};
+use rustc_macros::{StableHash, TyDecodable, TyEncodable, TypeVisitable};
 
 use crate::ty::{
     self, Const, EarlyBinder, Ty, TyCtxt, TypeFoldable, TypeFolder, TypeSuperFoldable,
@@ -9,7 +9,7 @@ use crate::ty::{
 };
 
 #[derive(Hash, Debug, Clone, Copy, Ord, PartialOrd, PartialEq, Eq)]
-#[derive(TyDecodable, TyEncodable, HashStable, TypeVisitable, TypeFoldable)]
+#[derive(TyDecodable, TyEncodable, StableHash, TypeVisitable, TypeFoldable)]
 pub enum CastKind {
     /// thir::ExprKind::As
     As,
@@ -17,7 +17,7 @@ pub enum CastKind {
     Use,
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, HashStable, TyEncodable, TyDecodable)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, StableHash, TyEncodable, TyDecodable)]
 pub enum NotConstEvaluatable {
     Error(ErrorGuaranteed),
     MentionsInfer,
@@ -56,7 +56,7 @@ impl<'tcx> TyCtxt<'tcx> {
                         Err(e) => ty::Const::new_error(self.tcx, e),
                         Ok(Some(bac)) => {
                             let args = self.tcx.erase_and_anonymize_regions(uv.args);
-                            let bac = bac.instantiate(self.tcx, args);
+                            let bac = bac.instantiate(self.tcx, args).skip_norm_wip();
                             return bac.fold_with(self);
                         }
                         Ok(None) => c,

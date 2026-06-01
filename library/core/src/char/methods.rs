@@ -1050,8 +1050,9 @@ impl char {
     /// ```
     #[must_use]
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[rustc_const_stable(feature = "const_is_control", since = "CURRENT_RUSTC_VERSION")]
     #[inline]
-    pub fn is_control(self) -> bool {
+    pub const fn is_control(self) -> bool {
         // According to
         // https://www.unicode.org/policies/stability_policy.html#Property_Value,
         // the set of codepoints in `Cc` will never change.
@@ -1984,7 +1985,8 @@ impl char {
         matches!(*self, '0'..='9') | matches!(*self, 'A'..='F') | matches!(*self, 'a'..='f')
     }
 
-    /// Checks if the value is an ASCII punctuation character:
+    /// Checks if the value is an ASCII punctuation or symbol character
+    /// (i.e. not alphanumeric, whitespace, or control):
     ///
     /// - U+0021 ..= U+002F `! " # $ % & ' ( ) * + , - . /`, or
     /// - U+003A ..= U+0040 `: ; < = > ? @`, or
@@ -2025,7 +2027,8 @@ impl char {
             | matches!(*self, '{'..='~')
     }
 
-    /// Checks if the value is an ASCII graphic character:
+    /// Checks if the value is an ASCII graphic character
+    /// (i.e. not whitespace or control):
     /// U+0021 '!' ..= U+007E '~'.
     ///
     /// # Examples

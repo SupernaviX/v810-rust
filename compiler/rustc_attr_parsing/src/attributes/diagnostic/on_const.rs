@@ -1,16 +1,17 @@
 use rustc_hir::attrs::diagnostic::Directive;
+use rustc_session::lint::builtin::MISPLACED_DIAGNOSTIC_ATTRIBUTES;
 
 use crate::attributes::diagnostic::*;
 use crate::attributes::prelude::*;
-
+use crate::errors::DiagnosticOnConstOnlyForTraitImpls;
 #[derive(Default)]
 pub(crate) struct OnConstParser {
     span: Option<Span>,
     directive: Option<(Span, Directive)>,
 }
 
-impl<S: Stage> AttributeParser<S> for OnConstParser {
-    const ATTRIBUTES: AcceptMapping<Self, S> = &[(
+impl AttributeParser for OnConstParser {
+    const ATTRIBUTES: AcceptMapping<Self> = &[(
         &[sym::diagnostic, sym::on_const],
         template!(List: &[r#"/*opt*/ message = "...", /*opt*/ label = "...", /*opt*/ note = "...""#]),
         |this, cx, args| {
@@ -21,6 +22,19 @@ impl<S: Stage> AttributeParser<S> for OnConstParser {
 
             let span = cx.attr_span;
             this.span = Some(span);
+
+            // FIXME(mejrs) no constness field on `Target`,
+            // so non-constness is still checked in check_attr.rs
+            if !matches!(cx.target, Target::Impl { of_trait: true }) {
+                let target_span = cx.target_span;
+                cx.emit_lint(
+                    MISPLACED_DIAGNOSTIC_ATTRIBUTES,
+                    DiagnosticOnConstOnlyForTraitImpls { target_span },
+                    span,
+                );
+                return;
+            }
+
             let mode = Mode::DiagnosticOnConst;
 
             let Some(items) = parse_list(cx, args, mode) else { return };
@@ -32,10 +46,11 @@ impl<S: Stage> AttributeParser<S> for OnConstParser {
         },
     )];
 
-    //FIXME Still checked in `check_attr.rs`
+    // "Allowed" on all targets; noop on anything but non-const trait impls;
+    // this linted on in parser.
     const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowList(ALL_TARGETS);
 
-    fn finalize(self, _cx: &FinalizeContext<'_, '_, S>) -> Option<AttributeKind> {
+    fn finalize(self, _cx: &FinalizeContext<'_, '_>) -> Option<AttributeKind> {
         if let Some(span) = self.span {
             Some(AttributeKind::OnConst { span, directive: self.directive.map(|d| Box::new(d.1)) })
         } else {

@@ -22,7 +22,7 @@ use syntax::{
 };
 
 use crate::{
-    completions::postfix::is_in_condition,
+    completions::postfix::{is_in_condition, is_in_value},
     context::{
         AttrCtx, BreakableKind, COMPLETION_MARKER, CompletionAnalysis, DotAccess, DotAccessExprCtx,
         DotAccessKind, ItemListKind, LifetimeContext, LifetimeKind, NameContext, NameKind,
@@ -1097,25 +1097,6 @@ fn classify_name_ref<'db>(
             .and_then(|next| next.first_token())
             .is_some_and(|token| token.kind() == SyntaxKind::ELSE_KW)
     };
-    let is_in_value = |it: &SyntaxNode| {
-        let Some(node) = it.parent() else { return false };
-        let kind = node.kind();
-        ast::LetStmt::can_cast(kind)
-            || ast::ArgList::can_cast(kind)
-            || ast::ArrayExpr::can_cast(kind)
-            || ast::ParenExpr::can_cast(kind)
-            || ast::BreakExpr::can_cast(kind)
-            || ast::ReturnExpr::can_cast(kind)
-            || ast::PrefixExpr::can_cast(kind)
-            || ast::FormatArgsArg::can_cast(kind)
-            || ast::RecordExprField::can_cast(kind)
-            || ast::BinExpr::cast(node.clone())
-                .and_then(|expr| expr.rhs())
-                .is_some_and(|expr| expr.syntax() == it)
-            || ast::IndexExpr::cast(node)
-                .and_then(|expr| expr.index())
-                .is_some_and(|expr| expr.syntax() == it)
-    };
 
     // We do not want to generate path completions when we are sandwiched between an item decl signature and its body.
     // ex. trait Foo $0 {}
@@ -1183,18 +1164,16 @@ fn classify_name_ref<'db>(
                                             let arg_name = arg_name.text();
                                             for item in trait_.items_with_supertraits(sema.db) {
                                                 match item {
-                                                    hir::AssocItem::TypeAlias(assoc_ty) => {
-                                                        if assoc_ty.name(sema.db).as_str() == arg_name {
+                                                    hir::AssocItem::TypeAlias(assoc_ty)
+                                                        if assoc_ty.name(sema.db).as_str() == arg_name => {
                                                             override_location = Some(TypeLocation::AssocTypeEq);
                                                             return None;
-                                                        }
-                                                    },
-                                                    hir::AssocItem::Const(const_) => {
-                                                        if const_.name(sema.db)?.as_str() == arg_name {
+                                                        },
+                                                    hir::AssocItem::Const(const_)
+                                                        if const_.name(sema.db)?.as_str() == arg_name => {
                                                             override_location =  Some(TypeLocation::AssocConstEq);
                                                             return None;
-                                                        }
-                                                    },
+                                                        },
                                                     _ => (),
                                                 }
                                             }
@@ -1431,7 +1410,7 @@ fn classify_name_ref<'db>(
             .find_map(ast::LetStmt::cast)
             .is_some_and(|it| it.semicolon_token().is_none())
             || after_incomplete_let && incomplete_expr_stmt.unwrap_or(true) && !before_else_kw;
-        let in_value = is_in_value(it);
+        let in_value = is_in_value(&expr);
         let impl_ = fetch_immediate_impl_or_trait(sema, original_file, expr.syntax())
             .and_then(Either::left);
 
@@ -1592,7 +1571,7 @@ fn classify_name_ref<'db>(
                     kind_macro_call(it)?
                 },
                 ast::Meta(meta) => make_path_kind_attr(meta)?,
-                ast::Visibility(it) => PathKind::Vis { has_in_token: it.in_token().is_some() },
+                ast::VisibilityInner(it) => PathKind::Vis { has_in_token: it.in_token().is_some() },
                 ast::UseTree(_) => PathKind::Use,
                 // completing inside a qualifier
                 ast::Path(parent) => {
@@ -1621,7 +1600,7 @@ fn classify_name_ref<'db>(
                                 kind_macro_call(it)?
                             },
                             ast::Meta(meta) => make_path_kind_attr(meta)?,
-                            ast::Visibility(it) => PathKind::Vis { has_in_token: it.in_token().is_some() },
+                            ast::VisibilityInner(it) => PathKind::Vis { has_in_token: it.in_token().is_some() },
                             ast::UseTree(_) => PathKind::Use,
                             ast::RecordExpr(it) => make_path_kind_expr(it.into()),
                             _ => return None,
@@ -2096,12 +2075,12 @@ fn next_non_trivia_token(e: impl Into<SyntaxElement>) -> Option<SyntaxToken> {
 }
 
 fn next_non_trivia_sibling(ele: SyntaxElement) -> Option<SyntaxElement> {
-    let mut e = ele.next_sibling_or_token();
-    while let Some(inner) = e {
-        if !inner.kind().is_trivia() {
-            return Some(inner);
+    let mut e = ele;
+    while let Some(next) = e.next_sibling_or_token() {
+        if !next.kind().is_trivia() {
+            return Some(next);
         } else {
-            e = inner.next_sibling_or_token();
+            e = next;
         }
     }
     None

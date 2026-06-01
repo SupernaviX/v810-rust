@@ -7,11 +7,9 @@ use std::{fmt, str};
 
 use rustc_arena::DroplessArena;
 use rustc_data_structures::fx::{FxHashSet, FxIndexSet};
-use rustc_data_structures::stable_hasher::{
-    HashStable, StableCompare, StableHasher, ToStableHashKey,
-};
+use rustc_data_structures::stable_hash::{StableCompare, StableHash, StableHashCtxt, StableHasher};
 use rustc_data_structures::sync::Lock;
-use rustc_macros::{Decodable, Encodable, HashStable_Generic, symbols};
+use rustc_macros::{Decodable, Encodable, StableHash, symbols};
 
 use crate::edit_distance::find_best_match_for_name;
 use crate::{DUMMY_SP, Edition, Span, with_session_globals};
@@ -239,6 +237,7 @@ symbols! {
         IntoFuture,
         IntoIterator,
         IntoIteratorItem,
+        IoBufReader,
         IrTyKind,
         Item,
         ItemContext,
@@ -286,6 +285,7 @@ symbols! {
         Rc,
         RcWeak,
         Ready,
+        Reborrow,
         RefCell,
         Reference,
         Relaxed,
@@ -307,6 +307,7 @@ symbols! {
         Some,
         Source,
         SpanCtxt,
+        StdinLock,
         Str,
         String,
         Struct,
@@ -317,7 +318,6 @@ symbols! {
         Target,
         This,
         TokenStream,
-        Trait,
         TrivialClone,
         Try,
         TryCaptureGeneric,
@@ -356,6 +356,7 @@ symbols! {
         abi_msp430_interrupt,
         abi_ptx,
         abi_riscv_interrupt,
+        abi_swift,
         abi_sysv64,
         abi_thiscall,
         abi_unadjusted,
@@ -548,6 +549,7 @@ symbols! {
         c_str_literals,
         c_unwind,
         c_variadic,
+        c_variadic_experimental_arch,
         c_variadic_naked_functions,
         c_void,
         call,
@@ -598,6 +600,7 @@ symbols! {
         cfi,
         cfi_encoding,
         char,
+        clflushopt_target_feature,
         client,
         clippy,
         clobber_abi,
@@ -623,6 +626,7 @@ symbols! {
         cmse_nonsecure_entry,
         coerce_pointee_validated,
         coerce_shared,
+        coerce_shared_target,
         coerce_unsized,
         coff,
         cold,
@@ -679,6 +683,7 @@ symbols! {
         const_panic,
         const_panic_fmt,
         const_param_ty,
+        const_param_ty_unchecked,
         const_precise_live_drops,
         const_ptr_cast,
         const_raw_ptr_deref,
@@ -749,8 +754,8 @@ symbols! {
         custom_mir,
         custom_test_frameworks,
         d32,
-        dbg_macro,
         dead_code,
+        dead_code_pub_in_binary,
         dealloc,
         debug,
         debug_assert_eq_macro,
@@ -803,6 +808,7 @@ symbols! {
         diagnostic_on_const,
         diagnostic_on_move,
         diagnostic_on_unknown,
+        diagnostic_on_unmatch_args,
         dialect,
         direct,
         discriminant_kind,
@@ -832,6 +838,7 @@ symbols! {
         dreg_low8,
         dreg_low16,
         drop,
+        drop_glue,
         drop_in_place,
         drop_types_in_const,
         dropck_eyepatch,
@@ -942,6 +949,7 @@ symbols! {
         field_offset,
         field_projections,
         field_representing_type,
+        field_representing_type_actual_type_id,
         field_representing_type_raw,
         field_type,
         fields,
@@ -1032,6 +1040,8 @@ symbols! {
         global_asm,
         global_registration,
         globs,
+        gpu_kernel: "gpu-kernel",
+        gpu_launch_sized_workgroup_mem,
         gt,
         guard,
         guard_patterns,
@@ -1293,7 +1303,6 @@ symbols! {
         mir_move,
         mir_offset,
         mir_ptr_metadata,
-        mir_retag,
         mir_return,
         mir_return_to,
         mir_set_discriminant,
@@ -1319,6 +1328,7 @@ symbols! {
         more_qualified_paths,
         more_struct_aliases,
         movbe_target_feature,
+        move_expr,
         move_ref_pattern,
         move_size_limit,
         movrs_target_feature,
@@ -1331,6 +1341,7 @@ symbols! {
         must_use,
         mut_preserve_binding_mode_2024,
         mut_ref,
+        mut_restriction,
         mutable,
         naked,
         naked_asm,
@@ -1415,6 +1426,7 @@ symbols! {
         of,
         off,
         offload,
+        offload_kernel,
         offset,
         offset_of,
         offset_of_enum,
@@ -1428,6 +1440,7 @@ symbols! {
         on_move,
         on_unimplemented,
         on_unknown,
+        on_unmatch_args,
         opaque,
         opaque_module_name_placeholder: "<opaque>",
         ops,
@@ -1513,6 +1526,7 @@ symbols! {
         pic,
         pie,
         pin,
+        pin_drop,
         pin_ergonomics,
         pin_v2,
         platform_intrinsics,
@@ -1658,6 +1672,7 @@ symbols! {
         residual,
         result,
         result_ffi_guarantees,
+        return_address,
         return_position_impl_trait_in_trait,
         return_type_notation,
         riscv32,
@@ -1753,8 +1768,6 @@ symbols! {
         rustc_insignificant_dtor,
         rustc_intrinsic,
         rustc_intrinsic_const_stable_indirect,
-        rustc_layout_scalar_valid_range_end,
-        rustc_layout_scalar_valid_range_start,
         rustc_legacy_const_generics,
         rustc_lint_opt_deny_field_access,
         rustc_lint_opt_ty,
@@ -1926,6 +1939,7 @@ symbols! {
         sinf128,
         size,
         size_of,
+        size_of_type_id,
         size_of_val,
         sized,
         sized_hierarchy,
@@ -2015,8 +2029,8 @@ symbols! {
         target_feature_11,
         target_feature_inline_always,
         target_has_atomic,
-        target_has_atomic_equal_alignment,
         target_has_atomic_load_store,
+        target_has_atomic_primitive_alignment,
         target_has_reliable_f16,
         target_has_reliable_f16_math,
         target_has_reliable_f128,
@@ -2044,6 +2058,7 @@ symbols! {
         thumb2,
         thumb_mode: "thumb-mode",
         tmm_reg,
+        to_owned_method,
         to_string,
         to_vec,
         tool_attributes,
@@ -2088,6 +2103,9 @@ symbols! {
         type_changing_struct_update,
         type_id,
         type_id_eq,
+        type_id_field_representing_type,
+        type_id_fields,
+        type_id_variants,
         type_id_vtable,
         type_info,
         type_ir,
@@ -2148,6 +2166,7 @@ symbols! {
         underscore_imports,
         underscore_lifetimes,
         uniform_paths,
+        unimplemented,
         unit,
         universal_impl_trait,
         unix,
@@ -2231,6 +2250,7 @@ symbols! {
         verbatim,
         version,
         vfp2,
+        view_types,
         vis,
         visible_private_types,
         volatile,
@@ -2307,7 +2327,7 @@ symbols! {
 /// `proc_macro`.
 pub const STDLIB_STABLE_CRATES: &[Symbol] = &[sym::std, sym::core, sym::alloc, sym::proc_macro];
 
-#[derive(Copy, Clone, Eq, HashStable_Generic, Encodable, Decodable)]
+#[derive(Copy, Clone, Eq, StableHash, Encodable, Decodable)]
 pub struct Ident {
     /// `name` should never be the empty symbol. If you are considering that,
     /// you are probably conflating "empty identifier with "no identifier" and
@@ -2630,18 +2650,10 @@ impl fmt::Display for Symbol {
     }
 }
 
-impl<Hcx> HashStable<Hcx> for Symbol {
+impl StableHash for Symbol {
     #[inline]
-    fn hash_stable(&self, hcx: &mut Hcx, hasher: &mut StableHasher) {
-        self.as_str().hash_stable(hcx, hasher);
-    }
-}
-
-impl<Hcx> ToStableHashKey<Hcx> for Symbol {
-    type KeyType = String;
-    #[inline]
-    fn to_stable_hash_key(&self, _: &mut Hcx) -> String {
-        self.as_str().to_string()
+    fn stable_hash<Hcx: StableHashCtxt>(&self, hcx: &mut Hcx, hasher: &mut StableHasher) {
+        self.as_str().stable_hash(hcx, hasher);
     }
 }
 
@@ -2690,10 +2702,10 @@ impl fmt::Debug for ByteSymbol {
     }
 }
 
-impl<Hcx> HashStable<Hcx> for ByteSymbol {
+impl StableHash for ByteSymbol {
     #[inline]
-    fn hash_stable(&self, hcx: &mut Hcx, hasher: &mut StableHasher) {
-        self.as_byte_str().hash_stable(hcx, hasher);
+    fn stable_hash<Hcx: StableHashCtxt>(&self, hcx: &mut Hcx, hasher: &mut StableHasher) {
+        self.as_byte_str().stable_hash(hcx, hasher);
     }
 }
 

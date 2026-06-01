@@ -1,4 +1,3 @@
-use std::ops::Bound;
 use std::{cmp, fmt};
 
 use rustc_abi as abi;
@@ -13,7 +12,7 @@ use rustc_errors::{
 use rustc_hir as hir;
 use rustc_hir::LangItem;
 use rustc_hir::def_id::DefId;
-use rustc_macros::{HashStable, TyDecodable, TyEncodable, extension};
+use rustc_macros::{StableHash, TyDecodable, TyEncodable, extension};
 use rustc_session::config::OptLevel;
 use rustc_span::{DUMMY_SP, ErrorGuaranteed, Span, Symbol, sym};
 use rustc_target::callconv::FnAbi;
@@ -24,7 +23,7 @@ use crate::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use crate::query::TyCtxtAt;
 use crate::traits::ObligationCause;
 use crate::ty::normalize_erasing_regions::NormalizationError;
-use crate::ty::{self, CoroutineArgsExt, Ty, TyCtxt, TypeVisitableExt};
+use crate::ty::{self, CoroutineArgsExt, Ty, TyCtxt, TypeVisitableExt, Unnormalized};
 
 #[extension(pub trait IntegerExt)]
 impl abi::Integer {
@@ -189,7 +188,7 @@ pub const MAX_SIMD_LANES: u64 = rustc_abi::MAX_SIMD_LANES;
 
 /// Used in `check_validity_requirement` to indicate the kind of initialization
 /// that is checked to be valid
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, HashStable)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, StableHash)]
 pub enum ValidityRequirement {
     Inhabited,
     Zero,
@@ -222,7 +221,7 @@ impl fmt::Display for ValidityRequirement {
     }
 }
 
-#[derive(Copy, Clone, Debug, HashStable, TyEncodable, TyDecodable)]
+#[derive(Copy, Clone, Debug, StableHash, TyEncodable, TyDecodable)]
 pub enum SimdLayoutError {
     /// The vector has 0 lanes.
     ZeroLength,
@@ -231,7 +230,7 @@ pub enum SimdLayoutError {
     TooManyLanes(u64),
 }
 
-#[derive(Copy, Clone, Debug, HashStable, TyEncodable, TyDecodable)]
+#[derive(Copy, Clone, Debug, StableHash, TyEncodable, TyDecodable)]
 pub enum LayoutError<'tcx> {
     /// A type doesn't have a sensible layout.
     ///
@@ -317,12 +316,6 @@ pub enum SizeSkeleton<'tcx> {
     /// Alignment can be `None` if unknown.
     Known(Size, Option<Align>),
 
-    /// This is a generic const expression (i.e. N * 2), which may contain some parameters.
-    /// It must be of type usize, and represents the size of a type in bytes.
-    /// It is not required to be evaluatable to a concrete value, but can be used to check
-    /// that another SizeSkeleton is of equal size.
-    Generic(ty::Const<'tcx>),
-
     /// A potentially-wide pointer.
     Pointer {
         /// If true, this pointer is never null.
@@ -339,8 +332,37 @@ impl<'tcx> SizeSkeleton<'tcx> {
         ty: Ty<'tcx>,
         tcx: TyCtxt<'tcx>,
         typing_env: ty::TypingEnv<'tcx>,
+        span: Span,
+    ) -> Result<SizeSkeleton<'tcx>, &'tcx LayoutError<'tcx>> {
+        Self::compute_inner(ty, tcx, typing_env, span, 0)
+    }
+
+    fn compute_inner(
+        ty: Ty<'tcx>,
+        tcx: TyCtxt<'tcx>,
+        typing_env: ty::TypingEnv<'tcx>,
+        span: Span,
+        depth: usize,
     ) -> Result<SizeSkeleton<'tcx>, &'tcx LayoutError<'tcx>> {
         debug_assert!(!ty.has_non_region_infer());
+
+        // Bail out if we've recursed too deeply (issue #156137); a cyclic type
+        // alias can otherwise blow the stack here. Using `>=` rather than `>`
+        // means we fire exactly at the limit, which lets us report the
+        // cycle-root type (`Thing<T>`) instead of an innocent field type.
+        let recursion_limit = tcx.recursion_limit();
+        if depth >= recursion_limit.0 {
+            let suggested_limit = match recursion_limit {
+                hir::limit::Limit(0) => hir::limit::Limit(2),
+                limit => limit * 2,
+            };
+            let reported = tcx.dcx().emit_err(crate::error::RecursionLimitReachedSizeSkeleton {
+                span,
+                ty,
+                suggested_limit,
+            });
+            return Err(tcx.arena.alloc(LayoutError::ReferencesError(reported)));
+        }
 
         // First try computing a static layout.
         let err = match tcx.layout_of(typing_env.as_query_input(ty)) {
@@ -367,6 +389,7 @@ impl<'tcx> SizeSkeleton<'tcx> {
             ty::Ref(_, pointee, _) | ty::RawPtr(pointee, _) => {
                 let non_zero = !ty.is_raw_ptr();
 
+                tcx.assert_fully_normalized(typing_env, pointee);
                 let tail = tcx.struct_tail_raw(
                     pointee,
                     &ObligationCause::dummy(),
@@ -412,7 +435,7 @@ impl<'tcx> SizeSkeleton<'tcx> {
                     return Ok(SizeSkeleton::Known(Size::from_bytes(0), None));
                 }
 
-                match SizeSkeleton::compute(inner, tcx, typing_env)? {
+                match SizeSkeleton::compute_inner(inner, tcx, typing_env, span, depth + 1)? {
                     // This may succeed because the multiplication of two types may overflow
                     // but a single size of a nested array will not.
                     SizeSkeleton::Known(s, a) => {
@@ -426,7 +449,7 @@ impl<'tcx> SizeSkeleton<'tcx> {
                         }
                         Err(err)
                     }
-                    SizeSkeleton::Pointer { .. } | SizeSkeleton::Generic(_) => Err(err),
+                    SizeSkeleton::Pointer { .. } => Err(err),
                 }
             }
 
@@ -439,10 +462,15 @@ impl<'tcx> SizeSkeleton<'tcx> {
                 // Get a zero-sized variant or a pointer newtype.
                 let zero_or_ptr_variant = |i| {
                     let i = VariantIdx::from_usize(i);
-                    let fields =
-                        def.variant(i).fields.iter().map(|field| {
-                            SizeSkeleton::compute(field.ty(tcx, args), tcx, typing_env)
-                        });
+                    let fields = def.variant(i).fields.iter().map(|field| {
+                        SizeSkeleton::compute_inner(
+                            field.ty(tcx, args).skip_norm_wip(),
+                            tcx,
+                            typing_env,
+                            span,
+                            depth + 1,
+                        )
+                    });
                     let mut ptr = None;
                     for field in fields {
                         let field = field?;
@@ -460,9 +488,6 @@ impl<'tcx> SizeSkeleton<'tcx> {
                                 }
                                 ptr = Some(field);
                             }
-                            SizeSkeleton::Generic(_) => {
-                                return Err(err);
-                            }
                         }
                     }
                     Ok(ptr)
@@ -472,17 +497,7 @@ impl<'tcx> SizeSkeleton<'tcx> {
                 // Newtype.
                 if def.variants().len() == 1 {
                     if let Some(SizeSkeleton::Pointer { non_zero, tail }) = v0 {
-                        return Ok(SizeSkeleton::Pointer {
-                            non_zero: non_zero
-                                || match tcx.layout_scalar_valid_range(def.did()) {
-                                    (Bound::Included(start), Bound::Unbounded) => start > 0,
-                                    (Bound::Included(start), Bound::Included(end)) => {
-                                        0 < start && start < end
-                                    }
-                                    _ => false,
-                                },
-                            tail,
-                        });
+                        return Ok(SizeSkeleton::Pointer { non_zero, tail });
                     } else {
                         return Err(err);
                     }
@@ -500,23 +515,24 @@ impl<'tcx> SizeSkeleton<'tcx> {
             }
 
             ty::Alias(..) => {
-                let normalized = tcx.normalize_erasing_regions(typing_env, ty);
+                let normalized =
+                    tcx.normalize_erasing_regions(typing_env, Unnormalized::new_wip(ty));
                 if ty == normalized {
                     Err(err)
                 } else {
-                    SizeSkeleton::compute(normalized, tcx, typing_env)
+                    SizeSkeleton::compute_inner(normalized, tcx, typing_env, span, depth + 1)
                 }
             }
 
             ty::Pat(base, pat) => {
                 // Pattern types are always the same size as their base.
-                let base = SizeSkeleton::compute(base, tcx, typing_env);
+                let base = SizeSkeleton::compute_inner(base, tcx, typing_env, span, depth + 1);
                 match *pat {
                     ty::PatternKind::Range { .. } | ty::PatternKind::Or(_) => base,
                     // But in the case of `!null` patterns we need to note that in the
                     // raw pointer.
                     ty::PatternKind::NotNull => match base? {
-                        SizeSkeleton::Known(..) | SizeSkeleton::Generic(_) => base,
+                        SizeSkeleton::Known(..) => base,
                         SizeSkeleton::Pointer { non_zero: _, tail } => {
                             Ok(SizeSkeleton::Pointer { non_zero: true, tail })
                         }
@@ -534,9 +550,6 @@ impl<'tcx> SizeSkeleton<'tcx> {
             (SizeSkeleton::Pointer { tail: a, .. }, SizeSkeleton::Pointer { tail: b, .. }) => {
                 a == b
             }
-            // constants are always pre-normalized into a canonical form so this
-            // only needs to check if their pointers are identical.
-            (SizeSkeleton::Generic(a), SizeSkeleton::Generic(b)) => a == b,
             _ => false,
         }
     }
@@ -548,12 +561,6 @@ pub trait HasTyCtxt<'tcx>: HasDataLayout {
 
 pub trait HasTypingEnv<'tcx> {
     fn typing_env(&self) -> ty::TypingEnv<'tcx>;
-
-    /// FIXME(#132279): This method should not be used as in the future
-    /// everything should take a `TypingEnv` instead. Remove it as that point.
-    fn param_env(&self) -> ty::ParamEnv<'tcx> {
-        self.typing_env().param_env
-    }
 }
 
 impl<'tcx> HasDataLayout for TyCtxt<'tcx> {
@@ -774,8 +781,8 @@ where
                 tcx.mk_layout(LayoutData::uninhabited_variant(cx, variant_index, fields))
             }
 
-            Variants::Multiple { ref variants, .. } => {
-                cx.tcx().mk_layout(variants[variant_index].clone())
+            Variants::Multiple { .. } => {
+                cx.tcx().mk_layout(LayoutData::for_variant(&this, variant_index))
             }
         };
 
@@ -876,7 +883,7 @@ where
                     {
                         let metadata = tcx.normalize_erasing_regions(
                             cx.typing_env(),
-                            Ty::new_projection(tcx, metadata_def_id, [pointee]),
+                            Unnormalized::new(Ty::new_projection(tcx, metadata_def_id, [pointee])),
                         );
 
                         // Map `Metadata = DynMetadata<dyn Trait>` back to a vtable, since it
@@ -944,7 +951,7 @@ where
                     match this.variants {
                         Variants::Single { index } => {
                             let field = &def.variant(index).fields[FieldIdx::from_usize(i)];
-                            TyMaybeWithLayout::Ty(field.ty(tcx, args))
+                            TyMaybeWithLayout::Ty(field.ty(tcx, args).skip_norm_wip())
                         }
                         Variants::Empty => panic!("there is no field in Variants::Empty types"),
 
@@ -1090,7 +1097,7 @@ where
                         } else {
                             VariantIdx::from_u32(0)
                         };
-                        assert_eq!(tagged_variant, *niche_variants.start());
+                        assert_eq!(tagged_variant, niche_variants.start);
                         if *niche_start == 0 {
                             // The other variant is encoded as "null", so we can recurse searching for
                             // a pointer here. This relies on the fact that the codegen backend
@@ -1241,12 +1248,12 @@ pub fn fn_can_unwind(tcx: TyCtxt<'_>, fn_def_id: Option<DefId>, abi: ExternAbi) 
             return false;
         }
 
-        // With -Z panic-in-drop=abort, drop_in_place never unwinds.
+        // With -Z panic-in-drop=abort, `drop_glue` never unwinds.
         //
         // This is not part of `codegen_fn_attrs` as it can differ between crates
         // and therefore cannot be computed in core.
         if !tcx.sess.opts.unstable_opts.panic_in_drop.unwinds()
-            && tcx.is_lang_item(did, LangItem::DropInPlace)
+            && tcx.is_lang_item(did, LangItem::DropGlue)
         {
             return false;
         }
@@ -1283,13 +1290,14 @@ pub fn fn_can_unwind(tcx: TyCtxt<'_>, fn_def_id: Option<DefId>, abi: ExternAbi) 
         | RiscvInterruptM
         | RiscvInterruptS
         | RustInvalid
+        | Swift
         | Unadjusted => false,
         Rust | RustCall | RustCold | RustPreserveNone => tcx.sess.panic_strategy().unwinds(),
     }
 }
 
 /// Error produced by attempting to compute or adjust a `FnAbi`.
-#[derive(Copy, Clone, Debug, HashStable)]
+#[derive(Copy, Clone, Debug, StableHash)]
 pub enum FnAbiError<'tcx> {
     /// Error produced by a `layout_of` call, while computing `FnAbi` initially.
     Layout(LayoutError<'tcx>),

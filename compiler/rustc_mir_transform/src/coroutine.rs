@@ -168,8 +168,8 @@ fn replace_base<'tcx>(place: &mut Place<'tcx>, new_base: Place<'tcx>, tcx: TyCtx
     tracing::trace!(?place);
 }
 
-const SELF_ARG: Local = Local::from_u32(1);
-const CTX_ARG: Local = Local::from_u32(2);
+const SELF_ARG: Local = Local::arg(0);
+const CTX_ARG: Local = Local::arg(1);
 
 /// A `yield` point in the coroutine.
 struct SuspensionPoint<'tcx> {
@@ -237,17 +237,20 @@ impl<'tcx> TransformVisitor<'tcx> {
                 let ty::Adt(_poll_adt, args) = *self.old_yield_ty.kind() else { bug!() };
                 let ty::Adt(_option_adt, args) = *args.type_at(0).kind() else { bug!() };
                 let yield_ty = args.type_at(0);
-                Rvalue::Use(Operand::Constant(Box::new(ConstOperand {
-                    span: source_info.span,
-                    const_: Const::Unevaluated(
-                        UnevaluatedConst::new(
-                            self.tcx.require_lang_item(LangItem::AsyncGenFinished, body.span),
-                            self.tcx.mk_args(&[yield_ty.into()]),
+                Rvalue::Use(
+                    Operand::Constant(Box::new(ConstOperand {
+                        span: source_info.span,
+                        const_: Const::Unevaluated(
+                            UnevaluatedConst::new(
+                                self.tcx.require_lang_item(LangItem::AsyncGenFinished, body.span),
+                                self.tcx.mk_args(&[yield_ty.into()]),
+                            ),
+                            self.old_yield_ty,
                         ),
-                        self.old_yield_ty,
-                    ),
-                    user_ty: None,
-                })))
+                        user_ty: None,
+                    })),
+                    WithRetag::Yes,
+                )
             }
         };
 
@@ -306,22 +309,25 @@ impl<'tcx> TransformVisitor<'tcx> {
                     let ty::Adt(_poll_adt, args) = *self.old_yield_ty.kind() else { bug!() };
                     let ty::Adt(_option_adt, args) = *args.type_at(0).kind() else { bug!() };
                     let yield_ty = args.type_at(0);
-                    Rvalue::Use(Operand::Constant(Box::new(ConstOperand {
-                        span: source_info.span,
-                        const_: Const::Unevaluated(
-                            UnevaluatedConst::new(
-                                self.tcx.require_lang_item(
-                                    LangItem::AsyncGenFinished,
-                                    source_info.span,
+                    Rvalue::Use(
+                        Operand::Constant(Box::new(ConstOperand {
+                            span: source_info.span,
+                            const_: Const::Unevaluated(
+                                UnevaluatedConst::new(
+                                    self.tcx.require_lang_item(
+                                        LangItem::AsyncGenFinished,
+                                        source_info.span,
+                                    ),
+                                    self.tcx.mk_args(&[yield_ty.into()]),
                                 ),
-                                self.tcx.mk_args(&[yield_ty.into()]),
+                                self.old_yield_ty,
                             ),
-                            self.old_yield_ty,
-                        ),
-                        user_ty: None,
-                    })))
+                            user_ty: None,
+                        })),
+                        WithRetag::Yes,
+                    )
                 } else {
-                    Rvalue::Use(val)
+                    Rvalue::Use(val, WithRetag::Yes)
                 }
             }
             CoroutineKind::Coroutine(_) => {
@@ -545,19 +551,13 @@ fn make_coroutine_state_argument_pinned<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body
     let pin_field = tcx.mk_place_field(SELF_ARG.into(), FieldIdx::ZERO, ref_coroutine_ty);
 
     let statements = &mut body.basic_blocks.as_mut_preserves_cfg()[START_BLOCK].statements;
-    // Miri requires retags to be the very first thing in the body.
-    // We insert this assignment just after.
-    let insert_point = statements
-        .iter()
-        .position(|stmt| !matches!(stmt.kind, StatementKind::Retag(..)))
-        .unwrap_or(statements.len());
     statements.insert(
-        insert_point,
+        0,
         Statement::new(
             source_info,
             StatementKind::Assign(Box::new((
                 unpinned_local.into(),
-                Rvalue::Use(Operand::Copy(pin_field)),
+                Rvalue::Use(Operand::Copy(pin_field), WithRetag::Yes),
             ))),
         ),
     );
@@ -626,7 +626,7 @@ fn eliminate_get_context_call<'tcx>(bb_data: &mut BasicBlockData<'tcx>) -> Local
     let [arg] = *Box::try_from(args).unwrap();
     let local = arg.node.place().unwrap().local;
 
-    let arg = Rvalue::Use(arg.node);
+    let arg = Rvalue::Use(arg.node, WithRetag::Yes);
     let assign =
         Statement::new(terminator.source_info, StatementKind::Assign(Box::new((destination, arg))));
     bb_data.statements.push(assign);
@@ -997,12 +997,10 @@ fn compute_layout<'tcx>(
         let ignore_for_traits = match decl.local_info {
             // Do not include raw pointers created from accessing `static` items, as those could
             // well be re-created by another access to the same static.
-            ClearCrossCrate::Set(box LocalInfo::StaticRef { is_thread_local, .. }) => {
-                !is_thread_local
-            }
+            ClearCrossCrate::Set(LocalInfo::StaticRef { is_thread_local, .. }) => !is_thread_local,
             // Fake borrows are only read by fake reads, so do not have any reality in
             // post-analysis MIR.
-            ClearCrossCrate::Set(box LocalInfo::FakeBorrow) => true,
+            ClearCrossCrate::Set(LocalInfo::FakeBorrow) => true,
             _ => false,
         };
         let decl =
@@ -1079,7 +1077,7 @@ fn compute_layout<'tcx>(
 /// Replaces the entry point of `body` with a block that switches on the coroutine discriminant and
 /// dispatches to blocks according to `cases`.
 ///
-/// After this function, the former entry point of the function will be bb1.
+/// After this function, the former entry point of the function will be the last block.
 fn insert_switch<'tcx>(
     body: &mut Body<'tcx>,
     cases: Vec<(usize, BasicBlock)>,
@@ -1087,23 +1085,34 @@ fn insert_switch<'tcx>(
     default_block: BasicBlock,
 ) {
     let (assign, discr) = transform.get_discr(body);
-    let switch_targets =
-        SwitchTargets::new(cases.iter().map(|(i, bb)| ((*i) as u128, *bb)), default_block);
-    let switch = TerminatorKind::SwitchInt { discr: Operand::Move(discr), targets: switch_targets };
 
-    let source_info = SourceInfo::outermost(body.span);
-    body.basic_blocks_mut().raw.insert(
-        0,
-        BasicBlockData::new_stmts(
-            vec![assign],
-            Some(Terminator { source_info, kind: switch }),
-            false,
-        ),
-    );
-
-    for b in body.basic_blocks_mut().iter_mut() {
-        b.terminator_mut().successors_mut(|target| *target += 1);
+    // MIR validation ensures that no block targets `ENTRY_BLOCK`.
+    #[cfg(debug_assertions)]
+    for bb in body.basic_blocks.iter() {
+        for target in bb.terminator().successors() {
+            assert_ne!(target, START_BLOCK);
+        }
     }
+
+    // Add the switch as entry block, and put the former entry block at the end.
+    let former_entry = std::mem::replace(
+        &mut body.basic_blocks_mut()[START_BLOCK],
+        BasicBlockData::new_stmts(vec![assign], None, false),
+    );
+    let former_entry = body.basic_blocks_mut().push(former_entry);
+
+    // We may point to `START_BLOCK` in our `cases`, replace it with `former_entry`.
+    let mut switch_targets =
+        SwitchTargets::new(cases.iter().map(|(i, bb)| ((*i) as u128, *bb)), default_block);
+    for bb in switch_targets.all_targets_mut() {
+        if *bb == START_BLOCK {
+            *bb = former_entry;
+        }
+    }
+
+    let switch = TerminatorKind::SwitchInt { discr: Operand::Move(discr), targets: switch_targets };
+    body.basic_blocks_mut()[START_BLOCK].terminator =
+        Some(Terminator { source_info: SourceInfo::outermost(body.span), kind: switch });
 }
 
 fn insert_term_block<'tcx>(body: &mut Body<'tcx>, kind: TerminatorKind<'tcx>) -> BasicBlock {
@@ -1174,41 +1183,8 @@ fn can_unwind<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> bool {
         return false;
     }
 
-    // Unwinds can only start at certain terminators.
-    for block in body.basic_blocks.iter() {
-        match block.terminator().kind {
-            // These never unwind.
-            TerminatorKind::Goto { .. }
-            | TerminatorKind::SwitchInt { .. }
-            | TerminatorKind::UnwindTerminate(_)
-            | TerminatorKind::Return
-            | TerminatorKind::Unreachable
-            | TerminatorKind::CoroutineDrop
-            | TerminatorKind::FalseEdge { .. }
-            | TerminatorKind::FalseUnwind { .. } => {}
-
-            // Resume will *continue* unwinding, but if there's no other unwinding terminator it
-            // will never be reached.
-            TerminatorKind::UnwindResume => {}
-
-            TerminatorKind::Yield { .. } => {
-                unreachable!("`can_unwind` called before coroutine transform")
-            }
-
-            // These may unwind.
-            TerminatorKind::Drop { .. }
-            | TerminatorKind::Call { .. }
-            | TerminatorKind::InlineAsm { .. }
-            | TerminatorKind::Assert { .. } => return true,
-
-            TerminatorKind::TailCall { .. } => {
-                unreachable!("tail calls can't be present in generators")
-            }
-        }
-    }
-
-    // If we didn't find an unwinding terminator, the function cannot unwind.
-    false
+    // If we don't find an unwinding terminator, the function cannot unwind.
+    body.basic_blocks.iter().any(|block| block.terminator().unwind().is_some())
 }
 
 // Poison the coroutine when it unwinds
@@ -1326,13 +1302,21 @@ fn create_coroutine_resume_function<'tcx>(
 enum Operation {
     Resume,
     Drop,
+    AsyncDrop,
 }
 
 impl Operation {
     fn target_block(self, point: &SuspensionPoint<'_>) -> Option<BasicBlock> {
         match self {
             Operation::Resume => Some(point.resume),
-            Operation::Drop => point.drop,
+            Operation::Drop | Operation::AsyncDrop => point.drop,
+        }
+    }
+
+    fn resume_place<'tcx>(self, point: &SuspensionPoint<'tcx>) -> Option<Place<'tcx>> {
+        match self {
+            Operation::Resume | Operation::AsyncDrop => Some(point.resume_arg),
+            Operation::Drop => None,
         }
     }
 }
@@ -1363,13 +1347,15 @@ fn create_cases<'tcx>(
                     }
                 }
 
-                if operation == Operation::Resume && point.resume_arg != CTX_ARG.into() {
-                    // Move the resume argument to the destination place of the `Yield` terminator
+                // Move the resume argument to the destination place of the `Yield` terminator
+                if let Some(resume_arg) = operation.resume_place(point)
+                    && resume_arg != CTX_ARG.into()
+                {
                     statements.push(Statement::new(
                         source_info,
                         StatementKind::Assign(Box::new((
-                            point.resume_arg,
-                            Rvalue::Use(Operand::Move(CTX_ARG.into())),
+                            resume_arg,
+                            Rvalue::Use(Operand::Move(CTX_ARG.into()), WithRetag::Yes),
                         ))),
                     ));
                 }
@@ -1599,7 +1585,7 @@ impl<'tcx> crate::MirPass<'tcx> for StateTransform {
             args_iter.filter_map(|local| {
                 let (ty, variant_index, idx) = transform.remap[local]?;
                 let lhs = transform.make_field(variant_index, idx, ty);
-                let rhs = Rvalue::Use(Operand::Move(local.into()));
+                let rhs = Rvalue::Use(Operand::Move(local.into()), WithRetag::Yes);
                 let assign = StatementKind::Assign(Box::new((lhs, rhs)));
                 Some(Statement::new(source_info, assign))
             }),
@@ -1747,7 +1733,7 @@ impl<'tcx> Visitor<'tcx> for EnsureCoroutineFieldAssignmentsNeverAlias<'_> {
 
     fn visit_statement(&mut self, statement: &Statement<'tcx>, location: Location) {
         match &statement.kind {
-            StatementKind::Assign(box (lhs, rhs)) => {
+            StatementKind::Assign((lhs, rhs)) => {
                 self.check_assigned_place(*lhs, |this| this.visit_rvalue(rhs, location));
             }
 
@@ -1755,7 +1741,6 @@ impl<'tcx> Visitor<'tcx> for EnsureCoroutineFieldAssignmentsNeverAlias<'_> {
             | StatementKind::SetDiscriminant { .. }
             | StatementKind::StorageLive(_)
             | StatementKind::StorageDead(_)
-            | StatementKind::Retag(..)
             | StatementKind::AscribeUserType(..)
             | StatementKind::PlaceMention(..)
             | StatementKind::Coverage(..)

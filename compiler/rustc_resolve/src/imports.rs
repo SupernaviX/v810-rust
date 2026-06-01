@@ -1,26 +1,32 @@
 //! A bunch of methods and structures more or less related to resolving imports.
 
+use std::cmp::Ordering;
 use std::mem;
 
+use itertools::Itertools;
 use rustc_ast::{Item, NodeId};
 use rustc_attr_parsing::AttributeParser;
 use rustc_data_structures::fx::{FxHashSet, FxIndexSet};
 use rustc_data_structures::intern::Interned;
 use rustc_errors::codes::*;
-use rustc_errors::{Applicability, Diagnostic, MultiSpan, pluralize, struct_span_code_err};
+use rustc_errors::{
+    Applicability, BufferedEarlyLint, Diagnostic, MultiSpan, pluralize, struct_span_code_err,
+};
+use rustc_expand::base::SyntaxExtensionKind;
 use rustc_hir::Attribute;
 use rustc_hir::attrs::AttributeKind;
 use rustc_hir::attrs::diagnostic::{CustomDiagnostic, Directive, FormatArgs};
 use rustc_hir::def::{self, DefKind, PartialRes};
-use rustc_hir::def_id::{DefId, LocalDefIdMap};
+use rustc_hir::def_id::{DefId, LocalDefId, LocalDefIdMap};
 use rustc_middle::metadata::{AmbigModChild, ModChild, Reexport};
 use rustc_middle::span_bug;
 use rustc_middle::ty::{TyCtxt, Visibility};
+use rustc_session::errors::feature_err;
+use rustc_session::lint::LintId;
 use rustc_session::lint::builtin::{
     AMBIGUOUS_GLOB_REEXPORTS, EXPORTED_PRIVATE_DEPENDENCIES, HIDDEN_GLOB_REEXPORTS,
     PUB_USE_OF_PRIVATE_EXTERN_CRATE, REDUNDANT_IMPORTS, UNUSED_IMPORTS,
 };
-use rustc_session::parse::feature_err;
 use rustc_span::edit_distance::find_best_match_for_name;
 use rustc_span::hygiene::LocalExpnId;
 use rustc_span::{Ident, Span, Symbol, kw, sym};
@@ -37,8 +43,9 @@ use crate::errors::{
 use crate::ref_mut::CmCell;
 use crate::{
     AmbiguityError, BindingKey, CmResolver, Decl, DeclData, DeclKind, Determinacy, Finalize,
-    IdentKey, ImportSuggestion, LocalModule, ModuleOrUniformRoot, ParentScope, PathResult, PerNS,
-    Res, ResolutionError, Resolver, ScopeSet, Segment, Used, module_to_string, names_to_string,
+    IdentKey, ImportSuggestion, ImportSummary, LocalModule, ModuleOrUniformRoot, ParentScope,
+    PathResult, PerNS, Res, ResolutionError, Resolver, ScopeSet, Segment, Used, module_to_string,
+    names_to_string,
 };
 
 /// A potential import declaration in the process of being planted into a module.
@@ -70,8 +77,6 @@ pub(crate) enum ImportKind<'ra> {
         target: Ident,
         /// Name declarations introduced by the import.
         decls: PerNS<CmCell<PendingDecl<'ra>>>,
-        /// `true` for `...::{self [as target]}` imports, `false` otherwise.
-        type_ns_only: bool,
         /// Did this import result from a nested import? i.e. `use foo::{bar, baz};`
         nested: bool,
         /// The ID of the `UseTree` that imported this `Import`.
@@ -86,17 +91,20 @@ pub(crate) enum ImportKind<'ra> {
         /// If this is the import for `foo::bar::a`, we would have the ID of the `UseTree`
         /// for `a` in this field.
         id: NodeId,
+        def_id: LocalDefId,
     },
     Glob {
         // The visibility of the greatest re-export.
         // n.b. `max_vis` is only used in `finalize_import` to check for re-export errors.
         max_vis: CmCell<Option<Visibility>>,
         id: NodeId,
+        def_id: LocalDefId,
     },
     ExternCrate {
         source: Option<Symbol>,
         target: Ident,
         id: NodeId,
+        def_id: LocalDefId,
     },
     MacroUse {
         /// A field has been added indicating whether it should be reported as a lint,
@@ -112,7 +120,7 @@ impl<'ra> std::fmt::Debug for ImportKind<'ra> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         use ImportKind::*;
         match self {
-            Single { source, target, decls, type_ns_only, nested, id, .. } => f
+            Single { source, target, decls, nested, id, def_id } => f
                 .debug_struct("Single")
                 .field("source", source)
                 .field("target", target)
@@ -121,18 +129,22 @@ impl<'ra> std::fmt::Debug for ImportKind<'ra> {
                     "decls",
                     &decls.clone().map(|b| b.into_inner().decl().map(|_| format_args!(".."))),
                 )
-                .field("type_ns_only", type_ns_only)
                 .field("nested", nested)
                 .field("id", id)
+                .field("def_id", def_id)
                 .finish(),
-            Glob { max_vis, id } => {
-                f.debug_struct("Glob").field("max_vis", max_vis).field("id", id).finish()
-            }
-            ExternCrate { source, target, id } => f
+            Glob { max_vis, id, def_id } => f
+                .debug_struct("Glob")
+                .field("max_vis", max_vis)
+                .field("id", id)
+                .field("def_id", def_id)
+                .finish(),
+            ExternCrate { source, target, id, def_id } => f
                 .debug_struct("ExternCrate")
                 .field("source", source)
                 .field("target", target)
                 .field("id", id)
+                .field("def_id", def_id)
                 .finish(),
             MacroUse { warn_private } => {
                 f.debug_struct("MacroUse").field("warn_private", warn_private).finish()
@@ -149,17 +161,15 @@ pub(crate) struct OnUnknownData {
 
 impl OnUnknownData {
     pub(crate) fn from_attrs<'tcx>(tcx: TyCtxt<'tcx>, item: &Item) -> Option<OnUnknownData> {
-        if let Some(Attribute::Parsed(AttributeKind::OnUnknown { directive, .. })) =
-            AttributeParser::parse_limited(
-                tcx.sess,
-                &item.attrs,
-                &[sym::diagnostic, sym::on_unknown],
-                item.span,
-                item.id,
-                Some(tcx.features()),
-            )
+        if tcx.features().diagnostic_on_unknown()
+            && let Some(Attribute::Parsed(AttributeKind::OnUnknown { directive, .. })) =
+                AttributeParser::parse_limited(
+                    tcx.sess,
+                    &item.attrs,
+                    &[sym::diagnostic, sym::on_unknown],
+                )
         {
-            Some(Self { directive: Box::new(*directive?) })
+            Some(Self { directive: directive? })
         } else {
             None
         }
@@ -216,6 +226,8 @@ pub(crate) struct ImportData<'ra> {
     /// A `#[diagnostic::on_unknown]` attribute applied
     /// to the given import. This allows crates to specify
     /// custom error messages for a specific import
+    ///
+    /// This is `None` if the feature flag for `diagnostic::on_unknown` is disabled.
     pub on_unknown_attr: Option<OnUnknownData>,
 }
 
@@ -257,14 +269,32 @@ impl<'ra> ImportData<'ra> {
         }
     }
 
-    pub(crate) fn simplify(&self, r: &Resolver<'_, '_>) -> Reexport {
-        let to_def_id = |id| r.local_def_id(id).to_def_id();
+    pub(crate) fn def_id(&self) -> Option<LocalDefId> {
         match self.kind {
-            ImportKind::Single { id, .. } => Reexport::Single(to_def_id(id)),
-            ImportKind::Glob { id, .. } => Reexport::Glob(to_def_id(id)),
-            ImportKind::ExternCrate { id, .. } => Reexport::ExternCrate(to_def_id(id)),
+            ImportKind::Single { def_id, .. }
+            | ImportKind::Glob { def_id, .. }
+            | ImportKind::ExternCrate { def_id, .. } => Some(def_id),
+            ImportKind::MacroUse { .. } | ImportKind::MacroExport => None,
+        }
+    }
+
+    pub(crate) fn simplify(&self) -> Reexport {
+        match self.kind {
+            ImportKind::Single { def_id, .. } => Reexport::Single(def_id.to_def_id()),
+            ImportKind::Glob { def_id, .. } => Reexport::Glob(def_id.to_def_id()),
+            ImportKind::ExternCrate { def_id, .. } => Reexport::ExternCrate(def_id.to_def_id()),
             ImportKind::MacroUse { .. } => Reexport::MacroUse,
             ImportKind::MacroExport => Reexport::MacroExport,
+        }
+    }
+
+    fn summary(&self) -> ImportSummary {
+        ImportSummary {
+            vis: self.vis,
+            nearest_parent_mod: self.parent_scope.module.nearest_parent_mod().expect_local(),
+            is_single: matches!(self.kind, ImportKind::Single { .. }),
+            priv_macro_use: matches!(self.kind, ImportKind::MacroUse { warn_private: true }),
+            span: self.span,
         }
     }
 }
@@ -327,13 +357,16 @@ struct UnresolvedImportError {
 
 // Reexports of the form `pub use foo as bar;` where `foo` is `extern crate foo;`
 // are permitted for backward-compatibility under a deprecation lint.
-fn pub_use_of_private_extern_crate_hack(import: Import<'_>, decl: Decl<'_>) -> Option<NodeId> {
-    match (&import.kind, &decl.kind) {
-        (ImportKind::Single { .. }, DeclKind::Import { import: decl_import, .. })
-            if let ImportKind::ExternCrate { id, .. } = decl_import.kind
+fn pub_use_of_private_extern_crate_hack(
+    import: ImportSummary,
+    decl: Decl<'_>,
+) -> Option<LocalDefId> {
+    match (import.is_single, decl.kind) {
+        (true, DeclKind::Import { import: decl_import, .. })
+            if let ImportKind::ExternCrate { def_id, .. } = decl_import.kind
                 && import.vis.is_public() =>
         {
-            Some(id)
+            Some(def_id)
         }
         _ => None,
     }
@@ -349,11 +382,9 @@ fn remove_same_import<'ra>(d1: Decl<'ra>, d2: Decl<'ra>) -> (Decl<'ra>, Decl<'ra
         assert_eq!(d1.span, d2.span);
         if d1.ambiguity.get() != d2.ambiguity.get() {
             assert!(d1.ambiguity.get().is_some());
-            assert!(d2.ambiguity.get().is_none());
         }
         // Visibility of the new import declaration may be different,
         // because it already incorporates the visibility of the source binding.
-        // `warn_ambiguity` of a re-fetched glob can also change in both directions.
         remove_same_import(d1_next, d2_next)
     } else {
         (d1, d2)
@@ -361,44 +392,150 @@ fn remove_same_import<'ra>(d1: Decl<'ra>, d2: Decl<'ra>) -> (Decl<'ra>, Decl<'ra
 }
 
 impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
+    pub(crate) fn import_decl_vis(&self, decl: Decl<'ra>, import: ImportSummary) -> Visibility {
+        self.import_decl_vis_ext(decl, import, false)
+    }
+
+    pub(crate) fn import_decl_vis_ext(
+        &self,
+        decl: Decl<'ra>,
+        import: ImportSummary,
+        min: bool,
+    ) -> Visibility {
+        assert!(import.vis.is_accessible_from(import.nearest_parent_mod, self.tcx));
+        let decl_vis = if min { decl.min_vis() } else { decl.vis() };
+        let ord = decl_vis.partial_cmp(import.vis, self.tcx);
+        let extern_crate_hack = pub_use_of_private_extern_crate_hack(import, decl).is_some();
+        if ord == Some(Ordering::Less)
+            && decl_vis.is_accessible_from(import.nearest_parent_mod, self.tcx)
+            && !extern_crate_hack
+        {
+            // Imported declaration is less visible than the import, but is still visible
+            // from the current module, use the declaration's visibility.
+            decl_vis.expect_local()
+        } else {
+            // Good case - imported declaration is more visible than the import, or the same,
+            // use the import's visibility.
+            //
+            // Bad case - imported declaration is too private for the current module.
+            // It doesn't matter what visibility we choose here (except in the `PRIVATE_MACRO_USE`
+            // and `PUB_USE_OF_PRIVATE_EXTERN_CRATE` cases), because an error will be reported.
+            // Use import visibility to keep the all declaration visibilities in a module ordered.
+            if !min
+                && matches!(ord, None | Some(Ordering::Less))
+                && !extern_crate_hack
+                && !import.priv_macro_use
+            {
+                let msg = format!("cannot extend visibility from {decl_vis:?} to {:?}", import.vis);
+                self.dcx().span_delayed_bug(import.span, msg);
+            }
+            import.vis
+        }
+    }
+
     /// Given an import and the declaration that it points to,
     /// create the corresponding import declaration.
     pub(crate) fn new_import_decl(&self, decl: Decl<'ra>, import: Import<'ra>) -> Decl<'ra> {
-        let import_vis = import.vis.to_def_id();
-        let vis = if decl.vis().is_at_least(import_vis, self.tcx)
-            || pub_use_of_private_extern_crate_hack(import, decl).is_some()
-        {
-            import_vis
-        } else {
-            decl.vis()
-        };
+        let vis = self.import_decl_vis(decl, import.summary());
 
         if let ImportKind::Glob { ref max_vis, .. } = import.kind
-            && (vis == import_vis
-                || max_vis.get().is_none_or(|max_vis| vis.is_at_least(max_vis, self.tcx)))
+            && (vis == import.vis
+                || max_vis.get().is_none_or(|max_vis| vis.greater_than(max_vis, self.tcx)))
         {
-            max_vis.set_unchecked(Some(vis.expect_local()))
+            max_vis.set_unchecked(Some(vis))
         }
 
         self.arenas.alloc_decl(DeclData {
             kind: DeclKind::Import { source_decl: decl, import },
             ambiguity: CmCell::new(None),
-            warn_ambiguity: CmCell::new(false),
             span: import.span,
-            vis: CmCell::new(vis),
+            initial_vis: vis.to_def_id(),
+            ambiguity_vis_max: CmCell::new(None),
+            ambiguity_vis_min: CmCell::new(None),
             expansion: import.parent_scope.expansion,
             parent_module: Some(import.parent_scope.module),
         })
     }
 
+    fn is_noise_0_7_0(&self, old_glob_decl: Decl<'ra>, glob_decl: Decl<'ra>) -> bool {
+        let DeclKind::Import { import: i1, .. } = glob_decl.kind else { unreachable!() };
+        let DeclKind::Import { import: i2, .. } = old_glob_decl.kind else { unreachable!() };
+        let [seg1, seg2] = &i1.module_path[..] else { return false };
+        if seg1.ident.name != kw::SelfLower || seg2.ident.name.as_str() != "perlin_surflet" {
+            return false;
+        }
+        let [seg1, seg2] = &i2.module_path[..] else { return false };
+        if seg1.ident.name != kw::SelfLower || seg2.ident.name.as_str() != "perlin" {
+            return false;
+        }
+        let Some(def_id1) = glob_decl.res().opt_def_id() else { return false };
+        let Some(def_id2) = old_glob_decl.res().opt_def_id() else { return false };
+        self.def_path_str(def_id1).ends_with("noise_fns::generators::perlin_surflet::Perlin")
+            && self.def_path_str(def_id2).ends_with("noise_fns::generators::perlin::Perlin")
+    }
+
+    fn is_rustybuzz_0_4_0(&self, old_glob_decl: Decl<'ra>, glob_decl: Decl<'ra>) -> bool {
+        let DeclKind::Import { import: i1, .. } = glob_decl.kind else { unreachable!() };
+        let DeclKind::Import { import: i2, .. } = old_glob_decl.kind else { unreachable!() };
+        let [seg1, seg2] = &i1.module_path[..] else { return false };
+        if seg1.ident.name != kw::Super || seg2.ident.name.as_str() != "gsubgpos" {
+            return false;
+        }
+        let [seg1] = &i2.module_path[..] else { return false };
+        if seg1.ident.name != kw::Super {
+            return false;
+        }
+        let Some(def_id1) = glob_decl.res().opt_def_id() else { return false };
+        let Some(def_id2) = old_glob_decl.res().opt_def_id() else { return false };
+        self.def_path_str(def_id1).ends_with("tables::gsubgpos::Class")
+            && self.def_path_str(def_id2).ends_with("ggg::Class")
+    }
+
+    fn is_pdf_0_9_0(&self, old_glob_decl: Decl<'ra>, glob_decl: Decl<'ra>) -> bool {
+        let DeclKind::Import { import: i1, .. } = glob_decl.kind else { unreachable!() };
+        let DeclKind::Import { import: i2, .. } = old_glob_decl.kind else { unreachable!() };
+        let [seg1, seg2] = &i1.module_path[..] else { return false };
+        if seg1.ident.name != kw::Crate || seg2.ident.name.as_str() != "content" {
+            return false;
+        }
+        let [seg1, seg2] = &i2.module_path[..] else { return false };
+        if seg1.ident.name != kw::Crate || seg2.ident.name.as_str() != "object" {
+            return false;
+        }
+        let Some(def_id1) = glob_decl.res().opt_def_id() else { return false };
+        let Some(def_id2) = old_glob_decl.res().opt_def_id() else { return false };
+        self.def_path_str(def_id1).ends_with("crate::content::Rect")
+            && self.def_path_str(def_id2).ends_with("crate::object::types::Rect")
+    }
+
+    fn is_net2_0_2_39(&self, old_glob_decl: Decl<'ra>, glob_decl: Decl<'ra>) -> bool {
+        let DeclKind::Import { import: i1, .. } = glob_decl.kind else { unreachable!() };
+        let DeclKind::Import { import: i2, .. } = old_glob_decl.kind else { unreachable!() };
+        let [seg1, seg2, seg3, seg4] = &i1.module_path[..] else { return false };
+        if seg1.ident.name != kw::PathRoot
+            || seg2.ident.name.as_str() != "winapi"
+            || seg3.ident.name.as_str() != "shared"
+            || seg4.ident.name.as_str() != "ws2def"
+        {
+            return false;
+        }
+        let [seg1, seg2, seg3, seg4] = &i2.module_path[..] else { return false };
+        if seg1.ident.name != kw::PathRoot
+            || seg2.ident.name.as_str() != "winapi"
+            || seg3.ident.name.as_str() != "um"
+            || seg4.ident.name.as_str() != "winsock2"
+        {
+            return false;
+        }
+        let Some(def_id1) = glob_decl.res().opt_def_id() else { return false };
+        let Some(def_id2) = old_glob_decl.res().opt_def_id() else { return false };
+        self.def_path_str(def_id1).starts_with("winapi::shared::ws2def::")
+            && self.def_path_str(def_id2).starts_with("winapi::um::winsock2::")
+    }
+
     /// If `glob_decl` attempts to overwrite `old_glob_decl` in a module,
     /// decide which one to keep.
-    fn select_glob_decl(
-        &self,
-        old_glob_decl: Decl<'ra>,
-        glob_decl: Decl<'ra>,
-        warn_ambiguity: bool,
-    ) -> Decl<'ra> {
+    fn select_glob_decl(&self, old_glob_decl: Decl<'ra>, glob_decl: Decl<'ra>) -> Decl<'ra> {
         assert!(glob_decl.is_glob_import());
         assert!(old_glob_decl.is_glob_import());
         assert_ne!(glob_decl, old_glob_decl);
@@ -407,11 +544,6 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
         // all these overwrites will be re-fetched by glob imports importing
         // from that module without generating new ambiguities.
         // - A glob decl is overwritten by a non-glob decl arriving later.
-        // - A glob decl is overwritten by its clone after setting ambiguity in it.
-        //   FIXME: avoid this by removing `warn_ambiguity`, or by triggering glob re-fetch
-        //   with the same decl in some way.
-        // - A glob decl is overwritten by a glob decl with larger visibility.
-        //   FIXME: avoid this by updating this visibility in place.
         // - A glob decl is overwritten by a glob decl re-fetching an
         //   overwritten decl from other module (the recursive case).
         // Here we are detecting all such re-fetches and overwrite old decls
@@ -422,39 +554,39 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
         if deep_decl != glob_decl {
             // Some import layers have been removed, need to overwrite.
             assert_ne!(old_deep_decl, old_glob_decl);
-            // FIXME: reenable the asserts when `warn_ambiguity` is removed (#149195).
-            // assert_ne!(old_deep_decl, deep_decl);
-            // assert!(old_deep_decl.is_glob_import());
-            // FIXME: reenable the assert when visibility is updated in place.
-            // assert!(!deep_decl.is_glob_import());
-            if old_glob_decl.ambiguity.get().is_some() && glob_decl.ambiguity.get().is_none() {
+            assert!(!deep_decl.is_glob_import());
+            if let Some((old_ambig, _)) = old_glob_decl.ambiguity.get()
+                && glob_decl.ambiguity.get().is_none()
+            {
                 // Do not lose glob ambiguities when re-fetching the glob.
-                glob_decl.ambiguity.set_unchecked(old_glob_decl.ambiguity.get());
-            }
-            if glob_decl.is_ambiguity_recursive() {
-                glob_decl.warn_ambiguity.set_unchecked(true);
+                glob_decl.ambiguity.set_unchecked(Some((old_ambig, true)));
             }
             glob_decl
         } else if glob_decl.res() != old_glob_decl.res() {
-            old_glob_decl.ambiguity.set_unchecked(Some(glob_decl));
-            old_glob_decl.warn_ambiguity.set_unchecked(warn_ambiguity);
-            if warn_ambiguity {
-                old_glob_decl
-            } else {
-                // Need a fresh decl so other glob imports importing it could re-fetch it
-                // and set their own `warn_ambiguity` to true.
-                // FIXME: remove this when `warn_ambiguity` is removed (#149195).
-                self.arenas.alloc_decl((*old_glob_decl).clone())
+            let warning = self.is_noise_0_7_0(old_glob_decl, glob_decl)
+                || self.is_rustybuzz_0_4_0(old_glob_decl, glob_decl)
+                || self.is_pdf_0_9_0(old_glob_decl, glob_decl)
+                || self.is_net2_0_2_39(old_glob_decl, glob_decl);
+            old_glob_decl.ambiguity.set_unchecked(Some((glob_decl, warning)));
+            old_glob_decl
+        } else if let old_vis = old_glob_decl.vis()
+            && let vis = glob_decl.vis()
+            && old_vis != vis
+        {
+            // We are glob-importing the same item but with a different visibility.
+            // All visibilities here are ordered because all of them are ancestors of `module`.
+            if vis.greater_than(old_vis, self.tcx) {
+                old_glob_decl.ambiguity_vis_max.set_unchecked(Some(glob_decl));
+            } else if let old_min_vis = old_glob_decl.min_vis()
+                && old_min_vis != vis
+                && old_min_vis.greater_than(vis, self.tcx)
+            {
+                old_glob_decl.ambiguity_vis_min.set_unchecked(Some(glob_decl));
             }
-        } else if !old_glob_decl.vis().is_at_least(glob_decl.vis(), self.tcx) {
-            // We are glob-importing the same item but with greater visibility.
-            // FIXME: Update visibility in place, but without regressions
-            // (#152004, #151124, #152347).
-            glob_decl
+            old_glob_decl
         } else if glob_decl.is_ambiguity_recursive() && !old_glob_decl.is_ambiguity_recursive() {
             // Overwriting a non-ambiguous glob import with an ambiguous glob import.
-            old_glob_decl.ambiguity.set_unchecked(Some(glob_decl));
-            old_glob_decl.warn_ambiguity.set_unchecked(true);
+            old_glob_decl.ambiguity.set_unchecked(Some((glob_decl, true)));
             old_glob_decl
         } else {
             old_glob_decl
@@ -469,9 +601,12 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
         orig_ident_span: Span,
         ns: Namespace,
         decl: Decl<'ra>,
-        warn_ambiguity: bool,
     ) -> Result<(), Decl<'ra>> {
+        assert!(decl.ambiguity.get().is_none());
+        assert!(decl.ambiguity_vis_max.get().is_none());
+        assert!(decl.ambiguity_vis_min.get().is_none());
         let module = decl.parent_module.unwrap().expect_local();
+        assert!(self.is_accessible_from(decl.vis(), module.to_module()));
         let res = decl.res();
         self.check_reserved_macro_name(ident.name, orig_ident_span, res);
         // Even if underscore names cannot be looked up, we still need to add them to modules,
@@ -481,32 +616,21 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
             module.underscore_disambiguator.update_unchecked(|d| d + 1);
             module.underscore_disambiguator.get()
         });
-        self.update_local_resolution(
-            module,
-            key,
-            orig_ident_span,
-            warn_ambiguity,
-            |this, resolution| {
-                assert!(!decl.warn_ambiguity.get());
-                if decl.is_glob_import() {
-                    resolution.glob_decl = Some(match resolution.glob_decl {
-                        Some(old_decl) => this.select_glob_decl(
-                            old_decl,
-                            decl,
-                            warn_ambiguity && resolution.non_glob_decl.is_none(),
-                        ),
-                        None => decl,
-                    })
-                } else {
-                    resolution.non_glob_decl = Some(match resolution.non_glob_decl {
-                        Some(old_decl) => return Err(old_decl),
-                        None => decl,
-                    })
-                }
+        self.update_local_resolution(module, key, orig_ident_span, |this, resolution| {
+            if decl.is_glob_import() {
+                resolution.glob_decl = Some(match resolution.glob_decl {
+                    Some(old_decl) => this.select_glob_decl(old_decl, decl),
+                    None => decl,
+                });
+            } else {
+                resolution.non_glob_decl = Some(match resolution.non_glob_decl {
+                    Some(old_decl) => return Err(old_decl),
+                    None => decl,
+                })
+            }
 
-                Ok(())
-            },
-        )
+            Ok(())
+        })
     }
 
     // Use `f` to mutate the resolution of the name in the module.
@@ -516,7 +640,6 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
         module: LocalModule<'ra>,
         key: BindingKey,
         orig_ident_span: Span,
-        warn_ambiguity: bool,
         f: F,
     ) -> T
     where
@@ -524,18 +647,19 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
     {
         // Ensure that `resolution` isn't borrowed when defining in the module's glob importers,
         // during which the resolution might end up getting re-defined via a glob cycle.
-        let (binding, t, warn_ambiguity) = {
+        let (binding, t) = {
             let resolution = &mut *self
                 .resolution_or_default(module.to_module(), key, orig_ident_span)
                 .borrow_mut_unchecked();
             let old_decl = resolution.determined_decl();
+            let old_vis = old_decl.map(|d| d.vis());
 
             let t = f(self, resolution);
 
             if let Some(binding) = resolution.determined_decl()
-                && old_decl != Some(binding)
+                && (old_decl != Some(binding) || old_vis != Some(binding.vis()))
             {
-                (binding, t, warn_ambiguity || old_decl.is_some())
+                (binding, t)
             } else {
                 return t;
             }
@@ -558,14 +682,8 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
             };
             if self.is_accessible_from(binding.vis(), scope) {
                 let import_decl = self.new_import_decl(binding, *import);
-                self.try_plant_decl_into_local_module(
-                    ident,
-                    orig_ident_span,
-                    key.ns,
-                    import_decl,
-                    warn_ambiguity,
-                )
-                .expect("planting a glob cannot fail");
+                self.try_plant_decl_into_local_module(ident, orig_ident_span, key.ns, import_decl)
+                    .expect("planting a glob cannot fail");
             }
         }
 
@@ -584,13 +702,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
             self.per_ns(|this, ns| {
                 let ident = IdentKey::new(target);
                 // This can fail, dummies are inserted only in non-occupied slots.
-                let _ = this.try_plant_decl_into_local_module(
-                    ident,
-                    target.span,
-                    ns,
-                    dummy_decl,
-                    false,
-                );
+                let _ = this.try_plant_decl_into_local_module(ident, target.span, ns, dummy_decl);
                 // Don't remove underscores from `single_imports`, they were never added.
                 if target.name != kw::Underscore {
                     let key = BindingKey::new(ident, ns);
@@ -598,7 +710,6 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                         import.parent_scope.module.expect_local(),
                         key,
                         target.span,
-                        false,
                         |_, resolution| {
                             resolution.single_imports.swap_remove(&import);
                         },
@@ -737,8 +848,35 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                 let resolution = resolution.borrow();
                 let Some(binding) = resolution.best_decl() else { continue };
 
+                // Report "cannot reexport" errors for exotic cases involving macros 2.0
+                // privacy bending or invariant-breaking code under deprecation lints.
+                for decl in [resolution.non_glob_decl, resolution.glob_decl] {
+                    if let Some(decl) = decl
+                        && let DeclKind::Import { source_decl, import } = decl.kind
+                        // FIXME: Do not check visibility-ambiguous imports for now. To check them
+                        // properly we need to preserve all imports in ambiguous glob sets and
+                        // check them all individually.
+                        && decl.ambiguity_vis_max.get().is_none()
+                    {
+                        // The source entity is too private to be reexported
+                        // with the given import declaration's visibility.
+                        let ord = source_decl.vis().partial_cmp(decl.vis(), self.tcx);
+                        if matches!(ord, None | Some(Ordering::Less)) {
+                            let ident = match import.kind {
+                                ImportKind::Single { source, .. } => source,
+                                _ => key.ident.orig(resolution.orig_ident_span),
+                            };
+                            if let Some(lint) =
+                                self.report_cannot_reexport(import, source_decl, ident, key.ns)
+                            {
+                                self.lint_buffer.add_early_lint(lint);
+                            }
+                        }
+                    }
+                }
+
                 if let DeclKind::Import { import, .. } = binding.kind
-                    && let Some(amb_binding) = binding.ambiguity.get()
+                    && let Some((amb_binding, _)) = binding.ambiguity.get()
                     && binding.res() != Res::Err
                     && exported_ambiguities.contains(&binding)
                 {
@@ -761,8 +899,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                     if binding.res() != Res::Err
                         && glob_decl.res() != Res::Err
                         && let DeclKind::Import { import: glob_import, .. } = glob_decl.kind
-                        && let Some(glob_import_id) = glob_import.id()
-                        && let glob_import_def_id = self.local_def_id(glob_import_id)
+                        && let Some(glob_import_def_id) = glob_import.def_id()
                         && self.effective_visibilities.is_exported(glob_import_def_id)
                         && glob_decl.vis().is_public()
                         && !binding.vis().is_public()
@@ -791,7 +928,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
 
                 if let DeclKind::Import { import, .. } = binding.kind
                     && let Some(binding_id) = import.id()
-                    && let import_def_id = self.local_def_id(binding_id)
+                    && let import_def_id = import.def_id().unwrap()
                     && self.effective_visibilities.is_exported(import_def_id)
                     && let Res::Def(reexported_kind, reexported_def_id) = binding.res()
                     && !matches!(reexported_kind, DefKind::Ctor(..))
@@ -845,24 +982,25 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
             .collect::<Vec<_>>();
         let default_message =
             format!("unresolved import{} {}", pluralize!(paths.len()), paths.join(", "),);
-        let (message, label, notes) = if self.tcx.features().diagnostic_on_unknown()
-            && let Some(directive) = errors[0].1.on_unknown_attr.as_ref().map(|a| &a.directive)
-        {
-            let args = FormatArgs {
-                this: paths.join(", "),
-                // Unused
-                this_sugared: String::new(),
-                // Unused
-                item_context: "",
-                // Unused
-                generic_args: Vec::new(),
-            };
-            let CustomDiagnostic { message, label, notes, .. } = directive.eval(None, &args);
+        let (message, label, notes) =
+            // Feature gating for `on_unknown_attr` happens initialization of the field
+            if let Some(directive) = errors[0].1.on_unknown_attr.as_ref().map(|a| &a.directive) {
+                let this = errors.iter().map(|(_import, err)| {
 
-            (message, label, notes)
-        } else {
-            (None, None, Vec::new())
-        };
+                    // Is this unwrap_or reachable?
+                    err.segment.unwrap_or(kw::Underscore)
+                }).join(", ");
+
+                let args = FormatArgs {
+                    this,
+                    ..
+                };
+                let CustomDiagnostic { message, label, notes, .. } = directive.eval(None, &args);
+
+                (message, label, notes)
+            } else {
+                (None, None, Vec::new())
+            };
         let has_custom_message = message.is_some();
         let message = message.as_deref().unwrap_or(default_message.as_str());
 
@@ -973,10 +1111,8 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
         };
 
         import.imported_module.set_unchecked(Some(module));
-        let (source, target, bindings, type_ns_only) = match import.kind {
-            ImportKind::Single { source, target, ref decls, type_ns_only, .. } => {
-                (source, target, decls, type_ns_only)
-            }
+        let (source, target, bindings) = match import.kind {
+            ImportKind::Single { source, target, ref decls, .. } => (source, target, decls),
             ImportKind::Glob { .. } => {
                 self.get_mut_unchecked().resolve_glob_import(import);
                 return 0;
@@ -986,64 +1122,61 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
 
         let mut indeterminate_count = 0;
         self.per_ns_cm(|mut this, ns| {
-            if !type_ns_only || ns == TypeNS {
-                if bindings[ns].get() != PendingDecl::Pending {
-                    return;
-                };
-                let binding_result = this.reborrow().maybe_resolve_ident_in_module(
-                    module,
-                    source,
-                    ns,
-                    &import.parent_scope,
-                    Some(import),
-                );
-                let parent = import.parent_scope.module;
-                let binding = match binding_result {
-                    Ok(binding) => {
-                        if binding.is_assoc_item()
-                            && !this.tcx.features().import_trait_associated_functions()
-                        {
-                            feature_err(
-                                this.tcx.sess,
-                                sym::import_trait_associated_functions,
-                                import.span,
-                                "`use` associated items of traits is unstable",
-                            )
-                            .emit();
-                        }
-                        // We need the `target`, `source` can be extracted.
-                        let import_decl = this.new_import_decl(binding, import);
-                        this.get_mut_unchecked().plant_decl_into_local_module(
-                            IdentKey::new(target),
+            if bindings[ns].get() != PendingDecl::Pending {
+                return;
+            };
+            let binding_result = this.reborrow().maybe_resolve_ident_in_module(
+                module,
+                source,
+                ns,
+                &import.parent_scope,
+                Some(import),
+            );
+            let parent = import.parent_scope.module;
+            let binding = match binding_result {
+                Ok(binding) => {
+                    if binding.is_assoc_item()
+                        && !this.tcx.features().import_trait_associated_functions()
+                    {
+                        feature_err(
+                            this.tcx.sess,
+                            sym::import_trait_associated_functions,
+                            import.span,
+                            "`use` associated items of traits is unstable",
+                        )
+                        .emit();
+                    }
+                    // We need the `target`, `source` can be extracted.
+                    let import_decl = this.new_import_decl(binding, import);
+                    this.get_mut_unchecked().plant_decl_into_local_module(
+                        IdentKey::new(target),
+                        target.span,
+                        ns,
+                        import_decl,
+                    );
+                    PendingDecl::Ready(Some(import_decl))
+                }
+                Err(Determinacy::Determined) => {
+                    // Don't remove underscores from `single_imports`, they were never added.
+                    if target.name != kw::Underscore {
+                        let key = BindingKey::new(IdentKey::new(target), ns);
+                        this.get_mut_unchecked().update_local_resolution(
+                            parent.expect_local(),
+                            key,
                             target.span,
-                            ns,
-                            import_decl,
+                            |_, resolution| {
+                                resolution.single_imports.swap_remove(&import);
+                            },
                         );
-                        PendingDecl::Ready(Some(import_decl))
                     }
-                    Err(Determinacy::Determined) => {
-                        // Don't remove underscores from `single_imports`, they were never added.
-                        if target.name != kw::Underscore {
-                            let key = BindingKey::new(IdentKey::new(target), ns);
-                            this.get_mut_unchecked().update_local_resolution(
-                                parent.expect_local(),
-                                key,
-                                target.span,
-                                false,
-                                |_, resolution| {
-                                    resolution.single_imports.swap_remove(&import);
-                                },
-                            );
-                        }
-                        PendingDecl::Ready(None)
-                    }
-                    Err(Determinacy::Undetermined) => {
-                        indeterminate_count += 1;
-                        PendingDecl::Pending
-                    }
-                };
-                bindings[ns].set_unchecked(binding);
-            }
+                    PendingDecl::Ready(None)
+                }
+                Err(Determinacy::Undetermined) => {
+                    indeterminate_count += 1;
+                    PendingDecl::Pending
+                }
+            };
+            bindings[ns].set_unchecked(binding);
         });
 
         indeterminate_count
@@ -1103,6 +1236,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                 module,
                 error_implied_by_parse_error: _,
                 message,
+                note: _,
             } => {
                 if no_ambiguity {
                     if !self.issue_145575_hack_applied {
@@ -1128,6 +1262,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                 suggestion,
                 module,
                 segment_name,
+                note,
                 ..
             } => {
                 if no_ambiguity {
@@ -1159,7 +1294,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                         None => UnresolvedImportError {
                             span,
                             label: Some(label),
-                            note: None,
+                            note,
                             suggestion,
                             candidates: None,
                             segment: Some(segment_name),
@@ -1182,11 +1317,9 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
             PathResult::Indeterminate => unreachable!(),
         };
 
-        let (ident, target, bindings, type_ns_only, import_id) = match import.kind {
-            ImportKind::Single { source, target, ref decls, type_ns_only, id, .. } => {
-                (source, target, decls, type_ns_only, id)
-            }
-            ImportKind::Glob { ref max_vis, id } => {
+        let (ident, target, bindings, import_id) = match import.kind {
+            ImportKind::Single { source, target, ref decls, id, .. } => (source, target, decls, id),
+            ImportKind::Glob { ref max_vis, id, def_id } => {
                 if import.module_path.len() <= 1 {
                     // HACK(eddyb) `lint_if_path_starts_with_module` needs at least
                     // 2 segments, so the `resolve_path` above won't trigger it.
@@ -1211,9 +1344,8 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                     });
                 }
                 if let Some(max_vis) = max_vis.get()
-                    && !max_vis.is_at_least(import.vis, self.tcx)
+                    && import.vis.greater_than(max_vis, self.tcx)
                 {
-                    let def_id = self.local_def_id(id);
                     self.lint_buffer.buffer_lint(
                         UNUSED_IMPORTS,
                         id,
@@ -1248,71 +1380,90 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                 for error in &mut self.privacy_errors[privacy_errors_len..] {
                     error.outermost_res = res;
                 }
+            } else {
+                // The final item is not a module (e.g., a struct, function, or macro).
+                // Resolve it directly in the parent module to get its Res, so
+                // `report_privacy_error()` can search for public re-export paths.
+                for ns in [TypeNS, ValueNS, MacroNS] {
+                    if let Ok(binding) = self.cm().resolve_ident_in_module(
+                        module,
+                        ident,
+                        ns,
+                        &import.parent_scope,
+                        None,
+                        ignore_decl,
+                        None,
+                    ) {
+                        let res = binding.res();
+                        for error in &mut self.privacy_errors[privacy_errors_len..] {
+                            error.outermost_res = Some((res, ident));
+                        }
+                        break;
+                    }
+                }
             }
         }
 
         let mut all_ns_err = true;
         self.per_ns(|this, ns| {
-            if !type_ns_only || ns == TypeNS {
-                let binding = this.cm().resolve_ident_in_module(
-                    module,
-                    ident,
-                    ns,
-                    &import.parent_scope,
-                    Some(Finalize {
-                        report_private: false,
-                        import_vis: Some(import.vis),
-                        ..finalize
-                    }),
-                    bindings[ns].get().decl(),
-                    Some(import),
-                );
+            let binding = this.cm().resolve_ident_in_module(
+                module,
+                ident,
+                ns,
+                &import.parent_scope,
+                Some(Finalize {
+                    report_private: false,
+                    import: Some(import.summary()),
+                    ..finalize
+                }),
+                bindings[ns].get().decl(),
+                Some(import),
+            );
 
-                match binding {
-                    Ok(binding) => {
-                        // Consistency checks, analogous to `finalize_macro_resolutions`.
-                        let initial_res = bindings[ns].get().decl().map(|binding| {
-                            let initial_binding = binding.import_source();
-                            all_ns_err = false;
-                            if target.name == kw::Underscore
-                                && initial_binding.is_extern_crate()
-                                && !initial_binding.is_import()
-                            {
-                                let used = if import.module_path.is_empty() {
-                                    Used::Scope
-                                } else {
-                                    Used::Other
-                                };
-                                this.record_use(ident, binding, used);
-                            }
-                            initial_binding.res()
-                        });
-                        let res = binding.res();
-                        let has_ambiguity_error =
-                            this.ambiguity_errors.iter().any(|error| error.warning.is_none());
-                        if res == Res::Err || has_ambiguity_error {
-                            this.dcx()
-                                .span_delayed_bug(import.span, "some error happened for an import");
-                            return;
+            match binding {
+                Ok(binding) => {
+                    // Consistency checks, analogous to `finalize_macro_resolutions`.
+                    let initial_res = bindings[ns].get().decl().map(|binding| {
+                        let initial_binding = binding.import_source();
+                        all_ns_err = false;
+                        if target.name == kw::Underscore
+                            && initial_binding.is_extern_crate()
+                            && !initial_binding.is_import()
+                        {
+                            let used = if import.module_path.is_empty() {
+                                Used::Scope
+                            } else {
+                                Used::Other
+                            };
+                            this.record_use(ident, binding, used);
                         }
-                        if let Some(initial_res) = initial_res {
-                            if res != initial_res && !this.issue_145575_hack_applied {
-                                span_bug!(import.span, "inconsistent resolution for an import");
-                            }
-                        } else if this.privacy_errors.is_empty() {
-                            this.dcx()
-                                .create_err(CannotDetermineImportResolution { span: import.span })
-                                .emit();
+                        initial_binding.res()
+                    });
+                    let res = binding.res();
+                    let has_ambiguity_error =
+                        this.ambiguity_errors.iter().any(|error| error.warning.is_none());
+                    if res == Res::Err || has_ambiguity_error {
+                        this.dcx()
+                            .span_delayed_bug(import.span, "some error happened for an import");
+                        return;
+                    }
+                    if let Some(initial_res) = initial_res {
+                        if res != initial_res && !this.issue_145575_hack_applied {
+                            span_bug!(import.span, "inconsistent resolution for an import");
                         }
+                    } else if this.privacy_errors.is_empty() {
+                        this.dcx()
+                            .create_err(CannotDetermineImportResolution { span: import.span })
+                            .emit();
                     }
-                    Err(..) => {
-                        // FIXME: This assert may fire if public glob is later shadowed by a private
-                        // single import (see test `issue-55884-2.rs`). In theory single imports should
-                        // always block globs, even if they are not yet resolved, so that this kind of
-                        // self-inconsistent resolution never happens.
-                        // Re-enable the assert when the issue is fixed.
-                        // assert!(result[ns].get().is_err());
-                    }
+                }
+                Err(..) => {
+                    // FIXME: This assert may fire if public glob is later shadowed by a private
+                    // single import (see test `issue-55884-2.rs`). In theory single imports should
+                    // always block globs, even if they are not yet resolved, so that this kind of
+                    // self-inconsistent resolution never happens.
+                    // Re-enable the assert when the issue is fixed.
+                    // assert!(result[ns].get().is_err());
                 }
             }
         });
@@ -1320,19 +1471,17 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
         if all_ns_err {
             let mut all_ns_failed = true;
             self.per_ns(|this, ns| {
-                if !type_ns_only || ns == TypeNS {
-                    let binding = this.cm().resolve_ident_in_module(
-                        module,
-                        ident,
-                        ns,
-                        &import.parent_scope,
-                        Some(finalize),
-                        None,
-                        None,
-                    );
-                    if binding.is_ok() {
-                        all_ns_failed = false;
-                    }
+                let binding = this.cm().resolve_ident_in_module(
+                    module,
+                    ident,
+                    ns,
+                    &import.parent_scope,
+                    Some(finalize),
+                    None,
+                    None,
+                );
+                if binding.is_ok() {
+                    all_ns_failed = false;
                 }
             });
 
@@ -1389,6 +1538,20 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                         _ => (lev_suggestion, None),
                     };
 
+                // If importing of trait asscoiated items is enabled, an also find an
+                // `Enum`, then note that inherent associated items cannot be imported.
+                let note = if self.tcx.features().import_trait_associated_functions()
+                    && let PathResult::Module(ModuleOrUniformRoot::Module(m)) = path_res
+                    && let Some(Res::Def(DefKind::Enum, _)) = m.res()
+                {
+                    note.or(Some(
+                        "cannot import inherent associated items, only trait associated items"
+                            .to_string(),
+                    ))
+                } else {
+                    note
+                };
+
                 let label = match module {
                     ModuleOrUniformRoot::Module(module) => {
                         let module_str = module_to_string(module);
@@ -1440,74 +1603,25 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
 
         let mut reexport_error = None;
         let mut any_successful_reexport = false;
-        let mut crate_private_reexport = false;
         self.per_ns(|this, ns| {
-            let Some(binding) = bindings[ns].get().decl().map(|b| b.import_source()) else {
+            let Some(binding) = bindings[ns].get().decl() else {
                 return;
             };
 
-            if !binding.vis().is_at_least(import.vis, this.tcx) {
-                reexport_error = Some((ns, binding));
-                if let Visibility::Restricted(binding_def_id) = binding.vis()
-                    && binding_def_id.is_top_level_module()
-                {
-                    crate_private_reexport = true;
-                }
+            if import.vis.greater_than(binding.vis(), this.tcx) {
+                // In isolation, a declaration like this is not an error, but if *all* 1-3
+                // declarations introduced by the import are more private than the import item's
+                // nominal visibility, then it's an error.
+                reexport_error = Some((ns, binding.import_source()));
             } else {
                 any_successful_reexport = true;
             }
         });
 
-        // All namespaces must be re-exported with extra visibility for an error to occur.
         if !any_successful_reexport {
             let (ns, binding) = reexport_error.unwrap();
-            if let Some(extern_crate_id) = pub_use_of_private_extern_crate_hack(import, binding) {
-                let extern_crate_sp = self.tcx.source_span(self.local_def_id(extern_crate_id));
-                self.lint_buffer.buffer_lint(
-                    PUB_USE_OF_PRIVATE_EXTERN_CRATE,
-                    import_id,
-                    import.span,
-                    crate::errors::PrivateExternCrateReexport {
-                        ident,
-                        sugg: extern_crate_sp.shrink_to_lo(),
-                    },
-                );
-            } else if ns == TypeNS {
-                let err = if crate_private_reexport {
-                    self.dcx()
-                        .create_err(CannotBeReexportedCratePublicNS { span: import.span, ident })
-                } else {
-                    self.dcx().create_err(CannotBeReexportedPrivateNS { span: import.span, ident })
-                };
-                err.emit();
-            } else {
-                let mut err = if crate_private_reexport {
-                    self.dcx()
-                        .create_err(CannotBeReexportedCratePublic { span: import.span, ident })
-                } else {
-                    self.dcx().create_err(CannotBeReexportedPrivate { span: import.span, ident })
-                };
-
-                match binding.kind {
-                        DeclKind::Def(Res::Def(DefKind::Macro(_), def_id))
-                            // exclude decl_macro
-                            if self.get_macro_by_def_id(def_id).macro_rules =>
-                        {
-                            err.subdiagnostic( ConsiderAddingMacroExport {
-                                span: binding.span,
-                            });
-                            err.subdiagnostic( ConsiderMarkingAsPubCrate {
-                                vis_span: import.vis_span,
-                            });
-                        }
-                        _ => {
-                            err.subdiagnostic( ConsiderMarkingAsPub {
-                                span: import.span,
-                                ident,
-                            });
-                        }
-                    }
-                err.emit();
+            if let Some(lint) = self.report_cannot_reexport(import, binding, ident, ns) {
+                self.lint_buffer.add_early_lint(lint);
             }
         }
 
@@ -1536,9 +1650,66 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
         None
     }
 
+    fn report_cannot_reexport(
+        &self,
+        import: Import<'ra>,
+        decl: Decl<'ra>,
+        ident: Ident,
+        ns: Namespace,
+    ) -> Option<BufferedEarlyLint> {
+        let crate_private_reexport = match decl.vis() {
+            Visibility::Restricted(def_id) if def_id.is_top_level_module() => true,
+            _ => false,
+        };
+
+        if let Some(extern_crate_id) = pub_use_of_private_extern_crate_hack(import.summary(), decl)
+        {
+            let ImportKind::Single { id, .. } = import.kind else { unreachable!() };
+            let sugg = self.tcx.source_span(extern_crate_id).shrink_to_lo();
+            let diagnostic = crate::errors::PrivateExternCrateReexport { ident, sugg };
+            return Some(BufferedEarlyLint {
+                lint_id: LintId::of(PUB_USE_OF_PRIVATE_EXTERN_CRATE),
+                node_id: id,
+                span: Some(import.span.into()),
+                diagnostic: diagnostic.into(),
+            });
+        } else if ns == TypeNS {
+            let err = if crate_private_reexport {
+                self.dcx().create_err(CannotBeReexportedCratePublicNS { span: import.span, ident })
+            } else {
+                self.dcx().create_err(CannotBeReexportedPrivateNS { span: import.span, ident })
+            };
+            err.emit();
+        } else {
+            let mut err = if crate_private_reexport {
+                self.dcx().create_err(CannotBeReexportedCratePublic { span: import.span, ident })
+            } else {
+                self.dcx().create_err(CannotBeReexportedPrivate { span: import.span, ident })
+            };
+
+            match decl.kind {
+                // exclude decl_macro
+                DeclKind::Def(Res::Def(DefKind::Macro(_), def_id))
+                    if let SyntaxExtensionKind::MacroRules(mr) =
+                        &self.get_macro_by_def_id(def_id).kind
+                        && mr.is_macro_rules() =>
+                {
+                    err.subdiagnostic(ConsiderAddingMacroExport { span: decl.span });
+                    err.subdiagnostic(ConsiderMarkingAsPubCrate { vis_span: import.vis_span });
+                }
+                _ => {
+                    err.subdiagnostic(ConsiderMarkingAsPub { span: import.span, ident });
+                }
+            }
+            err.emit();
+        }
+
+        None
+    }
+
     pub(crate) fn check_for_redundant_imports(&mut self, import: Import<'ra>) -> bool {
         // This function is only called for single imports.
-        let ImportKind::Single { source, target, ref decls, id, .. } = import.kind else {
+        let ImportKind::Single { source, target, ref decls, id, def_id, .. } = import.kind else {
             unreachable!()
         };
 
@@ -1557,7 +1728,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
         // Skip if the import is public or was used through non scope-based resolution,
         // e.g. through a module-relative path.
         if self.import_use_map.get(&import) == Some(&Used::Other)
-            || self.effective_visibilities.is_exported(self.local_def_id(id))
+            || self.effective_visibilities.is_exported(def_id)
         {
             return false;
         }
@@ -1652,7 +1823,9 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
         }
 
         // Add to module's glob_importers
-        module.glob_importers.borrow_mut_unchecked().push(import);
+        if module.is_local() {
+            module.glob_importers.borrow_mut_unchecked().push(import);
+        }
 
         // Ensure that `resolutions` isn't borrowed during `try_define`,
         // since it might get updated via a glob cycle.
@@ -1676,16 +1849,11 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                 };
             if self.is_accessible_from(binding.vis(), scope) {
                 let import_decl = self.new_import_decl(binding, import);
-                let warn_ambiguity = self
-                    .resolution(import.parent_scope.module, key)
-                    .and_then(|r| r.determined_decl())
-                    .is_some_and(|binding| binding.warn_ambiguity_recursive());
                 self.try_plant_decl_into_local_module(
                     key.ident,
                     orig_ident_span,
                     key.ns,
                     import_decl,
-                    warn_ambiguity,
                 )
                 .expect("planting a glob cannot fail");
             }
@@ -1711,23 +1879,23 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
         let mut children = Vec::new();
         let mut ambig_children = Vec::new();
 
-        module.to_module().for_each_child(self, |this, ident, orig_ident_span, _, binding| {
+        module.to_module().for_each_child(self, |_this, ident, orig_ident_span, _, binding| {
             let res = binding.res().expect_non_local();
             if res != def::Res::Err {
                 let ident = ident.orig(orig_ident_span);
                 let child =
                     |reexport_chain| ModChild { ident, res, vis: binding.vis(), reexport_chain };
                 if let Some((ambig_binding1, ambig_binding2)) = binding.descent_to_ambiguity() {
-                    let main = child(ambig_binding1.reexport_chain(this));
+                    let main = child(ambig_binding1.reexport_chain());
                     let second = ModChild {
                         ident,
                         res: ambig_binding2.res().expect_non_local(),
                         vis: ambig_binding2.vis(),
-                        reexport_chain: ambig_binding2.reexport_chain(this),
+                        reexport_chain: ambig_binding2.reexport_chain(),
                     };
                     ambig_children.push(AmbigModChild { main, second })
                 } else {
-                    children.push(child(binding.reexport_chain(this)));
+                    children.push(child(binding.reexport_chain()));
                 }
             }
         });

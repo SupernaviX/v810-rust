@@ -3,30 +3,27 @@ use rustc_hir::{MethodKind, Target};
 use rustc_span::{Span, Symbol, sym};
 
 use super::prelude::*;
-use crate::context::Stage;
 use crate::target_checking::AllowedTargets;
 
 pub(crate) struct RustcDumpUserArgsParser;
 
-impl<S: Stage> NoArgsAttributeParser<S> for RustcDumpUserArgsParser {
+impl NoArgsAttributeParser for RustcDumpUserArgsParser {
     const PATH: &[Symbol] = &[sym::rustc_dump_user_args];
-    const ON_DUPLICATE: OnDuplicate<S> = OnDuplicate::Error;
     const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowList(&[Allow(Target::Fn)]);
     const CREATE: fn(Span) -> AttributeKind = |_| AttributeKind::RustcDumpUserArgs;
 }
 
 pub(crate) struct RustcDumpDefParentsParser;
 
-impl<S: Stage> NoArgsAttributeParser<S> for RustcDumpDefParentsParser {
+impl NoArgsAttributeParser for RustcDumpDefParentsParser {
     const PATH: &[Symbol] = &[sym::rustc_dump_def_parents];
-    const ON_DUPLICATE: OnDuplicate<S> = OnDuplicate::Error;
     const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowList(&[Allow(Target::Fn)]);
     const CREATE: fn(Span) -> AttributeKind = |_| AttributeKind::RustcDumpDefParents;
 }
 
 pub(crate) struct RustcDumpDefPathParser;
 
-impl<S: Stage> SingleAttributeParser<S> for RustcDumpDefPathParser {
+impl SingleAttributeParser for RustcDumpDefPathParser {
     const PATH: &[Symbol] = &[sym::rustc_dump_def_path];
     const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowList(&[
         Allow(Target::Fn),
@@ -37,31 +34,25 @@ impl<S: Stage> SingleAttributeParser<S> for RustcDumpDefPathParser {
         Allow(Target::ForeignStatic),
         Allow(Target::Impl { of_trait: false }),
     ]);
-    const ON_DUPLICATE: OnDuplicate<S> = OnDuplicate::Error;
     const TEMPLATE: AttributeTemplate = template!(Word);
-    fn convert(cx: &mut AcceptContext<'_, '_, S>, args: &ArgParser) -> Option<AttributeKind> {
-        if let Err(span) = args.no_args() {
-            cx.adcx().expected_no_args(span);
-            return None;
-        }
+    fn convert(cx: &mut AcceptContext<'_, '_>, args: &ArgParser) -> Option<AttributeKind> {
+        cx.expect_no_args(args)?;
         Some(AttributeKind::RustcDumpDefPath(cx.attr_span))
     }
 }
 
 pub(crate) struct RustcDumpHiddenTypeOfOpaquesParser;
 
-impl<S: Stage> NoArgsAttributeParser<S> for RustcDumpHiddenTypeOfOpaquesParser {
+impl NoArgsAttributeParser for RustcDumpHiddenTypeOfOpaquesParser {
     const PATH: &[Symbol] = &[sym::rustc_dump_hidden_type_of_opaques];
-    const ON_DUPLICATE: OnDuplicate<S> = OnDuplicate::Error;
     const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowList(&[Allow(Target::Crate)]);
     const CREATE: fn(Span) -> AttributeKind = |_| AttributeKind::RustcDumpHiddenTypeOfOpaques;
 }
 
 pub(crate) struct RustcDumpInferredOutlivesParser;
 
-impl<S: Stage> NoArgsAttributeParser<S> for RustcDumpInferredOutlivesParser {
+impl NoArgsAttributeParser for RustcDumpInferredOutlivesParser {
     const PATH: &[Symbol] = &[sym::rustc_dump_inferred_outlives];
-    const ON_DUPLICATE: OnDuplicate<S> = OnDuplicate::Warn;
     const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowList(&[
         Allow(Target::Struct),
         Allow(Target::Enum),
@@ -73,16 +64,15 @@ impl<S: Stage> NoArgsAttributeParser<S> for RustcDumpInferredOutlivesParser {
 
 pub(crate) struct RustcDumpItemBoundsParser;
 
-impl<S: Stage> NoArgsAttributeParser<S> for RustcDumpItemBoundsParser {
+impl NoArgsAttributeParser for RustcDumpItemBoundsParser {
     const PATH: &[Symbol] = &[sym::rustc_dump_item_bounds];
-    const ON_DUPLICATE: OnDuplicate<S> = OnDuplicate::Error;
     const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowList(&[Allow(Target::AssocTy)]);
     const CREATE: fn(Span) -> AttributeKind = |_| AttributeKind::RustcDumpItemBounds;
 }
 
 pub(crate) struct RustcDumpLayoutParser;
 
-impl<S: Stage> CombineAttributeParser<S> for RustcDumpLayoutParser {
+impl CombineAttributeParser for RustcDumpLayoutParser {
     const PATH: &[Symbol] = &[sym::rustc_dump_layout];
 
     type Item = RustcDumpLayoutKind;
@@ -99,12 +89,10 @@ impl<S: Stage> CombineAttributeParser<S> for RustcDumpLayoutParser {
     const TEMPLATE: AttributeTemplate =
         template!(List: &["abi", "align", "size", "homogenous_aggregate", "debug"]);
     fn extend(
-        cx: &mut AcceptContext<'_, '_, S>,
+        cx: &mut AcceptContext<'_, '_>,
         args: &ArgParser,
     ) -> impl IntoIterator<Item = Self::Item> {
-        let ArgParser::List(items) = args else {
-            let attr_span = cx.attr_span;
-            cx.adcx().expected_list(attr_span, args);
+        let Some(items) = cx.expect_list(args, cx.attr_span) else {
             return vec![];
         };
 
@@ -146,9 +134,8 @@ impl<S: Stage> CombineAttributeParser<S> for RustcDumpLayoutParser {
 
 pub(crate) struct RustcDumpObjectLifetimeDefaultsParser;
 
-impl<S: Stage> NoArgsAttributeParser<S> for RustcDumpObjectLifetimeDefaultsParser {
+impl NoArgsAttributeParser for RustcDumpObjectLifetimeDefaultsParser {
     const PATH: &[Symbol] = &[sym::rustc_dump_object_lifetime_defaults];
-    const ON_DUPLICATE: OnDuplicate<S> = OnDuplicate::Error;
     const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowList(&[
         Allow(Target::AssocConst),
         Allow(Target::AssocTy),
@@ -173,9 +160,8 @@ impl<S: Stage> NoArgsAttributeParser<S> for RustcDumpObjectLifetimeDefaultsParse
 
 pub(crate) struct RustcDumpPredicatesParser;
 
-impl<S: Stage> NoArgsAttributeParser<S> for RustcDumpPredicatesParser {
+impl NoArgsAttributeParser for RustcDumpPredicatesParser {
     const PATH: &[Symbol] = &[sym::rustc_dump_predicates];
-    const ON_DUPLICATE: OnDuplicate<S> = OnDuplicate::Error;
     const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowList(&[
         Allow(Target::AssocConst),
         Allow(Target::AssocTy),
@@ -201,7 +187,7 @@ impl<S: Stage> NoArgsAttributeParser<S> for RustcDumpPredicatesParser {
 
 pub(crate) struct RustcDumpSymbolNameParser;
 
-impl<S: Stage> SingleAttributeParser<S> for RustcDumpSymbolNameParser {
+impl SingleAttributeParser for RustcDumpSymbolNameParser {
     const PATH: &[Symbol] = &[sym::rustc_dump_symbol_name];
     const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowList(&[
         Allow(Target::Fn),
@@ -212,22 +198,17 @@ impl<S: Stage> SingleAttributeParser<S> for RustcDumpSymbolNameParser {
         Allow(Target::ForeignStatic),
         Allow(Target::Impl { of_trait: false }),
     ]);
-    const ON_DUPLICATE: OnDuplicate<S> = OnDuplicate::Error;
     const TEMPLATE: AttributeTemplate = template!(Word);
-    fn convert(cx: &mut AcceptContext<'_, '_, S>, args: &ArgParser) -> Option<AttributeKind> {
-        if let Err(span) = args.no_args() {
-            cx.adcx().expected_no_args(span);
-            return None;
-        }
+    fn convert(cx: &mut AcceptContext<'_, '_>, args: &ArgParser) -> Option<AttributeKind> {
+        cx.expect_no_args(args)?;
         Some(AttributeKind::RustcDumpSymbolName(cx.attr_span))
     }
 }
 
 pub(crate) struct RustcDumpVariancesParser;
 
-impl<S: Stage> NoArgsAttributeParser<S> for RustcDumpVariancesParser {
+impl NoArgsAttributeParser for RustcDumpVariancesParser {
     const PATH: &[Symbol] = &[sym::rustc_dump_variances];
-    const ON_DUPLICATE: OnDuplicate<S> = OnDuplicate::Warn;
     const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowList(&[
         Allow(Target::Enum),
         Allow(Target::Fn),
@@ -243,18 +224,16 @@ impl<S: Stage> NoArgsAttributeParser<S> for RustcDumpVariancesParser {
 
 pub(crate) struct RustcDumpVariancesOfOpaquesParser;
 
-impl<S: Stage> NoArgsAttributeParser<S> for RustcDumpVariancesOfOpaquesParser {
+impl NoArgsAttributeParser for RustcDumpVariancesOfOpaquesParser {
     const PATH: &[Symbol] = &[sym::rustc_dump_variances_of_opaques];
-    const ON_DUPLICATE: OnDuplicate<S> = OnDuplicate::Warn;
     const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowList(&[Allow(Target::Crate)]);
     const CREATE: fn(Span) -> AttributeKind = |_| AttributeKind::RustcDumpVariancesOfOpaques;
 }
 
 pub(crate) struct RustcDumpVtableParser;
 
-impl<S: Stage> NoArgsAttributeParser<S> for RustcDumpVtableParser {
+impl NoArgsAttributeParser for RustcDumpVtableParser {
     const PATH: &[Symbol] = &[sym::rustc_dump_vtable];
-    const ON_DUPLICATE: OnDuplicate<S> = OnDuplicate::Error;
     const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowList(&[
         Allow(Target::Impl { of_trait: true }),
         Allow(Target::TyAlias),

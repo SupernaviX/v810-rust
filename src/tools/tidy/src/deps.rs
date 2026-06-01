@@ -466,6 +466,7 @@ const PERMITTED_RUSTC_DEPENDENCIES: &[&str] = &[
     "unicode-script",
     "unicode-security",
     "unicode-width",
+    "utf8_iter",
     "utf8parse",
     "valuable",
     "version_check",
@@ -539,18 +540,11 @@ const PERMITTED_STDLIB_DEPENDENCIES: &[&str] = &[
     "shlex",
     "unwinding",
     "vex-sdk",
-    "wasi",
+    "wasip1",
+    "wasip2",
+    "wasip3",
     "windows-link",
-    "windows-sys",
-    "windows-targets",
-    "windows_aarch64_gnullvm",
-    "windows_aarch64_msvc",
-    "windows_i686_gnu",
-    "windows_i686_gnullvm",
-    "windows_i686_msvc",
-    "windows_x86_64_gnu",
-    "windows_x86_64_gnullvm",
-    "windows_x86_64_msvc",
+    "windows-sys@0.61.100", // Enforce the usage of our dummy windows-sys patch. Keep version in sync.
     "wit-bindgen",
     // tidy-alphabetical-end
 ];
@@ -884,10 +878,7 @@ fn check_runtime_no_duplicate_dependencies(metadata: &Metadata, check: &mut Runn
             continue;
         }
 
-        // Skip the `wasi` crate here which the standard library explicitly
-        // depends on two version of (one for the `wasm32-wasip1` target and
-        // another for the `wasm32-wasip2` target).
-        if pkg.name.to_string() != "wasi" && !seen_pkgs.insert(&*pkg.name) {
+        if !seen_pkgs.insert(&*pkg.name) {
             check.error(format!(
                 "duplicate package `{}` is not allowed for the standard library",
                 pkg.name
