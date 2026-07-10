@@ -601,7 +601,8 @@ pub(crate) struct InterruptParser;
 impl NoArgsAttributeParser for InterruptParser {
     const PATH: &[Symbol] = &[sym::interrupt];
     const ON_DUPLICATE: OnDuplicate = OnDuplicate::Warn;
-    const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowList(&[Allow(Target::Fn)]);
+    const ALLOWED_TARGETS: AllowedTargets<'_> = AllowedTargets::AllowList(&[Allow(Target::Fn)]);
+    const STABILITY: AttributeStability = AttributeStability::Stable;
     const CREATE: fn(Span) -> AttributeKind = AttributeKind::Interrupt;
 }
 

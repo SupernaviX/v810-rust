@@ -716,7 +716,7 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
             return;
         }
 
-        self.dcx().emit_err(errors::InterruptAttributeNotAllowed {
+        self.dcx().emit_err(diagnostics::InterruptAttributeNotAllowed {
             attr_span,
             not_fn: target_span,
             help: (),
