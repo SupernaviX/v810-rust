@@ -14,7 +14,6 @@ use rustc_data_structures::base_n::{ALPHANUMERIC_ONLY, ToBaseN};
 use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::small_c_str::SmallCStr;
 use rustc_hir::def_id::DefId;
-use rustc_middle::middle::codegen_fn_attrs::PatchableFunctionEntry;
 use rustc_middle::mono::CodegenUnit;
 use rustc_middle::ty::layout::{
     FnAbiError, FnAbiOfHelpers, FnAbiRequest, HasTypingEnv, LayoutError, LayoutOfHelpers,
@@ -26,7 +25,6 @@ use rustc_session::config::{
     BranchProtection, CFGuard, CFProtection, CrateType, DebugInfo, FunctionReturn, PAuthKey, PacRet,
 };
 use rustc_span::{DUMMY_SP, Span, Spanned, Symbol, sym};
-use rustc_symbol_mangling::mangle_internal_symbol;
 use rustc_target::spec::{
     Arch, CfgAbi, Env, FramePointer, HasTargetSpec, Os, RelocModel, SmallDataThresholdSupport,
     Target, TlsModel,
@@ -136,7 +134,6 @@ pub(crate) struct FullCx<'ll, 'tcx> {
     pub dbg_cx: Option<debuginfo::CodegenUnitDebugContext<'ll, 'tcx>>,
 
     eh_personality: Cell<Option<&'ll Value>>,
-    eh_catch_typeinfo: Cell<Option<&'ll Value>>,
     pub rust_try_fn: Cell<Option<(&'ll Type, &'ll Value)>>,
 
     intrinsics:
@@ -203,6 +200,14 @@ pub(crate) unsafe fn create_module<'ll>(
         if sess.target.arch == Arch::PowerPC64 {
             // LLVM 22 updated the ABI alignment for double on AIX: https://github.com/llvm/llvm-project/pull/144673
             target_data_layout = target_data_layout.replace("-f64:32:64", "");
+
+            // LLVM 22 fixed the data layout calculation for targets that default to ELFv1
+            // when the ABI is set to ELFv2. With LLVM 21, the ELFv1 datalayout must be used,
+            // which will overalign function entries.
+            // https://github.com/llvm/llvm-project/pull/149725
+            if sess.target.llvm_target == "powerpc64-unknown-linux-gnu" {
+                target_data_layout = target_data_layout.replace("-Fn32", "-Fi64");
+            }
         }
         if sess.target.arch == Arch::AmdGpu {
             // LLVM 22 specified ELF mangling in the amdgpu data layout:
@@ -337,14 +342,13 @@ pub(crate) unsafe fn create_module<'ll>(
 
         // Add "kcfi-offset" module flag with -Z patchable-function-entry (See
         // https://reviews.llvm.org/D141172).
-        let pfe =
-            PatchableFunctionEntry::from_config(sess.opts.unstable_opts.patchable_function_entry);
-        if pfe.prefix() > 0 {
+        let patchable_prefix_nops = sess.opts.unstable_opts.patchable_function_entry.prefix();
+        if patchable_prefix_nops > 0 {
             llvm::add_module_flag_u32(
                 llmod,
                 llvm::ModuleFlagMergeBehavior::Override,
                 "kcfi-offset",
-                pfe.prefix().into(),
+                patchable_prefix_nops.into(),
             );
         }
 
@@ -641,7 +645,7 @@ impl<'ll, 'tcx> CodegenCx<'ll, 'tcx> {
             tcx.sess.instrument_coverage().then(coverageinfo::CguCoverageContext::new);
 
         let dbg_cx = if tcx.sess.opts.debuginfo != DebugInfo::None {
-            let dctx = debuginfo::CodegenUnitDebugContext::new(llmod);
+            let dctx = debuginfo::CodegenUnitDebugContext::new(llmod, tcx.sess);
             debuginfo::metadata::build_compile_unit_di_node(
                 tcx,
                 codegen_unit.name().as_str(),
@@ -672,7 +676,6 @@ impl<'ll, 'tcx> CodegenCx<'ll, 'tcx> {
                 coverage_cx,
                 dbg_cx,
                 eh_personality: Cell::new(None),
-                eh_catch_typeinfo: Cell::new(None),
                 rust_try_fn: Cell::new(None),
                 intrinsics: Default::default(),
                 local_gen_sym_counter: Cell::new(0),
@@ -720,6 +723,24 @@ impl<'ll, 'tcx> CodegenCx<'ll, 'tcx> {
             // (a.k.a the "non-fragile ABI").
             2
         }
+    }
+
+    pub(crate) fn add_ptrauth_elf_got_flag(&self) {
+        llvm::add_module_flag_u32(
+            self.llmod,
+            llvm::ModuleFlagMergeBehavior::Error,
+            "ptrauth-elf-got",
+            1,
+        );
+    }
+
+    pub(crate) fn add_ptrauth_sign_personality_flag(&self) {
+        llvm::add_module_flag_u32(
+            self.llmod,
+            llvm::ModuleFlagMergeBehavior::Error,
+            "ptrauth-sign-personality",
+            1,
+        );
     }
 
     // We do our best here to match what Clang does when compiling Objective-C natively.
@@ -866,8 +887,24 @@ impl<'ll, 'tcx> MiscCodegenMethods<'tcx> for CodegenCx<'ll, 'tcx> {
         get_fn(self, instance)
     }
 
-    fn get_fn_addr(&self, instance: Instance<'tcx>) -> &'ll Value {
-        get_fn(self, instance)
+    fn get_fn_addr(&self, instance: Instance<'tcx>, pac: Option<PacMetadata>) -> &'ll Value {
+        // When pointer authentication metadata is provided, `get_fn_addr` will
+        // attempt to sign the pointer using LLVM's `ConstPtrAuth` constant
+        // expression.
+        //
+        // FIXME(jchlanda) Currently, all function addresses requested from
+        // within LLVM codegen are signed. This behavior is too broad, resulting
+        // in the logic being applied to function values, not just pointers
+        // (addresses).
+        //
+        // See the discussion in the rust-lang issue:
+        // <https://github.com/rust-lang/rust/issues/152532>, and comment in
+        // builder's `ptrauth_operand_bundle`.
+        let llfn = get_fn(self, instance);
+        match pac {
+            Some(pac) => common::maybe_sign_fn_ptr(self, instance, llfn, pac),
+            None => llfn,
+        }
     }
 
     fn eh_personality(&self) -> &'ll Value {
@@ -909,13 +946,16 @@ impl<'ll, 'tcx> MiscCodegenMethods<'tcx> for CodegenCx<'ll, 'tcx> {
 
         let tcx = self.tcx;
         let llfn = match tcx.lang_items().eh_personality() {
-            Some(def_id) if name.is_none() => self.get_fn_addr(ty::Instance::expect_resolve(
-                tcx,
-                self.typing_env(),
-                def_id,
-                ty::List::empty(),
-                DUMMY_SP,
-            )),
+            Some(def_id) if name.is_none() => self.get_fn_addr(
+                ty::Instance::expect_resolve(
+                    tcx,
+                    self.typing_env(),
+                    def_id,
+                    ty::List::empty(),
+                    DUMMY_SP,
+                ),
+                Some(PacMetadata::default()),
+            ),
             _ => {
                 let name = name.unwrap_or("rust_eh_personality");
                 if let Some(llfn) = self.get_declared_value(name) {
@@ -973,10 +1013,7 @@ impl<'ll, 'tcx> MiscCodegenMethods<'tcx> for CodegenCx<'ll, 'tcx> {
     }
 
     fn intrinsic_call_expects_place_always(&self, name: Symbol) -> bool {
-        matches!(
-            name,
-            sym::autodiff | sym::volatile_load | sym::unaligned_volatile_load | sym::black_box
-        )
+        matches!(name, sym::black_box)
     }
 }
 
@@ -1042,23 +1079,6 @@ impl<'ll> CodegenCx<'ll, '_> {
             }
         }
     }
-
-    pub(crate) fn eh_catch_typeinfo(&self) -> &'ll Value {
-        if let Some(eh_catch_typeinfo) = self.eh_catch_typeinfo.get() {
-            return eh_catch_typeinfo;
-        }
-        let tcx = self.tcx;
-        assert!(self.sess().target.os == Os::Emscripten);
-        let eh_catch_typeinfo = match tcx.lang_items().eh_catch_typeinfo() {
-            Some(def_id) => self.get_static(def_id),
-            _ => {
-                let ty = self.type_struct(&[self.type_ptr(), self.type_ptr()], false);
-                self.declare_global(&mangle_internal_symbol(self.tcx, "rust_eh_catch_typeinfo"), ty)
-            }
-        };
-        self.eh_catch_typeinfo.set(Some(eh_catch_typeinfo));
-        eh_catch_typeinfo
-    }
 }
 
 impl CodegenCx<'_, '_> {
@@ -1103,9 +1123,10 @@ impl<'ll, CX: Borrow<SCx<'ll>>> GenericCx<'ll, CX> {
         instruction: &'ll Value,
         kind_id: MetadataKindId,
         md_list: &[&'ll Metadata],
-    ) {
+    ) -> &'ll Metadata {
         let md = self.md_node_in_context(md_list);
         self.set_metadata(instruction, kind_id, md);
+        md
     }
 
     /// Helper method for the sequence of calls:

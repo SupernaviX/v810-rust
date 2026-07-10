@@ -789,7 +789,7 @@ trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
             }
 
             // LLVM intrinsics
-            "llvm.prefetch" => {
+            "llvm.prefetch.p0" => {
                 let [p, rw, loc, ty] =
                     this.check_shim_sig_lenient(abi, CanonAbi::C, link_name, args)?;
 
@@ -854,6 +854,14 @@ trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 && this.tcx.sess.target.endian == Endian::Little =>
             {
                 return shims::aarch64::EvalContextExt::emulate_aarch64_intrinsic(
+                    this, link_name, abi, args, dest,
+                );
+            }
+            name if name.starts_with("llvm.loongarch.")
+                && matches!(this.tcx.sess.target.arch, Arch::LoongArch32 | Arch::LoongArch64)
+                && this.tcx.sess.target.endian == Endian::Little =>
+            {
+                return shims::loongarch::EvalContextExt::emulate_loongarch_intrinsic(
                     this, link_name, abi, args, dest,
                 );
             }

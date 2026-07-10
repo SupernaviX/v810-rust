@@ -297,23 +297,28 @@
 #[cfg(test)]
 mod tests;
 
-#[unstable(feature = "read_buf", issue = "78485")]
-pub use core::io::{BorrowedBuf, BorrowedCursor};
-#[stable(feature = "rust1", since = "1.0.0")]
-pub use core::io::{Chain, Empty, Repeat, Sink, Take, empty, repeat, sink};
-#[stable(feature = "iovec", since = "1.36.0")]
-pub use core::io::{IoSlice, IoSliceMut};
 use core::slice::memchr;
+
+#[unstable(feature = "raw_os_error_ty", issue = "107792")]
+pub use alloc_crate::io::RawOsError;
+#[doc(hidden)]
+#[unstable(feature = "io_const_error_internals", issue = "none")]
+pub use alloc_crate::io::SimpleMessage;
+#[unstable(feature = "io_const_error", issue = "133448")]
+pub use alloc_crate::io::const_error;
+#[unstable(feature = "read_buf", issue = "78485")]
+pub use alloc_crate::io::{BorrowedBuf, BorrowedCursor};
+#[stable(feature = "rust1", since = "1.0.0")]
+pub use alloc_crate::io::{
+    Chain, Empty, Error, ErrorKind, Repeat, Result, Seek, SeekFrom, Sink, Take, empty, repeat, sink,
+};
+pub(crate) use alloc_crate::io::{IoHandle, stream_len_default};
+#[stable(feature = "iovec", since = "1.36.0")]
+pub use alloc_crate::io::{IoSlice, IoSliceMut};
+use alloc_crate::io::{OsFunctions, SizeHint};
 
 #[stable(feature = "bufwriter_into_parts", since = "1.56.0")]
 pub use self::buffered::WriterPanicked;
-#[unstable(feature = "raw_os_error_ty", issue = "107792")]
-pub use self::error::RawOsError;
-#[doc(hidden)]
-#[unstable(feature = "io_const_error_internals", issue = "none")]
-pub use self::error::SimpleMessage;
-#[unstable(feature = "io_const_error", issue = "133448")]
-pub use self::error::const_error;
 #[stable(feature = "anonymous_pipe", since = "1.87.0")]
 pub use self::pipe::{PipeReader, PipeWriter, pipe};
 #[stable(feature = "is_terminal", since = "1.70.0")]
@@ -330,7 +335,6 @@ pub use self::{
     buffered::{BufReader, BufWriter, IntoInnerError, LineWriter},
     copy::copy,
     cursor::Cursor,
-    error::{Error, ErrorKind, Result},
     stdio::{Stderr, StderrLock, Stdin, StdinLock, Stdout, StdoutLock, stderr, stdin, stdout},
 };
 use crate::mem::MaybeUninit;
@@ -470,7 +474,7 @@ pub(crate) fn default_read_to_end<R: Read + ?Sized>(
         let mut spare = buf.spare_capacity_mut();
         let buf_len = cmp::min(spare.len(), max_read_size);
         spare = &mut spare[..buf_len];
-        let mut read_buf: BorrowedBuf<'_> = spare.into();
+        let mut read_buf: BorrowedBuf<'_, u8> = spare.into();
 
         // Note that we don't track already initialized bytes here, but this is fine
         // because we explicitly limit the read size
@@ -567,7 +571,7 @@ pub(crate) fn default_read_exact<R: Read + ?Sized>(this: &mut R, mut buf: &mut [
     if !buf.is_empty() { Err(Error::READ_EXACT_EOF) } else { Ok(()) }
 }
 
-pub(crate) fn default_read_buf<F>(read: F, mut cursor: BorrowedCursor<'_>) -> Result<()>
+pub(crate) fn default_read_buf<F>(read: F, mut cursor: BorrowedCursor<'_, u8>) -> Result<()>
 where
     F: FnOnce(&mut [u8]) -> Result<usize>,
 {
@@ -578,7 +582,7 @@ where
 
 pub(crate) fn default_read_buf_exact<R: Read + ?Sized>(
     this: &mut R,
-    mut cursor: BorrowedCursor<'_>,
+    mut cursor: BorrowedCursor<'_, u8>,
 ) -> Result<()> {
     while cursor.capacity() > 0 {
         let prev_written = cursor.written();
@@ -1038,7 +1042,7 @@ pub trait Read {
     ///
     /// This method makes it possible to return both data and an error but it is advised against.
     #[unstable(feature = "read_buf", issue = "78485")]
-    fn read_buf(&mut self, buf: BorrowedCursor<'_>) -> Result<()> {
+    fn read_buf(&mut self, buf: BorrowedCursor<'_, u8>) -> Result<()> {
         default_read_buf(|b| self.read(b), buf)
     }
 
@@ -1061,7 +1065,7 @@ pub trait Read {
     ///
     /// If this function returns an error, all bytes read will be appended to `cursor`.
     #[unstable(feature = "read_buf", issue = "78485")]
-    fn read_buf_exact(&mut self, cursor: BorrowedCursor<'_>) -> Result<()> {
+    fn read_buf_exact(&mut self, cursor: BorrowedCursor<'_, u8>) -> Result<()> {
         default_read_buf_exact(self, cursor)
     }
 
@@ -1265,6 +1269,72 @@ pub trait Read {
         // Guard against incorrect `read_buf_exact` implementations.
         assert_eq!(borrowed_buf.len(), N);
         Ok(unsafe { MaybeUninit::array_assume_init(buf) })
+    }
+
+    /// Read and return a type (e.g. an integer) in little-endian order.
+    ///
+    /// You can specify the type with turbofish (`reader.read_le::<u64>()`), or let type inference
+    /// determine the type based on how the return value gets used.
+    ///
+    /// Like `read_exact`, if this function encounters an "end of file" before reading the desired
+    /// number of bytes, it returns an error of the kind [`ErrorKind::UnexpectedEof`].
+    ///
+    /// ```
+    /// #![feature(read_le)]
+    /// use std::io::Cursor;
+    /// use std::io::prelude::*;
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let mut buf = Cursor::new([1, 2, 3, 4, 5, 6, 7, 8, 9, 8, 7, 6, 5, 4, 3, 2]);
+    ///     let x: u64 = buf.read_le()?;
+    ///     let y: u32 = buf.read_le()?;
+    ///     let z = buf.read_le::<u16>()?;
+    ///     assert_eq!(x, 0x807060504030201);
+    ///     assert_eq!(y, 0x6070809);
+    ///     assert_eq!(z, 0x405);
+    ///     Ok(())
+    /// }
+    /// ```
+    #[unstable(feature = "read_le", issue = "156984")]
+    #[inline]
+    fn read_le<T: FromEndianBytes>(&mut self) -> Result<T>
+    where
+        Self: Sized,
+    {
+        T::read_le_from(self)
+    }
+
+    /// Read and return a type (e.g. an integer) in big-endian order.
+    ///
+    /// You can specify the type with turbofish (`reader.read_be::<u64>()`), or let type inference
+    /// determine the type based on how the return value gets used.
+    ///
+    /// Like `read_exact`, if this function encounters an "end of file" before reading the desired
+    /// number of bytes, it returns an error of the kind [`ErrorKind::UnexpectedEof`].
+    ///
+    /// ```
+    /// #![feature(read_le)]
+    /// use std::io::Cursor;
+    /// use std::io::prelude::*;
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let mut buf = Cursor::new([1, 2, 3, 4, 5, 6, 7, 8, 9, 8, 7, 6, 5, 4, 3, 2]);
+    ///     let x: u64 = buf.read_be()?;
+    ///     let y: u32 = buf.read_be()?;
+    ///     let z = buf.read_be::<u16>()?;
+    ///     assert_eq!(x, 0x102030405060708);
+    ///     assert_eq!(y, 0x9080706);
+    ///     assert_eq!(z, 0x504);
+    ///     Ok(())
+    /// }
+    /// ```
+    #[unstable(feature = "read_le", issue = "156984")]
+    #[inline]
+    fn read_be<T: FromEndianBytes>(&mut self) -> Result<T>
+    where
+        Self: Sized,
+    {
+        T::read_be_from(self)
     }
 }
 
@@ -1691,240 +1761,6 @@ pub trait Write {
         self
     }
 }
-
-/// The `Seek` trait provides a cursor which can be moved within a stream of
-/// bytes.
-///
-/// The stream typically has a fixed size, allowing seeking relative to either
-/// end or the current offset.
-///
-/// # Examples
-///
-/// [`File`]s implement `Seek`:
-///
-/// [`File`]: crate::fs::File
-///
-/// ```no_run
-/// use std::io;
-/// use std::io::prelude::*;
-/// use std::fs::File;
-/// use std::io::SeekFrom;
-///
-/// fn main() -> io::Result<()> {
-///     let mut f = File::open("foo.txt")?;
-///
-///     // move the cursor 42 bytes from the start of the file
-///     f.seek(SeekFrom::Start(42))?;
-///     Ok(())
-/// }
-/// ```
-#[stable(feature = "rust1", since = "1.0.0")]
-#[cfg_attr(not(test), rustc_diagnostic_item = "IoSeek")]
-pub trait Seek {
-    /// Seek to an offset, in bytes, in a stream.
-    ///
-    /// A seek beyond the end of a stream is allowed, but behavior is defined
-    /// by the implementation.
-    ///
-    /// If the seek operation completed successfully,
-    /// this method returns the new position from the start of the stream.
-    /// That position can be used later with [`SeekFrom::Start`].
-    ///
-    /// # Errors
-    ///
-    /// Seeking can fail, for example because it might involve flushing a buffer.
-    ///
-    /// Seeking to a negative offset is considered an error.
-    #[stable(feature = "rust1", since = "1.0.0")]
-    fn seek(&mut self, pos: SeekFrom) -> Result<u64>;
-
-    /// Rewind to the beginning of a stream.
-    ///
-    /// This is a convenience method, equivalent to `seek(SeekFrom::Start(0))`.
-    ///
-    /// # Errors
-    ///
-    /// Rewinding can fail, for example because it might involve flushing a buffer.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use std::io::{Read, Seek, Write};
-    /// use std::fs::OpenOptions;
-    ///
-    /// let mut f = OpenOptions::new()
-    ///     .write(true)
-    ///     .read(true)
-    ///     .create(true)
-    ///     .open("foo.txt")?;
-    ///
-    /// let hello = "Hello!\n";
-    /// write!(f, "{hello}")?;
-    /// f.rewind()?;
-    ///
-    /// let mut buf = String::new();
-    /// f.read_to_string(&mut buf)?;
-    /// assert_eq!(&buf, hello);
-    /// # std::io::Result::Ok(())
-    /// ```
-    #[stable(feature = "seek_rewind", since = "1.55.0")]
-    fn rewind(&mut self) -> Result<()> {
-        self.seek(SeekFrom::Start(0))?;
-        Ok(())
-    }
-
-    /// Returns the length of this stream (in bytes).
-    ///
-    /// The default implementation uses up to three seek operations. If this
-    /// method returns successfully, the seek position is unchanged (i.e. the
-    /// position before calling this method is the same as afterwards).
-    /// However, if this method returns an error, the seek position is
-    /// unspecified.
-    ///
-    /// If you need to obtain the length of *many* streams and you don't care
-    /// about the seek position afterwards, you can reduce the number of seek
-    /// operations by simply calling `seek(SeekFrom::End(0))` and using its
-    /// return value (it is also the stream length).
-    ///
-    /// Note that length of a stream can change over time (for example, when
-    /// data is appended to a file). So calling this method multiple times does
-    /// not necessarily return the same length each time.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// #![feature(seek_stream_len)]
-    /// use std::{
-    ///     io::{self, Seek},
-    ///     fs::File,
-    /// };
-    ///
-    /// fn main() -> io::Result<()> {
-    ///     let mut f = File::open("foo.txt")?;
-    ///
-    ///     let len = f.stream_len()?;
-    ///     println!("The file is currently {len} bytes long");
-    ///     Ok(())
-    /// }
-    /// ```
-    #[unstable(feature = "seek_stream_len", issue = "59359")]
-    fn stream_len(&mut self) -> Result<u64> {
-        stream_len_default(self)
-    }
-
-    /// Returns the current seek position from the start of the stream.
-    ///
-    /// This is equivalent to `self.seek(SeekFrom::Current(0))`.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use std::{
-    ///     io::{self, BufRead, BufReader, Seek},
-    ///     fs::File,
-    /// };
-    ///
-    /// fn main() -> io::Result<()> {
-    ///     let mut f = BufReader::new(File::open("foo.txt")?);
-    ///
-    ///     let before = f.stream_position()?;
-    ///     f.read_line(&mut String::new())?;
-    ///     let after = f.stream_position()?;
-    ///
-    ///     println!("The first line was {} bytes long", after - before);
-    ///     Ok(())
-    /// }
-    /// ```
-    #[stable(feature = "seek_convenience", since = "1.51.0")]
-    fn stream_position(&mut self) -> Result<u64> {
-        self.seek(SeekFrom::Current(0))
-    }
-
-    /// Seeks relative to the current position.
-    ///
-    /// This is equivalent to `self.seek(SeekFrom::Current(offset))` but
-    /// doesn't return the new position which can allow some implementations
-    /// such as [`BufReader`] to perform more efficient seeks.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use std::{
-    ///     io::{self, Seek},
-    ///     fs::File,
-    /// };
-    ///
-    /// fn main() -> io::Result<()> {
-    ///     let mut f = File::open("foo.txt")?;
-    ///     f.seek_relative(10)?;
-    ///     assert_eq!(f.stream_position()?, 10);
-    ///     Ok(())
-    /// }
-    /// ```
-    ///
-    /// [`BufReader`]: crate::io::BufReader
-    #[stable(feature = "seek_seek_relative", since = "1.80.0")]
-    fn seek_relative(&mut self, offset: i64) -> Result<()> {
-        self.seek(SeekFrom::Current(offset))?;
-        Ok(())
-    }
-}
-
-pub(crate) fn stream_len_default<T: Seek + ?Sized>(self_: &mut T) -> Result<u64> {
-    let old_pos = self_.stream_position()?;
-    let len = self_.seek(SeekFrom::End(0))?;
-
-    // Avoid seeking a third time when we were already at the end of the
-    // stream. The branch is usually way cheaper than a seek operation.
-    if old_pos != len {
-        self_.seek(SeekFrom::Start(old_pos))?;
-    }
-
-    Ok(len)
-}
-
-/// Enumeration of possible methods to seek within an I/O object.
-///
-/// It is used by the [`Seek`] trait.
-#[derive(Copy, PartialEq, Eq, Clone, Debug)]
-#[stable(feature = "rust1", since = "1.0.0")]
-#[cfg_attr(not(test), rustc_diagnostic_item = "SeekFrom")]
-pub enum SeekFrom {
-    /// Sets the offset to the provided number of bytes.
-    #[stable(feature = "rust1", since = "1.0.0")]
-    Start(#[stable(feature = "rust1", since = "1.0.0")] u64),
-
-    /// Sets the offset to the size of this object plus the specified number of
-    /// bytes.
-    ///
-    /// It is possible to seek beyond the end of an object, but it's an error to
-    /// seek before byte 0.
-    #[stable(feature = "rust1", since = "1.0.0")]
-    End(#[stable(feature = "rust1", since = "1.0.0")] i64),
-
-    /// Sets the offset to the current position plus the specified number of
-    /// bytes.
-    ///
-    /// It is possible to seek beyond the end of an object, but it's an error to
-    /// seek before byte 0.
-    #[stable(feature = "rust1", since = "1.0.0")]
-    Current(#[stable(feature = "rust1", since = "1.0.0")] i64),
-}
-
-/// Marks that a type `T` can have IO traits such as [`Seek`], [`Write`], etc. automatically
-/// implemented for handle types like [`Arc`][arc] as well.
-///
-/// This trait should only be implemented for types where `<&T as Trait>::method(&mut &value, ..)`
-/// would be identical to `<T as Trait>::method(&mut value, ..)`.
-///
-/// [`File`][file] passes this test, as operations on `&File` and `File` both affect
-/// the same underlying file.
-/// `[u8]` fails, because any modification to `&mut &[u8]` would only affect a temporary
-/// and be lost after the method has been called.
-///
-/// [file]: crate::fs::File
-/// [arc]: crate::sync::Arc
-pub(crate) trait IoHandle {}
 
 fn read_until<R: BufRead + ?Sized>(r: &mut R, delim: u8, buf: &mut Vec<u8>) -> Result<usize> {
     let mut read = 0;
@@ -2429,7 +2265,7 @@ impl<T: Read, U: Read> Read for Chain<T, U> {
     // We don't override `read_to_string` here because an UTF-8 sequence could
     // be split between the two parts of the chain
 
-    fn read_buf(&mut self, mut buf: BorrowedCursor<'_>) -> Result<()> {
+    fn read_buf(&mut self, mut buf: BorrowedCursor<'_, u8>) -> Result<()> {
         if buf.capacity() == 0 {
             return Ok(());
         }
@@ -2483,21 +2319,6 @@ impl<T: BufRead, U: BufRead> BufRead for Chain<T, U> {
     // split between the two parts of the chain
 }
 
-impl<T, U> SizeHint for Chain<T, U> {
-    #[inline]
-    fn lower_bound(&self) -> usize {
-        SizeHint::lower_bound(&self.first) + SizeHint::lower_bound(&self.second)
-    }
-
-    #[inline]
-    fn upper_bound(&self) -> Option<usize> {
-        match (SizeHint::upper_bound(&self.first), SizeHint::upper_bound(&self.second)) {
-            (Some(first), Some(second)) => first.checked_add(second),
-            _ => None,
-        }
-    }
-}
-
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T: Read> Read for Take<T> {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
@@ -2513,7 +2334,7 @@ impl<T: Read> Read for Take<T> {
         Ok(n)
     }
 
-    fn read_buf(&mut self, mut buf: BorrowedCursor<'_>) -> Result<()> {
+    fn read_buf(&mut self, mut buf: BorrowedCursor<'_, u8>) -> Result<()> {
         // Don't call into inner reader at all at EOF because it may still block
         if self.limit == 0 {
             return Ok(());
@@ -2592,64 +2413,6 @@ impl<T: BufRead> BufRead for Take<T> {
     }
 }
 
-impl<T> SizeHint for Take<T> {
-    #[inline]
-    fn lower_bound(&self) -> usize {
-        cmp::min(SizeHint::lower_bound(&self.inner) as u64, self.limit) as usize
-    }
-
-    #[inline]
-    fn upper_bound(&self) -> Option<usize> {
-        match SizeHint::upper_bound(&self.inner) {
-            Some(upper_bound) => Some(cmp::min(upper_bound as u64, self.limit) as usize),
-            None => self.limit.try_into().ok(),
-        }
-    }
-}
-
-#[stable(feature = "seek_io_take", since = "1.89.0")]
-impl<T: Seek> Seek for Take<T> {
-    fn seek(&mut self, pos: SeekFrom) -> Result<u64> {
-        let new_position = match pos {
-            SeekFrom::Start(v) => Some(v),
-            SeekFrom::Current(v) => self.position().checked_add_signed(v),
-            SeekFrom::End(v) => self.len.checked_add_signed(v),
-        };
-        let new_position = match new_position {
-            Some(v) if v <= self.len => v,
-            _ => return Err(ErrorKind::InvalidInput.into()),
-        };
-        while new_position != self.position() {
-            if let Some(offset) = new_position.checked_signed_diff(self.position()) {
-                self.inner.seek_relative(offset)?;
-                self.limit = self.limit.wrapping_sub(offset as u64);
-                break;
-            }
-            let offset = if new_position > self.position() { i64::MAX } else { i64::MIN };
-            self.inner.seek_relative(offset)?;
-            self.limit = self.limit.wrapping_sub(offset as u64);
-        }
-        Ok(new_position)
-    }
-
-    fn stream_len(&mut self) -> Result<u64> {
-        Ok(self.len)
-    }
-
-    fn stream_position(&mut self) -> Result<u64> {
-        Ok(self.position())
-    }
-
-    fn seek_relative(&mut self, offset: i64) -> Result<()> {
-        if !self.position().checked_add_signed(offset).is_some_and(|p| p <= self.len) {
-            return Err(ErrorKind::InvalidInput.into());
-        }
-        self.inner.seek_relative(offset)?;
-        self.limit = self.limit.wrapping_sub(offset as u64);
-        Ok(())
-    }
-}
-
 /// An iterator over `u8` values of a reader.
 ///
 /// This struct is generally created by calling [`bytes`] on a reader.
@@ -2713,64 +2476,6 @@ fn inlined_slow_read_byte<R: Read>(reader: &mut R) -> Option<Result<u8>> {
 #[inline(never)]
 fn uninlined_slow_read_byte<R: Read>(reader: &mut R) -> Option<Result<u8>> {
     inlined_slow_read_byte(reader)
-}
-
-trait SizeHint {
-    fn lower_bound(&self) -> usize;
-
-    fn upper_bound(&self) -> Option<usize>;
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.lower_bound(), self.upper_bound())
-    }
-}
-
-impl<T: ?Sized> SizeHint for T {
-    #[inline]
-    default fn lower_bound(&self) -> usize {
-        0
-    }
-
-    #[inline]
-    default fn upper_bound(&self) -> Option<usize> {
-        None
-    }
-}
-
-impl<T> SizeHint for &mut T {
-    #[inline]
-    fn lower_bound(&self) -> usize {
-        SizeHint::lower_bound(*self)
-    }
-
-    #[inline]
-    fn upper_bound(&self) -> Option<usize> {
-        SizeHint::upper_bound(*self)
-    }
-}
-
-impl<T> SizeHint for Box<T> {
-    #[inline]
-    fn lower_bound(&self) -> usize {
-        SizeHint::lower_bound(&**self)
-    }
-
-    #[inline]
-    fn upper_bound(&self) -> Option<usize> {
-        SizeHint::upper_bound(&**self)
-    }
-}
-
-impl SizeHint for &[u8] {
-    #[inline]
-    fn lower_bound(&self) -> usize {
-        self.len()
-    }
-
-    #[inline]
-    fn upper_bound(&self) -> Option<usize> {
-        Some(self.len())
-    }
 }
 
 /// An iterator over the contents of an instance of `BufRead` split on a
@@ -2841,3 +2546,34 @@ impl<B: BufRead> Iterator for Lines<B> {
         }
     }
 }
+
+/// Trait for types that can be converted from a fixed-size byte array with a specified endianness
+#[unstable(feature = "read_le_be_internals", reason = "internals", issue = "none")]
+// Once we can use associated consts in the types of method parameters, rewrite this to have
+// `from_le_bytes` and `from_be_bytes` methods, move it to `core`, and make it public.
+pub trait FromEndianBytes: crate::sealed::Sealed + Sized {
+    #[doc(hidden)]
+    fn read_le_from(r: &mut impl Read) -> Result<Self>;
+
+    #[doc(hidden)]
+    fn read_be_from(r: &mut impl Read) -> Result<Self>;
+}
+
+macro_rules! impl_from_endian_bytes {
+    ($($t:ty),*$(,)?) => {$(
+        #[unstable(feature = "read_le_be_internals", reason = "internals", issue = "none")]
+        impl FromEndianBytes for $t {
+            #[inline]
+            fn read_le_from(r: &mut impl Read) -> Result<Self> {
+                Ok(<$t>::from_le_bytes(r.read_array()?))
+            }
+
+            #[inline]
+            fn read_be_from(r: &mut impl Read) -> Result<Self> {
+                Ok(<$t>::from_be_bytes(r.read_array()?))
+            }
+        }
+    )*};
+}
+
+impl_from_endian_bytes!(u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize, f32, f64);

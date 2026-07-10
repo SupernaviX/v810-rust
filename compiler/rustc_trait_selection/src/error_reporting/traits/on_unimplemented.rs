@@ -40,6 +40,11 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
         if trait_pred.polarity() != ty::PredicatePolarity::Positive {
             return CustomDiagnostic::default();
         }
+        // This is needed as `on_unimplemented` is currently not allowed on trait aliases,
+        // but the "not allowed" is a warning, and this check ensures the attribute has no effect
+        if self.tcx.is_trait_alias(trait_pred.def_id()) {
+            return CustomDiagnostic::default();
+        }
         let (filter_options, format_args) =
             self.on_unimplemented_components(trait_pred, obligation, long_ty_path);
         if let Some(command) = find_attr!(self.tcx, trait_pred.def_id(), OnUnimplemented {directive, ..} => directive.as_deref()).flatten() {
@@ -67,7 +72,7 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
         // FIXME(-Zlower-impl-trait-in-trait-to-assoc-ty): HIR is not present for RPITITs,
         // but I guess we could synthesize one here. We don't see any errors that rely on
         // that yet, though.
-        let item_context = self.describe_enclosure(obligation.cause.body_id).unwrap_or("");
+        let item_context = self.describe_enclosure(obligation.cause.body_def_id).unwrap_or("");
 
         let direct = match obligation.cause.code() {
             ObligationCauseCode::BuiltinDerived(..)
@@ -251,7 +256,8 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
             })
             .collect();
 
-        let format_args = FormatArgs { this, this_path, this_resolved, generic_args, item_context };
+        let format_args =
+            FormatArgs { this, this_path, this_resolved, generic_args, item_context, .. };
         (filter_options, format_args)
     }
 }

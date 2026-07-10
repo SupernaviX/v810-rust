@@ -125,6 +125,7 @@ impl<'tcx> Stable<'tcx> for CanonAbi {
             CanonAbi::Rust => CallConvention::Rust,
             CanonAbi::RustCold => CallConvention::Cold,
             CanonAbi::RustPreserveNone => CallConvention::PreserveNone,
+            CanonAbi::RustTail => CallConvention::Tail,
             CanonAbi::Custom => CallConvention::Custom,
             CanonAbi::Swift => CallConvention::Swift,
             CanonAbi::Arm(arm_call) => match arm_call {
@@ -270,8 +271,12 @@ impl<'tcx> Stable<'tcx> for rustc_abi::BackendRepr {
     ) -> Self::T {
         match *self {
             rustc_abi::BackendRepr::Scalar(scalar) => ValueAbi::Scalar(scalar.stable(tables, cx)),
-            rustc_abi::BackendRepr::ScalarPair(first, second) => {
-                ValueAbi::ScalarPair(first.stable(tables, cx), second.stable(tables, cx))
+            rustc_abi::BackendRepr::ScalarPair { a: first, b: second, b_offset: second_offset } => {
+                ValueAbi::ScalarPair {
+                    a: first.stable(tables, cx),
+                    b: second.stable(tables, cx),
+                    b_offset: second_offset.stable(tables, cx),
+                }
             }
             rustc_abi::BackendRepr::SimdVector { element, count } => {
                 ValueAbi::Vector { element: element.stable(tables, cx), count }

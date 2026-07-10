@@ -318,6 +318,7 @@ pub(crate) enum AttributeKind {
     SanitizeRealtimeNonblocking = 47,
     SanitizeRealtimeBlocking = 48,
     Convergent = 49,
+    NoFree = 50,
 }
 
 /// LLVMIntPredicate
@@ -983,6 +984,10 @@ unsafe extern "C" {
     pub(crate) fn LLVMGetValueName2(Val: &Value, Length: *mut size_t) -> *const c_char;
     pub(crate) fn LLVMSetValueName2(Val: &Value, Name: *const c_char, NameLen: size_t);
     pub(crate) fn LLVMReplaceAllUsesWith<'a>(OldVal: &'a Value, NewVal: &'a Value);
+    pub(crate) safe fn LLVMGetMetadata<'a>(
+        Val: &'a Value,
+        KindID: MetadataKindId,
+    ) -> Option<&'a Value>;
     pub(crate) safe fn LLVMSetMetadata<'a>(Val: &'a Value, KindID: MetadataKindId, Node: &'a Value);
     pub(crate) fn LLVMGlobalSetMetadata<'a>(
         Val: &'a Value,
@@ -1012,6 +1017,7 @@ unsafe extern "C" {
         Name: *const c_char,
         Val: &'a Value,
     );
+    pub(crate) fn LLVMReplaceMDNodeOperandWith(Val: &Value, index: u32, replacement: &Metadata);
 
     // Operations on scalar constants
     pub(crate) fn LLVMConstInt(IntTy: &Type, N: c_ulonglong, SignExtend: Bool) -> &Value;
@@ -2133,6 +2139,8 @@ unsafe extern "C" {
         IsVolatile: bool,
     ) -> &'a Value;
 
+    pub(crate) fn LLVMRustBuildVScale<'a>(B: &Builder<'a>, Ty: &'a Type) -> &'a Value;
+
     pub(crate) fn LLVMRustTimeTraceProfilerInitialize();
 
     pub(crate) fn LLVMRustTimeTraceProfilerFinishThread();
@@ -2484,6 +2492,8 @@ unsafe extern "C" {
         llvm_selfprofiler: *mut c_void,
         begin_callback: SelfProfileBeforePassCallback,
         end_callback: SelfProfileAfterPassCallback,
+        PostEnzymePasses: *const c_char,
+        PostEnzymePassesLen: size_t,
         ExtraPasses: *const c_char,
         ExtraPassesLen: size_t,
         LLVMPlugins: *const c_char,
@@ -2639,4 +2649,12 @@ unsafe extern "C" {
         Aliasee: &Value,
         Name: *const c_char,
     ) -> &'ll Value;
+
+    pub(crate) fn LLVMRustConstPtrAuth(
+        ptr: *const Value,
+        key: u32,
+        disc: u64,
+        addr_diversity: *const Value,
+        deactivation_symbol: *const Value,
+    ) -> *const Value;
 }

@@ -4,22 +4,20 @@ use rustc_errors::codes::*;
 use rustc_errors::{
     Applicability, Diag, DiagArgValue, DiagCtxtHandle, Diagnostic, EmissionGuarantee, Level,
 };
-use rustc_feature::AttributeTemplate;
 use rustc_hir::AttrPath;
 use rustc_hir::attrs::{MirDialect, MirPhase};
 use rustc_macros::{Diagnostic, Subdiagnostic};
 use rustc_span::{Span, Symbol};
 use rustc_target::spec::TargetTuple;
 
+use crate::AttributeTemplate;
 use crate::context::Suggestion;
 
 #[derive(Diagnostic)]
-#[diag("invalid predicate `{$predicate}`", code = E0537)]
-pub(crate) struct InvalidPredicate {
+#[diag("`#[ffi_const]` function cannot be `#[ffi_pure]`", code = E0757)]
+pub(crate) struct BothFfiConstAndPure {
     #[primary_span]
-    pub span: Span,
-
-    pub predicate: String,
+    pub attr_span: Span,
 }
 
 #[derive(Diagnostic)]
@@ -80,6 +78,26 @@ pub(crate) struct DocAttributeNotAttribute {
     #[primary_span]
     pub span: Span,
     pub attribute: Symbol,
+}
+
+#[derive(Diagnostic)]
+#[diag(
+    "`#[target_feature]` cannot be applied to a {$kind ->
+        [panic_handler] `#[panic_handler]`
+        *[other] lang item
+    } function"
+)]
+pub(crate) struct TargetFeatureOnLangItem {
+    #[primary_span]
+    pub attr_span: Span,
+    pub kind: Symbol,
+    #[label(
+        "{$kind ->
+            [panic_handler] `#[panic_handler]`
+            *[other] lang item
+        } function is not allowed to have `#[target_feature]`"
+    )]
+    pub item_span: Span,
 }
 
 #[derive(Diagnostic)]
@@ -275,6 +293,13 @@ pub(crate) struct EmptyExportName {
 }
 
 #[derive(Diagnostic)]
+#[diag("`section` may not be empty")]
+pub(crate) struct EmptySection {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
 #[diag("`export_name` may not contain null characters", code = E0648)]
 pub(crate) struct NullOnExport {
     #[primary_span]
@@ -310,6 +335,13 @@ pub(crate) struct NullOnObjcSelector {
 }
 
 #[derive(Diagnostic)]
+#[diag("`section` may not contain null characters", code = E0648)]
+pub(crate) struct NullOnSection {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
 #[diag("`objc::class!` expected a string literal")]
 pub(crate) struct ObjcClassExpectedStringLiteral {
     #[primary_span]
@@ -324,13 +356,6 @@ pub(crate) struct ObjcSelectorExpectedStringLiteral {
 }
 
 #[derive(Diagnostic)]
-#[diag("stability attributes may not be used outside of the standard library", code = E0734)]
-pub(crate) struct StabilityOutsideStd {
-    #[primary_span]
-    pub span: Span,
-}
-
-#[derive(Diagnostic)]
 #[diag("expected at least one confusable name")]
 pub(crate) struct EmptyConfusables {
     #[primary_span]
@@ -338,8 +363,8 @@ pub(crate) struct EmptyConfusables {
 }
 
 #[derive(Diagnostic)]
-#[help("`#[{$name}]` can {$only}be applied to {$applied}")]
-#[diag("`#[{$name}]` attribute cannot be used on {$target}")]
+#[help("`#[{$name}{$attribute_args}]` can {$only}be applied to {$applied}")]
+#[diag("`#[{$name}{$attribute_args}]` attribute cannot be used on {$target}")]
 pub(crate) struct InvalidTarget {
     #[primary_span]
     #[suggestion(
@@ -353,6 +378,25 @@ pub(crate) struct InvalidTarget {
     pub target: &'static str,
     pub applied: DiagArgValue,
     pub only: &'static str,
+    pub attribute_args: String,
+    #[subdiagnostic]
+    pub help: Option<InvalidTargetHelp>,
+    #[warning(
+        "this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!"
+    )]
+    pub previously_accepted: bool,
+    #[note(
+        "placing this attribute on a macro invocation does nothing even if the macro expands to what would be a valid target for the attribute"
+    )]
+    pub on_macro_call: bool,
+}
+
+#[derive(Subdiagnostic)]
+pub(crate) enum InvalidTargetHelp {
+    #[help("use `#[rustc_align(...)]` instead")]
+    UseRustcAlign,
+    #[help("use `#[rustc_align_static(...)]` instead")]
+    UseRustcAlignStatic,
 }
 
 #[derive(Diagnostic)]
@@ -1014,4 +1058,48 @@ pub(crate) enum InvalidMachoSectionReason {
     MissingSection,
     #[note("section name `{$section}` is longer than 16 bytes")]
     SectionTooLong { section: String },
+}
+
+#[derive(Diagnostic)]
+#[diag("`#[sanitize({$field} = ...)]` attribute cannot be used on statics")]
+#[help("`#[sanitize]` can be used on statics if only the address is sanitized")]
+pub(crate) struct SanitizeInvalidStatic {
+    #[primary_span]
+    pub span: Span,
+    pub field: &'static str,
+}
+
+#[derive(Diagnostic)]
+#[diag("attribute items not separated with `,`")]
+pub(crate) struct ExpectedComma {
+    #[primary_span]
+    #[suggestion(
+        "try adding `,` here",
+        code = ",",
+        applicability = "maybe-incorrect",
+        style = "short"
+    )]
+    pub span: Span,
+    #[subdiagnostic]
+    pub additional: Vec<AdditionalCommaSuggestion>,
+}
+
+#[derive(Subdiagnostic)]
+#[suggestion("try adding `,` here", code = ",", applicability = "maybe-incorrect", style = "short")]
+pub(crate) struct AdditionalCommaSuggestion {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag("unused attribute")]
+pub(crate) struct UnusedDuplicate {
+    #[suggestion("remove this attribute", code = "", applicability = "machine-applicable")]
+    pub this: Span,
+    #[note("attribute also specified here")]
+    pub other: Span,
+    #[warning(
+        "this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!"
+    )]
+    pub warning: bool,
 }

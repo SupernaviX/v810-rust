@@ -659,25 +659,29 @@ impl<'a> Parser<'a> {
         defaultness: Defaultness,
         is_reuse: bool,
     ) -> PResult<'a, ItemKind> {
-        let mut constness = self.parse_constness(Case::Sensitive);
+        let constness = self.parse_constness(Case::Sensitive);
         let safety = self.parse_safety(Case::Sensitive);
         self.expect_keyword(exp!(Impl))?;
-
+        let mut generics_snapshot = None;
         // First, parse generic parameters if necessary.
         let mut generics = if self.choose_generics_over_qpath(0) {
             self.parse_generics()?
         } else {
+            // We might be mistakenly trying to use a generic type as a generic parameter.
+            // impl<X<T>> Trait for Y<T> { ... }
+            if self.look_ahead(0, |t| t == &token::Lt)
+                && self.look_ahead(1, |t| t.is_ident())
+                && self.look_ahead(2, |t| t == &token::Lt)
+            {
+                generics_snapshot = Some(self.create_snapshot_for_diagnostic());
+            }
+
             let mut generics = Generics::default();
             // impl A for B {}
             //    /\ this is where `generics.span` should point when there are no type params.
             generics.span = self.prev_token.span.shrink_to_hi();
             generics
         };
-
-        if let Const::No = constness {
-            // FIXME(const_trait_impl): disallow `impl const Trait`
-            constness = self.parse_constness(Case::Sensitive);
-        }
 
         if let Const::Yes(span) = constness {
             self.psess.gated_spans.gate(sym::const_trait_impl, span);
@@ -703,9 +707,13 @@ impl<'a> Parser<'a> {
                 for_span: span.to(self.token.span),
             }));
         } else {
-            self.parse_ty_with_generics_recovery(&generics)?
+            self.parse_ty_with_generics_recovery(&generics).map_err(|e| {
+                let Some(mut snapshot) = generics_snapshot else {
+                    return e;
+                };
+                snapshot.maybe_type_in_generic_parameter(e)
+            })?
         };
-
         // If `for` is missing we try to recover.
         let has_for = self.eat_keyword(exp!(For));
         let missing_for_span = self.prev_token.span.between(self.token.span);
@@ -909,7 +917,7 @@ impl<'a> Parser<'a> {
                 ident,
                 rename,
                 body: self.parse_delegation_body()?,
-                from_glob: false,
+                source: DelegationSource::Single,
             }))
         })
     }
@@ -1140,7 +1148,7 @@ impl<'a> Parser<'a> {
         // Parse optional colon and supertrait bounds.
         let had_colon = self.eat(exp!(Colon));
         let span_at_colon = self.prev_token.span;
-        let bounds = if had_colon { self.parse_generic_bounds()? } else { Vec::new() };
+        let bounds = if had_colon { self.parse_generic_bounds()? } else { ThinVec::new() };
 
         let span_before_eq = self.prev_token.span;
         if self.eat(exp!(Eq)) {
@@ -1258,7 +1266,8 @@ impl<'a> Parser<'a> {
         let mut generics = self.parse_generics()?;
 
         // Parse optional colon and param bounds.
-        let bounds = if self.eat(exp!(Colon)) { self.parse_generic_bounds()? } else { Vec::new() };
+        let bounds =
+            if self.eat(exp!(Colon)) { self.parse_generic_bounds()? } else { ThinVec::new() };
         generics.where_clause = self.parse_where_clause()?;
 
         let ty = if self.eat(exp!(Eq)) { Some(self.parse_ty()?) } else { None };
@@ -1915,6 +1924,10 @@ impl<'a> Parser<'a> {
                 None
             };
 
+            let span = vlo.to(this.prev_token.span);
+            if ident.name == kw::Underscore {
+                this.psess.gated_spans.gate(sym::unnamed_enum_variants, span);
+            }
             let vr = ast::Variant {
                 ident,
                 vis,
@@ -1922,7 +1935,7 @@ impl<'a> Parser<'a> {
                 attrs: variant_attrs,
                 data: struct_def,
                 disr_expr,
-                span: vlo.to(this.prev_token.span),
+                span,
                 is_placeholder: false,
             };
 
@@ -2163,8 +2176,10 @@ impl<'a> Parser<'a> {
         })
         .map(|(r, _)| r)
         .map_err(|mut error| {
-            if encountered_colon {
+            if self.token == token::Colon {
                 error.subdiagnostic(UseDoubleColonSuggestion { colon: self.token.span });
+            }
+            if encountered_colon {
                 self.eat_to_tokens(&[exp!(CloseParen)]);
                 self.bump();
                 error.subdiagnostic(UseRegularStructSuggestion {
@@ -2382,7 +2397,10 @@ impl<'a> Parser<'a> {
     /// for better diagnostics and suggestions.
     fn parse_field_ident(&mut self, adt_ty: &str, lo: Span) -> PResult<'a, Ident> {
         let (ident, is_raw) = self.ident_or_err(true)?;
-        if is_raw == IdentIsRaw::No && ident.is_reserved() {
+        if is_raw == IdentIsRaw::No
+            && ident.is_reserved()
+            && !(ident.name == kw::Underscore && adt_ty == "enum")
+        {
             let snapshot = self.create_snapshot_for_diagnostic();
             let err = if self.check_fn_front_matter(false, Case::Sensitive) {
                 let inherited_vis =
@@ -3406,6 +3424,7 @@ impl<'a> Parser<'a> {
                 let (pat, colon) = this.parse_fn_param_pat_colon()?;
                 if !colon {
                     let mut err = this.unexpected().unwrap_err();
+                    let pat_span = pat.span;
                     return if let Some(ident) = this.parameter_without_type(
                         &mut err,
                         pat,
@@ -3414,7 +3433,9 @@ impl<'a> Parser<'a> {
                         fn_parse_mode,
                     ) {
                         let guar = err.emit();
-                        Ok((dummy_arg(ident, guar), Trailing::No, UsePreAttrPos::No))
+                        let mut arg = dummy_arg(ident, guar);
+                        arg.span = pat_span;
+                        Ok((arg, Trailing::No, UsePreAttrPos::No))
                     } else {
                         Err(err)
                     };

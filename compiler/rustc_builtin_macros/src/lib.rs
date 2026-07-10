@@ -33,10 +33,10 @@ mod concat_bytes;
 mod define_opaque;
 mod derive;
 mod deriving;
+mod diagnostics;
 mod edition_panic;
 mod eii;
 mod env;
-mod errors;
 mod format;
 mod format_foreign;
 mod global_allocator;
@@ -47,6 +47,7 @@ mod pattern_type;
 mod source_util;
 mod test;
 mod trace_macros;
+mod view_type;
 
 pub mod asm;
 pub mod cmdline_attrs;
@@ -99,6 +100,7 @@ pub fn register_builtin_macros(resolver: &mut dyn ResolverExpand) {
         stringify: source_util::expand_stringify,
         trace_macros: trace_macros::expand_trace_macros,
         unreachable: edition_panic::expand_unreachable,
+        view_type: view_type::expand,
         // tidy-alphabetical-end
     }
 

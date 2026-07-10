@@ -27,7 +27,7 @@ fn copy_intrinsic<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
     let layout = bx.layout_of(ty);
     let size = layout.size;
     let align = layout.align.abi;
-    let size = bx.mul(bx.const_usize(size.bytes()), count);
+    let size = bx.unchecked_sumul(bx.const_usize(size.bytes()), count);
     let flags = if volatile { MemFlags::VOLATILE } else { MemFlags::empty() };
     if allow_overlap {
         bx.memmove(dst, align, src, align, size, flags);
@@ -63,6 +63,17 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
         result_place: Option<PlaceValue<Bx::Value>>,
         source_info: SourceInfo,
     ) -> IntrinsicResult<'tcx, Bx::Value> {
+        // When `-Zforce-intrinsic-fallback` is enabled, always use the fallback body if it exists,
+        if bx.tcx().sess.opts.unstable_opts.force_intrinsic_fallback
+            && let Some(def) = bx.tcx().intrinsic(instance.def_id())
+            && !def.must_be_overridden
+        {
+            return IntrinsicResult::Fallback(ty::Instance::new_raw(
+                instance.def_id(),
+                instance.args,
+            ));
+        }
+
         let span = source_info.span;
 
         let name = bx.tcx().item_name(instance.def_id());

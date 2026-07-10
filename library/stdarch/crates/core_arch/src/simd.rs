@@ -28,11 +28,13 @@ unsafe impl SimdElement for u8 {}
 unsafe impl SimdElement for u16 {}
 unsafe impl SimdElement for u32 {}
 unsafe impl SimdElement for u64 {}
+unsafe impl SimdElement for u128 {}
 
 unsafe impl SimdElement for i8 {}
 unsafe impl SimdElement for i16 {}
 unsafe impl SimdElement for i32 {}
 unsafe impl SimdElement for i64 {}
+unsafe impl SimdElement for i128 {}
 
 unsafe impl SimdElement for f16 {}
 unsafe impl SimdElement for f32 {}
@@ -88,7 +90,7 @@ impl<T: SimdElement, const N: usize> Clone for Simd<T, N> {
 
 #[rustc_const_unstable(feature = "stdarch_const_helpers", issue = "none")]
 #[rustfmt::skip] // FIXME: https://github.com/rust-lang/stdarch/pull/2133#issuecomment-4524350350
-impl<T: SimdElement, const N: usize> const crate::cmp::PartialEq for Simd<T, N> {
+const impl<T: SimdElement, const N: usize> crate::cmp::PartialEq for Simd<T, N> {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
         self.as_array() == other.as_array()
@@ -301,7 +303,7 @@ impl<T: SimdElement, const N: usize> Clone for SimdM<T, N> {
 
 #[rustc_const_unstable(feature = "stdarch_const_helpers", issue = "none")]
 #[rustfmt::skip] // FIXME: https://github.com/rust-lang/stdarch/pull/2133#issuecomment-4524350350
-impl<T: SimdElement, const N: usize> const crate::cmp::PartialEq for SimdM<T, N> {
+const impl<T: SimdElement, const N: usize> crate::cmp::PartialEq for SimdM<T, N> {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
         self.as_array() == other.as_array()
@@ -371,11 +373,13 @@ pub(crate) type u8x32 = Simd<u8, 32>;
 pub(crate) type u16x16 = Simd<u16, 16>;
 pub(crate) type u32x8 = Simd<u32, 8>;
 pub(crate) type u64x4 = Simd<u64, 4>;
+pub(crate) type u128x2 = Simd<u128, 2>;
 
 pub(crate) type i8x32 = Simd<i8, 32>;
 pub(crate) type i16x16 = Simd<i16, 16>;
 pub(crate) type i32x8 = Simd<i32, 8>;
 pub(crate) type i64x4 = Simd<i64, 4>;
+pub(crate) type i128x2 = Simd<i128, 2>;
 
 pub(crate) type f16x16 = Simd<f16, 16>;
 pub(crate) type f32x8 = Simd<f32, 8>;
@@ -391,11 +395,13 @@ pub(crate) type u8x64 = Simd<u8, 64>;
 pub(crate) type u16x32 = Simd<u16, 32>;
 pub(crate) type u32x16 = Simd<u32, 16>;
 pub(crate) type u64x8 = Simd<u64, 8>;
+pub(crate) type u128x4 = Simd<u128, 4>;
 
 pub(crate) type i8x64 = Simd<i8, 64>;
 pub(crate) type i16x32 = Simd<i16, 32>;
 pub(crate) type i32x16 = Simd<i32, 16>;
 pub(crate) type i64x8 = Simd<i64, 8>;
+pub(crate) type i128x4 = Simd<i128, 4>;
 
 pub(crate) type f16x32 = Simd<f16, 32>;
 pub(crate) type f32x16 = Simd<f32, 16>;

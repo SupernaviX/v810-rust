@@ -9,7 +9,7 @@ use rustc_hir::def_id::{CrateNum, DefId, LOCAL_CRATE};
 use rustc_middle::ty::TyCtxt;
 use rustc_session::config::CrateType;
 
-use crate::errors::{DuplicateEiiImpls, EiiWithoutImpl};
+use crate::diagnostics::{DuplicateEiiImpls, EiiWithoutImpl};
 
 #[derive(Clone, Copy, Debug)]
 enum CheckingMode {
@@ -141,6 +141,7 @@ pub(crate) fn check_externally_implementable_items<'tcx>(tcx: TyCtxt<'tcx>, (): 
                         decl_crate_name: tcx.crate_name(decl_crate),
                         // FIXME: shouldn't call `item_name`
                         name: decl.name.name,
+                        kind: tcx.def_kind(decl.foreign_item).descr(decl.foreign_item),
                         span: decl.name.span,
                         help: (),
                     });

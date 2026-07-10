@@ -31,7 +31,7 @@ use rustc_trait_selection::traits;
 use tracing::debug;
 
 use super::{MethodCallee, probe};
-use crate::errors::{SupertraitItemShadowee, SupertraitItemShadower, SupertraitItemShadowing};
+use crate::diagnostics::{SupertraitItemShadowee, SupertraitItemShadower, SupertraitItemShadowing};
 use crate::{FnCtxt, callee};
 
 pub(crate) struct ConfirmContext<'a, 'tcx> {
@@ -702,7 +702,7 @@ impl<'a, 'tcx> ConfirmContext<'a, 'tcx> {
                 Some(self.self_expr.span),
                 self.call_expr.span,
                 trait_def_id,
-                self.body_id.to_def_id(),
+                self.body_def_id.to_def_id(),
             )
         {
             self.set_tainted_by_errors(e);

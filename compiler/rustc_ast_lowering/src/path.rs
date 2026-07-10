@@ -11,11 +11,11 @@ use rustc_span::{BytePos, DUMMY_SP, DesugaringKind, Ident, Span, Symbol, sym};
 use smallvec::smallvec;
 use tracing::{debug, instrument};
 
-use super::errors::{
+use crate::diagnostics::{
     AsyncBoundNotOnTrait, AsyncBoundOnlyForFnTraits, BadReturnTypeNotation,
     GenericTypeWithParentheses, RTNSuggestion, UseAngleBrackets,
 };
-use super::{
+use crate::{
     AllowReturnTypeNotation, GenericArgsCtor, GenericArgsMode, ImplTraitContext, ImplTraitPosition,
     LifetimeRes, LoweringContext, ParamMode,
 };
@@ -412,6 +412,7 @@ impl<'hir> LoweringContext<'_, 'hir> {
             } else {
                 Some(generic_args.into_generic_args(self))
             },
+            delegation_child_segment: false,
         }
     }
 

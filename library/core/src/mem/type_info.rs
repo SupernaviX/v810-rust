@@ -215,7 +215,7 @@ pub struct Variant {
     pub name: &'static str,
     /// All fields of the variant.
     pub fields: &'static [Field],
-    /// Whether the enum variant fields is non-exhaustive.
+    /// Whether the enum variant fields are non-exhaustive.
     pub non_exhaustive: bool,
 }
 
@@ -342,6 +342,22 @@ pub struct FnPtr {
 
     /// Vardiadic function, e.g. extern "C" fn add(n: usize, mut args: ...);
     pub variadic: bool,
+
+    // FIXME(splat): should these fields be private, or merged into an Option<u8/u16>?
+    /// Is any function argument splatted?
+    pub is_splatted: bool,
+
+    /// The index of the splatted function argument in `inputs`, only valid if `is_splatted` is true.
+    /// e.g. in `fn overload(a: u8, #[splat] b: (f32, usize))` the index is 1, and it can be called
+    /// as `overload(a, 1.0, 2)`.
+    pub splatted_index: u8,
+}
+
+impl FnPtr {
+    /// Returns the splatted function argument index, or `None` if no argument is splatted.
+    pub const fn splatted(&self) -> Option<u8> {
+        if self.is_splatted { Some(self.splatted_index) } else { None }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -374,7 +390,8 @@ impl TypeId {
     /// ```
     #[unstable(feature = "type_info", issue = "146922")]
     #[rustc_const_unstable(feature = "type_info", issue = "146922")]
-    pub const fn size(self) -> Option<usize> {
+    #[rustc_comptime]
+    pub fn size(self) -> Option<usize> {
         intrinsics::size_of_type_id(self)
     }
 
@@ -399,7 +416,8 @@ impl TypeId {
     /// ```
     #[unstable(feature = "type_info", issue = "146922")]
     #[rustc_const_unstable(feature = "type_info", issue = "146922")]
-    pub const fn variants(self) -> usize {
+    #[rustc_comptime]
+    pub fn variants(self) -> usize {
         intrinsics::type_id_variants(self)
     }
 
@@ -461,7 +479,8 @@ impl TypeId {
     /// ```
     #[unstable(feature = "type_info", issue = "146922")]
     #[rustc_const_unstable(feature = "type_info", issue = "146922")]
-    pub const fn fields(self, variant_index: usize) -> usize {
+    #[rustc_comptime]
+    pub fn fields(self, variant_index: usize) -> usize {
         intrinsics::type_id_fields(self, variant_index)
     }
 
@@ -527,7 +546,8 @@ impl TypeId {
     /// ```
     #[unstable(feature = "type_info", issue = "146922")]
     #[rustc_const_unstable(feature = "type_info", issue = "146922")]
-    pub const fn field(self, variant_index: usize, field_index: usize) -> FieldId {
+    #[rustc_comptime]
+    pub fn field(self, variant_index: usize, field_index: usize) -> FieldId {
         FieldId {
             frt_type_id: intrinsics::type_id_field_representing_type(
                 self,
@@ -571,7 +591,8 @@ impl FieldId {
     /// ```
     #[unstable(feature = "type_info", issue = "146922")]
     #[rustc_const_unstable(feature = "type_info", issue = "146922")]
-    pub const fn type_id(self) -> TypeId {
+    #[rustc_comptime]
+    pub fn type_id(self) -> TypeId {
         intrinsics::field_representing_type_actual_type_id(self.frt_type_id)
     }
 }

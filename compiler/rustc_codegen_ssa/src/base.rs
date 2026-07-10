@@ -373,7 +373,6 @@ pub(crate) fn build_shift_expr_rhs<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
 // us
 pub fn wants_wasm_eh(sess: &Session) -> bool {
     sess.target.is_like_wasm
-        && (sess.target.os != Os::Emscripten || sess.opts.unstable_opts.emscripten_wasm_eh)
 }
 
 /// Returns `true` if this session's target will use SEH-based unwinding.
@@ -494,7 +493,7 @@ pub fn maybe_create_entry_wrapper<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
         return None;
     }
 
-    let main_llfn = cx.get_fn_addr(instance);
+    let main_llfn = cx.get_fn_addr(instance, Some(PacMetadata::default()));
 
     let entry_fn = create_entry_fn::<Bx>(cx, main_llfn, main_def_id, entry_type);
     return Some(entry_fn);
@@ -555,7 +554,7 @@ pub fn maybe_create_entry_wrapper<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
                 cx.tcx().mk_args(&[main_ret_ty.into()]),
                 DUMMY_SP,
             );
-            let start_fn = cx.get_fn_addr(start_instance);
+            let start_fn = cx.get_fn_addr(start_instance, Some(PacMetadata::default()));
 
             let i8_ty = cx.type_i8();
             let arg_sigpipe = bx.const_u8(sigpipe);
@@ -963,6 +962,7 @@ impl CrateInfo {
             natvis_debugger_visualizers: Default::default(),
             lint_level_specs: CodegenLintLevelSpecs::from_tcx(tcx),
             metadata_symbol: exported_symbols::metadata_symbol_name(tcx),
+            symbol_rename_suffix: format!(".rs{:x}", tcx.stable_crate_id(LOCAL_CRATE)),
             each_linked_rlib_file_for_lto: Default::default(),
             exported_symbols_for_lto: Default::default(),
         };
@@ -1133,7 +1133,9 @@ pub(crate) fn provide(providers: &mut Providers) {
 }
 
 pub fn determine_cgu_reuse<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> CguReuse {
-    if !tcx.dep_graph.is_fully_enabled() {
+    if !tcx.dep_graph.is_fully_enabled()
+        || tcx.sess.opts.unstable_opts.disable_incr_comp_backend_caching
+    {
         return CguReuse::No;
     }
 

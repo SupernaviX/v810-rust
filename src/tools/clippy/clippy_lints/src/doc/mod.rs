@@ -906,29 +906,35 @@ fn check_attrs(cx: &LateContext<'_>, valid_idents: &FxHashSet<String>, attrs: &[
         return Some(DocHeaders::default());
     }
 
-    check_for_code_clusters(
-        cx,
-        pulldown_cmark::Parser::new_with_broken_link_callback(
+    // Only emits the allow-by-default `DOC_LINK_CODE`; skip its extra markdown reparse when it's off.
+    if !clippy_utils::is_lint_allowed(cx, DOC_LINK_CODE, cx.last_node_with_lint_attrs) {
+        check_for_code_clusters(
+            cx,
+            pulldown_cmark::Parser::new_with_broken_link_callback(
+                &doc,
+                main_body_opts() - Options::ENABLE_SMART_PUNCTUATION,
+                Some(&mut fake_broken_link_callback),
+            )
+            .into_offset_iter(),
             &doc,
-            main_body_opts() - Options::ENABLE_SMART_PUNCTUATION,
-            Some(&mut fake_broken_link_callback),
-        )
-        .into_offset_iter(),
-        &doc,
-        Fragments {
-            doc: &doc,
-            fragments: &fragments,
-        },
-    );
+            Fragments {
+                doc: &doc,
+                fragments: &fragments,
+            },
+        );
+    }
 
-    doc_paragraphs_missing_punctuation::check(
-        cx,
-        &doc,
-        Fragments {
-            doc: &doc,
-            fragments: &fragments,
-        },
-    );
+    // Same for the allow-by-default `DOC_PARAGRAPHS_MISSING_PUNCTUATION`, which also reparses.
+    if !clippy_utils::is_lint_allowed(cx, DOC_PARAGRAPHS_MISSING_PUNCTUATION, cx.last_node_with_lint_attrs) {
+        doc_paragraphs_missing_punctuation::check(
+            cx,
+            &doc,
+            Fragments {
+                doc: &doc,
+                fragments: &fragments,
+            },
+        );
+    }
 
     // NOTE: check_doc uses it own cb function,
     // to avoid causing duplicated diagnostics for the broken link checker.
@@ -1118,6 +1124,9 @@ fn check_doc<'a, Events: Iterator<Item = (pulldown_cmark::Event<'a>, Range<usize
 
     let mut containers = Vec::new();
 
+    // Skip collecting text and the per-word scan when `DOC_MARKDOWN` (pedantic) is allowed.
+    let check_doc_markdown = !clippy_utils::is_lint_allowed(cx, DOC_MARKDOWN, cx.last_node_with_lint_attrs);
+
     let mut events = events.peekable();
 
     while let Some((event, range)) = events.next() {
@@ -1232,19 +1241,29 @@ fn check_doc<'a, Events: Iterator<Item = (pulldown_cmark::Event<'a>, Range<usize
                 if let End(TagEnd::Item) = event {
                     containers.pop();
                 }
-                if ticks_unbalanced && let Some(span) = fragments.span(cx, paragraph_range.clone()) {
-                    span_lint_and_help(
-                        cx,
-                        DOC_MARKDOWN,
-                        span,
-                        "backticks are unbalanced",
-                        None,
-                        "a backtick may be missing a pair",
-                    );
-                    text_to_check.clear();
-                } else {
-                    for (text, range, assoc_code_level) in text_to_check.drain(..) {
-                        markdown::check(cx, valid_idents, &text, &fragments, range, assoc_code_level, blockquote_level);
+                if check_doc_markdown {
+                    if ticks_unbalanced && let Some(span) = fragments.span(cx, paragraph_range.clone()) {
+                        span_lint_and_help(
+                            cx,
+                            DOC_MARKDOWN,
+                            span,
+                            "backticks are unbalanced",
+                            None,
+                            "a backtick may be missing a pair",
+                        );
+                        text_to_check.clear();
+                    } else {
+                        for (text, range, assoc_code_level) in text_to_check.drain(..) {
+                            markdown::check(
+                                cx,
+                                valid_idents,
+                                &text,
+                                &fragments,
+                                range,
+                                assoc_code_level,
+                                blockquote_level,
+                            );
+                        }
                     }
                 }
             },
@@ -1325,7 +1344,9 @@ fn check_doc<'a, Events: Iterator<Item = (pulldown_cmark::Event<'a>, Range<usize
                         // Don't check the text associated with external URLs
                         continue;
                     }
-                    text_to_check.push((text, range.clone(), code_level));
+                    if check_doc_markdown {
+                        text_to_check.push((text, range.clone(), code_level));
+                    }
                     doc_suspicious_footnotes::check(cx, doc, range, &fragments, attrs);
                 }
             }

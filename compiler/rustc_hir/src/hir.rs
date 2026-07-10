@@ -20,12 +20,14 @@ use rustc_data_structures::fingerprint::Fingerprint;
 use rustc_data_structures::sorted_map::SortedMap;
 use rustc_data_structures::steal::Steal;
 use rustc_data_structures::tagged_ptr::TaggedRef;
+use rustc_data_structures::unord::UnordMap;
 use rustc_error_messages::{DiagArgValue, IntoDiagArg};
 use rustc_index::IndexVec;
 use rustc_macros::{Decodable, Encodable, StableHash};
 use rustc_span::def_id::LocalDefId;
 use rustc_span::{
-    BytePos, DUMMY_SP, DesugaringKind, ErrorGuaranteed, Ident, Span, Spanned, Symbol, kw, sym,
+    BytePos, DUMMY_SP, DesugaringKind, ErrorGuaranteed, Ident, LocalExpnId, Span, Spanned, Symbol,
+    kw, sym,
 };
 use rustc_target::asm::InlineAsmRegOrRegClass;
 use smallvec::SmallVec;
@@ -385,12 +387,24 @@ pub struct PathSegment<'hir> {
     /// out of those only the segments with no type parameters
     /// to begin with, e.g., `Vec::new` is `<Vec<..>>::new::<..>`.
     pub infer_args: bool,
+
+    /// Whether this segment is a delegation's child segment:
+    /// `reuse Trait::foo`, in this case `foo` is a delegation's child segment.
+    /// Used for faster check during generic args lowering.
+    pub delegation_child_segment: bool,
 }
 
 impl<'hir> PathSegment<'hir> {
     /// Converts an identifier to the corresponding segment.
     pub fn new(ident: Ident, hir_id: HirId, res: Res) -> PathSegment<'hir> {
-        PathSegment { ident, hir_id, res, infer_args: true, args: None }
+        PathSegment {
+            ident,
+            hir_id,
+            res,
+            infer_args: true,
+            args: None,
+            delegation_child_segment: false,
+        }
     }
 
     pub fn invalid() -> Self {
@@ -497,7 +511,7 @@ impl<'hir, Unambig> ConstArg<'hir, Unambig> {
 #[derive(Clone, Copy, Debug, StableHash)]
 #[repr(u8, C)]
 pub enum ConstArgKind<'hir, Unambig = ()> {
-    Tup(&'hir [&'hir ConstArg<'hir, Unambig>]),
+    Tup(&'hir [&'hir ConstArg<'hir>]),
     /// **Note:** Currently this is only used for bare const params
     /// (`N` where `fn foo<const N: usize>(...)`),
     /// not paths to any const (`N` where `const N: usize = ...`).
@@ -700,12 +714,12 @@ impl<'hir> GenericArgs<'hir> {
     }
 
     #[inline]
-    pub fn num_lifetime_params(&self) -> usize {
+    pub fn num_lifetime_args(&self) -> usize {
         self.args.iter().filter(|arg| matches!(arg, GenericArg::Lifetime(_))).count()
     }
 
     #[inline]
-    pub fn has_lifetime_params(&self) -> bool {
+    pub fn has_lifetime_args(&self) -> bool {
         self.args.iter().any(|arg| matches!(arg, GenericArg::Lifetime(_)))
     }
 
@@ -1193,8 +1207,6 @@ pub enum WherePredicateKind<'hir> {
     BoundPredicate(WhereBoundPredicate<'hir>),
     /// A lifetime predicate (e.g., `'a: 'b + 'c`).
     RegionPredicate(WhereRegionPredicate<'hir>),
-    /// An equality predicate (unsupported).
-    EqPredicate(WhereEqPredicate<'hir>),
 }
 
 impl<'hir> WherePredicateKind<'hir> {
@@ -1202,7 +1214,6 @@ impl<'hir> WherePredicateKind<'hir> {
         match self {
             WherePredicateKind::BoundPredicate(p) => p.origin == PredicateOrigin::WhereClause,
             WherePredicateKind::RegionPredicate(p) => p.in_where_clause,
-            WherePredicateKind::EqPredicate(_) => false,
         }
     }
 
@@ -1210,7 +1221,6 @@ impl<'hir> WherePredicateKind<'hir> {
         match self {
             WherePredicateKind::BoundPredicate(p) => p.bounds,
             WherePredicateKind::RegionPredicate(p) => p.bounds,
-            WherePredicateKind::EqPredicate(_) => &[],
         }
     }
 }
@@ -1665,9 +1675,9 @@ impl<'tcx> AttributeMap<'tcx> {
 /// These nodes are mapped by `ItemLocalId` alongside the index of their parent node.
 /// The HIR tree, including bodies, is pre-hashed.
 pub struct OwnerNodes<'tcx> {
-    /// Pre-computed hash of the full HIR. Used in the crate hash. Only present
-    /// when incr. comp. is enabled.
-    pub opt_hash_including_bodies: Option<Fingerprint>,
+    /// Pre-computed hash of the full HIR, including bodies. Used in the crate hash.
+    /// Only present when incr. comp. is enabled.
+    pub opt_hash: Option<Fingerprint>,
     /// Full HIR for the current owner.
     // The zeroth node's parent should never be accessed: the owner's parent is computed by the
     // hir_owner_parent query. It is set to `ItemLocalId::INVALID` to force an ICE if accidentally
@@ -1688,7 +1698,7 @@ impl<'tcx> OwnerNodes<'tcx> {
         OwnerNodes {
             // There is no reason to bother computing a hash for a synthetic body.
             // Just use a constant value.
-            opt_hash_including_bodies: Some(Fingerprint::ZERO),
+            opt_hash: Some(Fingerprint::ZERO),
             nodes: IndexVec::from_elem_n(
                 ParentedNode { parent: ItemLocalId::INVALID, node: OwnerNode::Synthetic.into() },
                 1,
@@ -1714,13 +1724,13 @@ impl fmt::Debug for OwnerNodes<'_> {
                 }),
             )
             .field("bodies", &self.bodies)
-            .field("opt_hash_including_bodies", &self.opt_hash_including_bodies)
+            .field("opt_hash", &self.opt_hash)
             .finish()
     }
 }
 
 /// Full information resulting from lowering an AST node.
-#[derive(Debug, StableHash)]
+#[derive(Debug)]
 pub struct OwnerInfo<'hir> {
     /// Contents of the HIR.
     pub nodes: OwnerNodes<'hir>,
@@ -1731,14 +1741,18 @@ pub struct OwnerInfo<'hir> {
     /// Map indicating what traits are in scope for places where this
     /// is relevant; generated by resolve.
     pub trait_map: ItemLocalMap<&'hir [TraitCandidate<'hir>]>,
+    /// Owners generated as side-effect by lowering.
+    pub children: UnordMap<LocalDefId, MaybeOwner<'hir>>,
 
     /// Lints delayed during ast lowering to be emitted
     /// after hir has completely built
     ///
     /// WARNING: The delayed lints are not hashed as a part of the `OwnerInfo`, and therefore
     ///          should only be accessed in `eval_always` queries.
-    #[stable_hash(ignore)]
     pub delayed_lints: Steal<DelayedLints>,
+
+    // Only present when the crate hash is needed.
+    pub opt_hash: Option<Fingerprint>,
 }
 
 impl<'tcx> OwnerInfo<'tcx> {
@@ -1752,18 +1766,18 @@ impl<'tcx> OwnerInfo<'tcx> {
 pub enum MaybeOwner<'tcx> {
     Owner(&'tcx OwnerInfo<'tcx>),
     NonOwner(HirId),
-    /// Used as a placeholder for unused LocalDefId.
-    Phantom,
 }
 
 impl<'tcx> MaybeOwner<'tcx> {
+    #[inline]
     pub fn as_owner(self) -> Option<&'tcx OwnerInfo<'tcx>> {
         match self {
             MaybeOwner::Owner(i) => Some(i),
-            MaybeOwner::NonOwner(_) | MaybeOwner::Phantom => None,
+            MaybeOwner::NonOwner(_) => None,
         }
     }
 
+    #[inline]
     pub fn unwrap(self) -> &'tcx OwnerInfo<'tcx> {
         self.as_owner().unwrap_or_else(|| panic!("Not a HIR owner"))
     }
@@ -2327,6 +2341,13 @@ impl CoroutineKind {
         matches!(self, CoroutineKind::Desugared(_, CoroutineSource::Fn))
     }
 
+    pub fn is_async_desugaring(self) -> bool {
+        matches!(
+            self,
+            CoroutineKind::Desugared(CoroutineDesugaring::Async | CoroutineDesugaring::AsyncGen, _)
+        )
+    }
+
     pub fn to_plural_string(&self) -> String {
         match self {
             CoroutineKind::Desugared(d, CoroutineSource::Fn) => format!("{d:#}fn bodies"),
@@ -2464,10 +2485,12 @@ pub enum ConstContext {
     /// - Array length expressions
     /// - Enum discriminants
     /// - Const generics
-    ///
-    /// For the most part, other contexts are treated just like a regular `const`, so they are
-    /// lumped into the same category.
-    Const { inline: bool },
+    Const {
+        /// For backwards compatibility `const` items allow
+        /// calls to `const fn` to get promoted.
+        /// We forbid that in comptime fns and inline consts.
+        allow_const_fn_promotion: bool,
+    },
 }
 
 impl ConstContext {
@@ -3269,7 +3292,6 @@ pub struct TraitItem<'hir> {
     pub kind: TraitItemKind<'hir>,
     pub span: Span,
     pub defaultness: Defaultness,
-    pub has_delayed_lints: bool,
 }
 
 macro_rules! expect_methods_self_kind {
@@ -3314,7 +3336,7 @@ impl<'hir> TraitItem<'hir> {
 
     expect_methods_self_kind! {
         expect_const, (&'hir Ty<'hir>, Option<ConstItemRhs<'hir>>),
-            TraitItemKind::Const(ty, rhs, _), (ty, *rhs);
+            TraitItemKind::Const(ty, rhs), (ty, *rhs);
 
         expect_fn, (&FnSig<'hir>, &TraitFn<'hir>),
             TraitItemKind::Fn(ty, trfn), (ty, trfn);
@@ -3334,32 +3356,11 @@ pub enum TraitFn<'hir> {
     Provided(BodyId),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, StableHash)]
-pub enum IsTypeConst {
-    No,
-    Yes,
-}
-
-impl From<bool> for IsTypeConst {
-    fn from(value: bool) -> Self {
-        if value { Self::Yes } else { Self::No }
-    }
-}
-
-impl From<IsTypeConst> for bool {
-    fn from(value: IsTypeConst) -> Self {
-        matches!(value, IsTypeConst::Yes)
-    }
-}
-
 /// Represents a trait method or associated constant or type
 #[derive(Debug, Clone, Copy, StableHash)]
 pub enum TraitItemKind<'hir> {
-    // FIXME(mgca) eventually want to move the option that is around `ConstItemRhs<'hir>`
-    // into `ConstItemRhs`, much like `ast::ConstItemRhsKind`, but for now mark whether
-    // this node is a TypeConst with a flag.
     /// An associated constant with an optional value (otherwise `impl`s must contain a value).
-    Const(&'hir Ty<'hir>, Option<ConstItemRhs<'hir>>, IsTypeConst),
+    Const(&'hir Ty<'hir>, Option<ConstItemRhs<'hir>>),
     /// An associated function with an optional body.
     Fn(FnSig<'hir>, TraitFn<'hir>),
     /// An associated type with (possibly empty) bounds and optional concrete
@@ -3394,7 +3395,6 @@ pub struct ImplItem<'hir> {
     pub kind: ImplItemKind<'hir>,
     pub impl_kind: ImplItemImplKind,
     pub span: Span,
-    pub has_delayed_lints: bool,
 }
 
 #[derive(Debug, Clone, Copy, StableHash)]
@@ -3865,13 +3865,34 @@ pub enum OpaqueTyOrigin<D> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, StableHash)]
+pub enum DelegationSelfTyPropagationKind {
+    /// Used when self type is explicitly specified in free-to-trait reuse
+    /// `reuse <() as Trait>::foo;`.
+    SelfTy(HirId /* Self ty id */),
+    /// Used when infer instead of a self type is specified or self type
+    /// is not specified at all: `reuse Trait::foo; reuse <_ as Trait>::foo;`.
+    SelfParam,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, StableHash)]
 pub struct DelegationInfo {
     pub call_expr_id: HirId,
-    pub call_path_res: Option<DefId>,
-    pub parent_args_segment_id: Option<HirId>,
-    pub child_args_segment_id: Option<HirId>,
-    pub self_ty_id: Option<HirId>,
-    pub propagate_self_ty: bool,
+    pub call_path_res: DefId,
+
+    /// Id of the child segment in delegation: `reuse Trait::foo`,
+    /// `child_seg_id` points to `foo`.
+    pub child_seg_id: HirId,
+
+    /// Ids of parent and child segments, `Some` when we need to take
+    /// generic args of those segments for signature/predicates inheritance.
+    /// `None` in trait impl case or when error delegation is generated, meaning
+    /// we should not access those segments for generic args lowering.
+    /// When `child_seg_id_for_sig` is Some it always equals `child_seg_id`.
+    pub parent_seg_id_for_sig: Option<HirId>,
+    pub child_seg_id_for_sig: Option<HirId>,
+
+    pub self_ty_propagation_kind: Option<DelegationSelfTyPropagationKind>,
+    pub group_id: Option<(LocalExpnId, bool /* unused_target_expr */)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, StableHash)]
@@ -4032,13 +4053,29 @@ pub struct Param<'hir> {
     pub span: Span,
 }
 
+/// Error type for splatted argument index errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplattedArgIndexError {
+    /// The splatted argument index is invalid.
+    /// A `u8::MAX` argument index used to indicate that no argument is splatted.
+    /// Higher values are also not supported, for performance reasons.
+    InvalidIndex { splatted_arg_index: u8 },
+
+    /// The splatted argument index is outside the bounds of the function arguments.
+    OutOfBounds { splatted_arg_index: u8, args_len: u16 },
+}
+
 /// Contains the packed non-type fields of a function declaration.
-// FIXME(splat): add the splatted argument index as a u16
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[derive(Encodable, Decodable, StableHash)]
 pub struct FnDeclFlags {
     /// Holds the c_variadic and lifetime_elision_allowed bitflags, and 3 bits for the `ImplicitSelfKind`.
     flags: u8,
+
+    /// Which function argument is splatted into multiple arguments in callers, if any?
+    /// Splatting functions with `>= u8::MAX` arguments is not supported, see `FnSigKind` for
+    /// details.
+    splatted: u8,
 }
 
 impl fmt::Debug for FnDeclFlags {
@@ -4050,11 +4087,15 @@ impl fmt::Debug for FnDeclFlags {
             f.field(&"LifetimeElisionAllowed");
         } else {
             f.field(&"NoLifetimeElision");
-        };
+        }
 
         if self.c_variadic() {
             f.field(&"CVariadic");
-        };
+        }
+
+        if let Some(index) = self.splatted() {
+            f.field(&format!("Splatted({})", index));
+        }
 
         f.finish()
     }
@@ -4070,19 +4111,25 @@ impl FnDeclFlags {
     /// Bitflag for lifetime elision.
     const LIFETIME_ELISION_ALLOWED_FLAG: u8 = 1 << 4;
 
-    /// Create a new FnDeclKind with no implicit self, no lifetime elision, and no C-style variadic argument.
+    /// Marker index for "no splatted argument".
+    /// Must have the same value as `FnSigKind::NO_SPLATTED_ARG_INDEX` and `rustc_ast::FnDecl::NO_SPLATTED_ARG_INDEX`.
+    const NO_SPLATTED_ARG_INDEX: u8 = u8::MAX;
+
+    /// Create a new FnDeclKind with no implicit self, no lifetime elision, no C-style variadic
+    /// argument, and no splatting.
     /// To modify these flags, use the `set_*` methods, for readability.
     // FIXME: use Default instead when that trait is const stable.
-    pub const fn default() -> Self {
-        Self { flags: 0 }
+    pub fn default() -> Self {
+        Self { flags: 0, splatted: 0 }
             .set_implicit_self(ImplicitSelfKind::None)
             .set_lifetime_elision_allowed(false)
             .set_c_variadic(false)
+            .set_no_splatted_args()
     }
 
     /// Set the implicit self kind.
     #[must_use = "this method does not modify the receiver"]
-    pub const fn set_implicit_self(mut self, implicit_self: ImplicitSelfKind) -> Self {
+    pub fn set_implicit_self(mut self, implicit_self: ImplicitSelfKind) -> Self {
         self.flags &= !Self::IMPLICIT_SELF_MASK;
 
         match implicit_self {
@@ -4098,7 +4145,7 @@ impl FnDeclFlags {
 
     /// Set the C-style variadic argument flag.
     #[must_use = "this method does not modify the receiver"]
-    pub const fn set_c_variadic(mut self, c_variadic: bool) -> Self {
+    pub fn set_c_variadic(mut self, c_variadic: bool) -> Self {
         if c_variadic {
             self.flags |= Self::C_VARIADIC_FLAG;
         } else {
@@ -4110,7 +4157,7 @@ impl FnDeclFlags {
 
     /// Set the lifetime elision allowed flag.
     #[must_use = "this method does not modify the receiver"]
-    pub const fn set_lifetime_elision_allowed(mut self, allowed: bool) -> Self {
+    pub fn set_lifetime_elision_allowed(mut self, allowed: bool) -> Self {
         if allowed {
             self.flags |= Self::LIFETIME_ELISION_ALLOWED_FLAG;
         } else {
@@ -4120,8 +4167,44 @@ impl FnDeclFlags {
         self
     }
 
+    /// Set the splatted argument index.
+    /// The number of function arguments is used for error checking.
+    #[must_use = "this method does not modify the receiver"]
+    pub fn set_splatted(
+        mut self,
+        splatted: Option<u8>,
+        args_len: usize,
+    ) -> Result<Self, SplattedArgIndexError> {
+        if let Some(splatted_arg_index) = splatted {
+            if splatted_arg_index == Self::NO_SPLATTED_ARG_INDEX {
+                // This index value is used as a marker for "no splatting", so it is unsupported.
+                // Higher values are also not supported, for performance reasons.
+                return Err(SplattedArgIndexError::InvalidIndex { splatted_arg_index });
+            } else if usize::from(splatted_arg_index) >= args_len {
+                return Err(SplattedArgIndexError::OutOfBounds {
+                    splatted_arg_index,
+                    args_len: args_len as u16,
+                });
+            }
+
+            self.splatted = splatted_arg_index;
+        } else {
+            self.splatted = Self::NO_SPLATTED_ARG_INDEX;
+        }
+
+        Ok(self)
+    }
+
+    /// Set "no splatted arguments" for the function declaration.
+    #[must_use = "this method does not modify the receiver"]
+    pub fn set_no_splatted_args(mut self) -> Self {
+        self.splatted = Self::NO_SPLATTED_ARG_INDEX;
+
+        self
+    }
+
     /// Get the implicit self kind.
-    pub const fn implicit_self(self) -> ImplicitSelfKind {
+    pub fn implicit_self(self) -> ImplicitSelfKind {
         match self.flags & Self::IMPLICIT_SELF_MASK {
             0 => ImplicitSelfKind::None,
             1 => ImplicitSelfKind::Imm,
@@ -4133,13 +4216,18 @@ impl FnDeclFlags {
     }
 
     /// Do the function arguments end with a C-style variadic argument?
-    pub const fn c_variadic(self) -> bool {
+    pub fn c_variadic(self) -> bool {
         self.flags & Self::C_VARIADIC_FLAG != 0
     }
 
     /// Is lifetime elision allowed?
-    pub const fn lifetime_elision_allowed(self) -> bool {
+    pub fn lifetime_elision_allowed(self) -> bool {
         self.flags & Self::LIFETIME_ELISION_ALLOWED_FLAG != 0
+    }
+
+    /// Get the splatted argument index, if any.
+    pub fn splatted(self) -> Option<u8> {
+        if self.splatted == Self::NO_SPLATTED_ARG_INDEX { None } else { Some(self.splatted) }
     }
 }
 
@@ -4186,6 +4274,10 @@ impl<'hir> FnDecl<'hir> {
 
     pub fn lifetime_elision_allowed(&self) -> bool {
         self.fn_decl_kind.lifetime_elision_allowed()
+    }
+
+    pub fn splatted(&self) -> Option<u8> {
+        self.fn_decl_kind.splatted()
     }
 
     pub fn dummy(span: Span) -> Self {
@@ -4499,7 +4591,6 @@ pub struct Item<'hir> {
     pub kind: ItemKind<'hir>,
     pub span: Span,
     pub vis_span: Span,
-    pub has_delayed_lints: bool,
     /// hint to speed up collection: true if the item is a static or function and has
     /// either an `EiiImpls` or `EiiExternTarget` attribute
     pub eii: bool,
@@ -4512,6 +4603,7 @@ impl<'hir> Item<'hir> {
         HirId::make_owner(self.owner_id.def_id)
     }
 
+    #[inline]
     pub fn item_id(&self) -> ItemId {
         ItemId { owner_id: self.owner_id }
     }
@@ -4629,17 +4721,24 @@ impl fmt::Display for Safety {
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Encodable, Decodable, StableHash)]
-#[derive(Default)]
 pub enum Constness {
-    #[default]
-    Const,
+    Const { always: bool },
     NotConst,
+}
+
+/// This impl exists as an optimization so that metadata deserialization can
+/// store the value directly and not have to encode it wrapped in another `Option`.
+impl Default for Constness {
+    fn default() -> Self {
+        Self::Const { always: false }
+    }
 }
 
 impl fmt::Display for Constness {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match *self {
-            Self::Const => "const",
+            Self::Const { always: true } => "comptime",
+            Self::Const { always: false } => "const",
             Self::NotConst => "non-const",
         })
     }
@@ -4691,10 +4790,6 @@ pub struct FnHeader {
 impl FnHeader {
     pub fn is_async(&self) -> bool {
         matches!(self.asyncness, IsAsync::Async(_))
-    }
-
-    pub fn is_const(&self) -> bool {
-        matches!(self.constness, Constness::Const)
     }
 
     pub fn is_unsafe(&self) -> bool {
@@ -4891,7 +4986,6 @@ pub struct ForeignItem<'hir> {
     pub owner_id: OwnerId,
     pub span: Span,
     pub vis_span: Span,
-    pub has_delayed_lints: bool,
 }
 
 impl ForeignItem<'_> {
@@ -5001,7 +5095,7 @@ impl<'hir> OwnerNode<'hir> {
             | OwnerNode::TraitItem(TraitItem {
                 kind:
                     TraitItemKind::Fn(_, TraitFn::Provided(body))
-                    | TraitItemKind::Const(_, Some(ConstItemRhs::Body(body)), _),
+                    | TraitItemKind::Const(_, Some(ConstItemRhs::Body(body))),
                 ..
             })
             | OwnerNode::ImplItem(ImplItem {
@@ -5228,7 +5322,7 @@ impl<'hir> Node<'hir> {
                 _ => None,
             },
             Node::TraitItem(it) => match it.kind {
-                TraitItemKind::Const(ty, _, _) => Some(ty),
+                TraitItemKind::Const(ty, _) => Some(ty),
                 TraitItemKind::Type(_, ty) => ty,
                 _ => None,
             },
@@ -5246,6 +5340,7 @@ impl<'hir> Node<'hir> {
                 GenericParamKind::Type { default, .. } => default,
                 GenericParamKind::Const { ty, .. } => Some(ty),
             },
+            Node::Field(f) => Some(f.ty),
             _ => None,
         }
     }
@@ -5271,7 +5366,7 @@ impl<'hir> Node<'hir> {
             | Node::TraitItem(TraitItem {
                 owner_id,
                 kind:
-                    TraitItemKind::Const(_, Some(ConstItemRhs::Body(body)), _)
+                    TraitItemKind::Const(_, Some(ConstItemRhs::Body(body)))
                     | TraitItemKind::Fn(_, TraitFn::Provided(body)),
                 ..
             })
@@ -5348,6 +5443,16 @@ impl<'hir> Node<'hir> {
         }
     }
 
+    /// For expressions, patterns, and types return the path if it's a path expr/pat/ty.
+    pub fn path(self) -> Option<&'hir QPath<'hir>> {
+        match self {
+            Node::Ty(Ty { kind: TyKind::Path(path), .. })
+            | Node::Expr(Expr { kind: ExprKind::Path(path), .. })
+            | Node::PatExpr(PatExpr { kind: PatExprKind::Path(path), .. }) => Some(path),
+            _ => None,
+        }
+    }
+
     expect_methods_self! {
         expect_param,         &'hir Param<'hir>,        Node::Param(n),        n;
         expect_item,          &'hir Item<'hir>,         Node::Item(n),         n;
@@ -5392,7 +5497,7 @@ mod size_asserts {
     static_assert_size!(Expr<'_>, 64);
     static_assert_size!(ExprKind<'_>, 48);
     static_assert_size!(FnDecl<'_>, 40);
-    static_assert_size!(ForeignItem<'_>, 96);
+    static_assert_size!(ForeignItem<'_>, 88);
     static_assert_size!(ForeignItemKind<'_>, 56);
     static_assert_size!(GenericArg<'_>, 16);
     static_assert_size!(GenericBound<'_>, 64);

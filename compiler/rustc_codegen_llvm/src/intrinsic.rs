@@ -28,7 +28,7 @@ use rustc_session::lint::builtin::DEPRECATED_LLVM_INTRINSIC;
 use rustc_span::{ErrorGuaranteed, Span, Symbol, sym};
 use rustc_symbol_mangling::{mangle_internal_symbol, symbol_name_for_instance_in_crate};
 use rustc_target::callconv::PassMode;
-use rustc_target::spec::{Arch, Os};
+use rustc_target::spec::{Arch, LlvmAbi};
 use tracing::debug;
 
 use crate::abi::FnAbiLlvmExt;
@@ -37,13 +37,15 @@ use crate::builder::autodiff::{adjust_activity_to_abi, generate_enzyme_call};
 use crate::builder::gpu_offload::{
     OffloadKernelDims, gen_call_handling, gen_define_handling, register_offload,
 };
+use crate::common::pauth_fn_attrs;
 use crate::context::CodegenCx;
 use crate::declare::declare_raw_fn;
 use crate::errors::{
     AutoDiffWithoutEnable, AutoDiffWithoutLto, IntrinsicSignatureMismatch, IntrinsicWrongArch,
     OffloadWithoutEnable, OffloadWithoutFatLTO, UnknownIntrinsic,
 };
-use crate::llvm::{self, Type, Value};
+use crate::intrinsic::ty::typetree::fnc_typetrees;
+use crate::llvm::{self, Attribute, AttributePlace, Type, Value};
 use crate::type_of::LayoutLlvmExt;
 use crate::va_arg::emit_va_arg;
 
@@ -113,17 +115,17 @@ fn call_simple_intrinsic<'ll, 'tcx>(
         sym::fmuladdf64 => ("llvm.fmuladd", &[bx.type_f64()]),
         sym::fmuladdf128 => ("llvm.fmuladd", &[bx.type_f128()]),
 
+        sym::minimumf16 => ("llvm.minimum", &[bx.type_f16()]),
+        sym::minimumf32 => ("llvm.minimum", &[bx.type_f32()]),
         // FIXME: LLVM currently mis-compile those intrinsics, re-enable them
         // when llvm/llvm-project#{139380,139381,140445} are fixed.
-        //sym::minimumf16 => ("llvm.minimum", &[bx.type_f16()]),
-        //sym::minimumf32 => ("llvm.minimum", &[bx.type_f32()]),
         //sym::minimumf64 => ("llvm.minimum", &[bx.type_f64()]),
         //sym::minimumf128 => ("llvm.minimum", &[cx.type_f128()]),
         //
+        sym::maximumf16 => ("llvm.maximum", &[bx.type_f16()]),
+        sym::maximumf32 => ("llvm.maximum", &[bx.type_f32()]),
         // FIXME: LLVM currently mis-compile those intrinsics, re-enable them
         // when llvm/llvm-project#{139380,139381,140445} are fixed.
-        //sym::maximumf16 => ("llvm.maximum", &[bx.type_f16()]),
-        //sym::maximumf32 => ("llvm.maximum", &[bx.type_f32()]),
         //sym::maximumf64 => ("llvm.maximum", &[bx.type_f64()]),
         //sym::maximumf128 => ("llvm.maximum", &[cx.type_f128()]),
         //
@@ -223,12 +225,7 @@ impl<'ll, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'_, 'll, 'tcx> {
                 )
             }
             sym::autodiff => {
-                let result = PlaceRef {
-                    val: result_place.unwrap(),
-                    layout: result_layout,
-                };
-                codegen_autodiff(self, tcx, instance, args, result);
-                return IntrinsicResult::WroteIntoPlace;
+                return codegen_autodiff(self, instance, args, result_layout, result_place);
             }
             sym::offload => {
                 if tcx.sess.opts.unstable_opts.offload.is_empty() {
@@ -358,25 +355,39 @@ impl<'ll, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'_, 'll, 'tcx> {
             }
 
             sym::volatile_load | sym::unaligned_volatile_load => {
-                let result = PlaceRef {
-                    val: result_place.unwrap(),
-                    layout: result_layout,
-                };
-
+                // Note that we cannot just load the `llvm_type` because we should never load non-scalars.
+                // Trying to do so blows up horribly in some cases -- for example loading a
+                // `MaybeUninint<&dyn Trait>` would load as `{ [i64x2] }` which gives assertions later
+                // (if we're lucky) from things not being pointers that ought to be.
                 let ptr = args[0].immediate();
-                let load = self.volatile_load(result_layout.llvm_type(self), ptr);
-                let align = if name == sym::unaligned_volatile_load {
-                    1
+                let abi_align = result_layout.align.abi;
+                let ptr_align = if name == sym::volatile_load { abi_align } else { Align::ONE };
+                if result_layout.is_zst() {
+                    return IntrinsicResult::Operand(OperandValue::ZeroSized);
+                } else if let BackendRepr::Scalar(scalar) = result_layout.backend_repr {
+                    let load = self.volatile_load(self.type_from_scalar(scalar), ptr, ptr_align);
+                    self.to_immediate_scalar(load, scalar)
                 } else {
-                    result_layout.align.bytes() as u32
-                };
-                unsafe {
-                    llvm::LLVMSetAlignment(load, align);
+                    // One day Rust will probably want to define how we split up a volatile load
+                    // of something that's *not* just an ordinary scalar, but for now we can just
+                    // use an LLVM integer type of the correct width and let it split it however.
+                    let llty = self.type_ix(result_layout.size.bits());
+                    let temp = if let Some(result_place) = result_place {
+                        PlaceRef {
+                            val: result_place,
+                            layout: result_layout,
+                        }
+                    } else {
+                        PlaceRef::alloca(self, result_layout)
+                    };
+                    let llval = self.volatile_load(llty, ptr, ptr_align);
+                    self.store(llval, temp.val.llval, abi_align);
+                    return if result_place.is_none() {
+                        IntrinsicResult::Operand(self.load_operand(temp).val)
+                    } else {
+                        IntrinsicResult::WroteIntoPlace
+                    };
                 }
-                if !result_layout.is_zst() {
-                    self.store_to_place(load, result.val);
-                }
-                return IntrinsicResult::WroteIntoPlace;
             }
             sym::volatile_store => {
                 let dst = args[0].deref(self.cx());
@@ -402,7 +413,7 @@ impl<'ll, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'_, 'll, 'tcx> {
                 let ptr = args[0].immediate();
                 let locality = fn_args.const_at(1).to_leaf().to_i32();
                 self.call_intrinsic(
-                    "llvm.prefetch",
+                    "llvm.prefetch.p0",
                     &[self.val_ty(ptr)],
                     &[
                         ptr,
@@ -563,7 +574,7 @@ impl<'ll, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'_, 'll, 'tcx> {
                 let tp_ty = fn_args.type_at(0);
                 let layout = self.layout_of(tp_ty).layout;
                 let use_integer_compare = match layout.backend_repr() {
-                    Scalar(_) | ScalarPair(_, _) => true,
+                    Scalar(_) | ScalarPair { a: _, b: _, b_offset: _ } => true,
                     SimdVector { .. } => false,
                     SimdScalableVector { .. } => {
                         let err = tcx.dcx().emit_err(InvalidMonomorphization::NonScalableType {
@@ -1070,10 +1081,6 @@ impl<'ll, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'_, 'll, 'tcx> {
         self.call_intrinsic("llvm.va_start", &[self.val_ty(va_list)], &[va_list]);
     }
 
-    fn va_end(&mut self, va_list: &'ll Value) {
-        self.call_intrinsic("llvm.va_end", &[self.val_ty(va_list)], &[va_list]);
-    }
-
     fn retag_reg(&mut self, ptr: Self::Value, info: &RetagInfo<Self::Value>) -> Self::Value {
         codegen_retag_inner(self, "__rust_retag_reg", ptr, info)
     }
@@ -1356,8 +1363,6 @@ fn catch_unwind_intrinsic<'ll, 'tcx>(
         codegen_msvc_try(bx, try_func, data, catch_func)
     } else if wants_wasm_eh(bx.sess()) {
         codegen_wasm_try(bx, try_func, data, catch_func)
-    } else if bx.sess().target.os == Os::Emscripten {
-        codegen_emcc_try(bx, try_func, data, catch_func)
     } else {
         codegen_gnu_try(bx, try_func, data, catch_func)
     }
@@ -1654,87 +1659,6 @@ fn codegen_gnu_try<'ll, 'tcx>(
     ret
 }
 
-// Variant of codegen_gnu_try used for emscripten where Rust panics are
-// implemented using C++ exceptions. Here we use exceptions of a specific type
-// (`struct rust_panic`) to represent Rust panics.
-fn codegen_emcc_try<'ll, 'tcx>(
-    bx: &mut Builder<'_, 'll, 'tcx>,
-    try_func: &'ll Value,
-    data: &'ll Value,
-    catch_func: &'ll Value,
-) -> &'ll Value {
-    let (llty, llfn) = get_rust_try_fn(bx, &mut |mut bx| {
-        // Codegens the shims described above:
-        //
-        //   bx:
-        //      invoke %try_func(%data) normal %normal unwind %catch
-        //
-        //   normal:
-        //      ret 0
-        //
-        //   catch:
-        //      (%ptr, %selector) = landingpad
-        //      %rust_typeid = @llvm.eh.typeid.for(@_ZTI10rust_panic)
-        //      %is_rust_panic = %selector == %rust_typeid
-        //      %catch_data = alloca { i8*, i8 }
-        //      %catch_data[0] = %ptr
-        //      %catch_data[1] = %is_rust_panic
-        //      call %catch_func(%data, %catch_data)
-        //      ret 1
-        let then = bx.append_sibling_block("then");
-        let catch = bx.append_sibling_block("catch");
-
-        let try_func = llvm::get_param(bx.llfn(), 0);
-        let data = llvm::get_param(bx.llfn(), 1);
-        let catch_func = llvm::get_param(bx.llfn(), 2);
-        let try_func_ty = bx.type_func(&[bx.type_ptr()], bx.type_void());
-        bx.invoke(try_func_ty, None, None, try_func, &[data], then, catch, None, None);
-
-        bx.switch_to_block(then);
-        bx.ret(bx.const_bool(false));
-
-        // Type indicator for the exception being thrown.
-        //
-        // The first value in this tuple is a pointer to the exception object
-        // being thrown. The second value is a "selector" indicating which of
-        // the landing pad clauses the exception's type had been matched to.
-        bx.switch_to_block(catch);
-        let tydesc = bx.eh_catch_typeinfo();
-        let lpad_ty = bx.type_struct(&[bx.type_ptr(), bx.type_i32()], false);
-        let vals = bx.landing_pad(lpad_ty, bx.eh_personality(), 2);
-        bx.add_clause(vals, tydesc);
-        bx.add_clause(vals, bx.const_null(bx.type_ptr()));
-        let ptr = bx.extract_value(vals, 0);
-        let selector = bx.extract_value(vals, 1);
-
-        // Check if the typeid we got is the one for a Rust panic.
-        let rust_typeid = bx.call_intrinsic("llvm.eh.typeid.for", &[bx.val_ty(tydesc)], &[tydesc]);
-        let is_rust_panic = bx.icmp(IntPredicate::IntEQ, selector, rust_typeid);
-        let is_rust_panic = bx.zext(is_rust_panic, bx.type_bool());
-
-        // We need to pass two values to catch_func (ptr and is_rust_panic), so
-        // create an alloca and pass a pointer to that.
-        let ptr_size = bx.tcx().data_layout.pointer_size();
-        let ptr_align = bx.tcx().data_layout.pointer_align().abi;
-        let i8_align = bx.tcx().data_layout.i8_align;
-        // Required in order for there to be no padding between the fields.
-        assert!(i8_align <= ptr_align);
-        let catch_data = bx.alloca(2 * ptr_size, ptr_align);
-        bx.store(ptr, catch_data, ptr_align);
-        let catch_data_1 = bx.inbounds_ptradd(catch_data, bx.const_usize(ptr_size.bytes()));
-        bx.store(is_rust_panic, catch_data_1, i8_align);
-
-        let catch_ty = bx.type_func(&[bx.type_ptr(), bx.type_ptr()], bx.type_void());
-        bx.call(catch_ty, None, None, catch_func, &[data, catch_data], None, None);
-        bx.ret(bx.const_bool(true));
-    });
-
-    // Note that no invoke is used here because by definition this function
-    // can't panic (that's what it's catching).
-    let ret = bx.call(llty, None, None, llfn, &[try_func, data, catch_func], None, None);
-    ret
-}
-
 // Helper function to give a Block to a closure to codegen a shim function.
 // This is currently primarily used for the `try` intrinsic functions above.
 fn gen_fn<'a, 'll, 'tcx>(
@@ -1788,6 +1712,13 @@ fn get_rust_try_fn<'a, 'll, 'tcx>(
         hir::Safety::Unsafe,
     ));
     let rust_try = gen_fn(cx, "__rust_try", rust_fn_sig, codegen);
+    if cx.sess().target.llvm_abiname == LlvmAbi::Pauthtest {
+        let attrs: Vec<&Attribute> =
+            pauth_fn_attrs().iter().map(|name| llvm::CreateAttrString(cx.llcx, name)).collect();
+        let (_ty, rust_try_fn) = rust_try;
+        crate::attributes::apply_to_llfn(rust_try_fn, AttributePlace::Function, &attrs);
+    }
+
     cx.rust_try_fn.set(Some(rust_try));
     rust_try
 }
@@ -1812,11 +1743,12 @@ fn codegen_retag_inner<'ll, 'tcx>(
 
 fn codegen_autodiff<'ll, 'tcx>(
     bx: &mut Builder<'_, 'll, 'tcx>,
-    tcx: TyCtxt<'tcx>,
     instance: ty::Instance<'tcx>,
     args: &[OperandRef<'tcx, &'ll Value>],
-    result: PlaceRef<'tcx, &'ll Value>,
-) {
+    result_layout: ty::layout::TyAndLayout<'tcx>,
+    result_place: Option<PlaceValue<&'ll Value>>,
+) -> IntrinsicResult<'tcx, &'ll Value> {
+    let tcx = bx.tcx;
     if !tcx.sess.opts.unstable_opts.autodiff.contains(&rustc_session::config::AutoDiff::Enable) {
         let _ = tcx.dcx().emit_almost_fatal(AutoDiffWithoutEnable);
     }
@@ -1856,9 +1788,9 @@ fn codegen_autodiff<'ll, 'tcx>(
             diff_id,
             diff_args
         ),
-        Err(_) => {
+        Err(err) => {
             // An error has already been emitted
-            return;
+            return IntrinsicResult::Err(err);
         }
     };
 
@@ -1878,20 +1810,20 @@ fn codegen_autodiff<'ll, 'tcx>(
         &mut diff_attrs.input_activity,
     );
 
-    let fnc_tree = rustc_middle::ty::fnc_typetrees(tcx, source_fn_ptr_ty);
+    let fnc_tree = fnc_typetrees(tcx, source_fn_ptr_ty);
 
     // Build body
     generate_enzyme_call(
         bx,
-        bx.cx,
         fn_to_diff,
         &diff_symbol,
         llret_ty,
         &val_arr,
         &diff_attrs,
-        result,
+        result_layout,
+        result_place,
         fnc_tree,
-    );
+    )
 }
 
 // Generates the LLVM code to offload a Rust function to a target device (e.g., GPU).

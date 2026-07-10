@@ -917,6 +917,13 @@ impl<'a> Parser<'a> {
                             }
 
                             // Attempt to keep parsing if it was an omitted separator.
+                            // `&raw <expr>` already has a specific suggestion for missing
+                            // `const`/`mut`, so don't recover `<expr>` as the next element in
+                            // a comma-separated list.
+                            if exp.token_type == TokenType::Comma && self.is_expected_raw_ref_mut()
+                            {
+                                return Err(expect_err);
+                            }
                             self.last_unexpected_token_span = None;
                             match f(self) {
                                 Ok(t) => {
@@ -1083,7 +1090,7 @@ impl<'a> Parser<'a> {
     /// Parses a comma-separated sequence, including both delimiters.
     /// The function `f` must consume tokens until reaching the next separator or
     /// closing bracket.
-    fn parse_delim_comma_seq<T>(
+    pub fn parse_delim_comma_seq<T>(
         &mut self,
         open: ExpTokenPair,
         close: ExpTokenPair,
@@ -1348,7 +1355,7 @@ impl<'a> Parser<'a> {
     /// ```enbf
     /// FieldName = IntLit | Ident
     /// ```
-    fn parse_field_name(&mut self) -> PResult<'a, Ident> {
+    pub fn parse_field_name(&mut self) -> PResult<'a, Ident> {
         if let token::Literal(token::Lit { kind: token::Integer, symbol, suffix }) = self.token.kind
         {
             if let Some(suffix) = suffix {
