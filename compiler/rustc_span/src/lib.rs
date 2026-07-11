@@ -738,7 +738,7 @@ impl Default for SpanData {
 
 impl PartialOrd for Span {
     fn partial_cmp(&self, rhs: &Self) -> Option<Ordering> {
-        PartialOrd::partial_cmp(&self.data(), &rhs.data())
+        Some(self.cmp(rhs))
     }
 }
 impl Ord for Span {
@@ -1362,7 +1362,7 @@ pub trait SpanEncoder: Encoder {
     fn encode_def_id(&mut self, def_id: DefId);
 }
 
-impl SpanEncoder for FileEncoder {
+impl SpanEncoder for FileEncoder<'_> {
     fn encode_span(&mut self, span: Span) {
         let span = span.data();
         span.lo.encode(self);
@@ -2573,7 +2573,7 @@ fn normalize_newlines(src: &mut String, normalized_pos: &mut Vec<NormalizedPos>)
     // directly, let's rather steal the contents of `src`. This makes the code
     // safe even if a panic occurs.
 
-    let mut buf = std::mem::replace(src, String::new()).into_bytes();
+    let mut buf = std::mem::take(src).into_bytes();
     let mut gap_len = 0;
     let mut tail = buf.as_mut_slice();
     let mut cursor = 0;

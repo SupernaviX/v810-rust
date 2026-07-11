@@ -9,7 +9,7 @@ use rustc_session::lint::builtin::LARGE_ASSIGNMENTS;
 use rustc_span::{Span, Spanned, sym};
 use tracing::{debug, trace};
 
-use crate::errors::LargeAssignmentsLint;
+use crate::diagnostics::LargeAssignmentsLint;
 
 struct MoveCheckVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
@@ -60,7 +60,7 @@ impl<'tcx> MoveCheckVisitor<'tcx> {
         self.instance.instantiate_mir_and_normalize_erasing_regions(
             self.tcx,
             ty::TypingEnv::fully_monomorphized(),
-            ty::EarlyBinder::bind(value),
+            ty::EarlyBinder::bind(self.tcx, value),
         )
     }
 

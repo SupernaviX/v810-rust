@@ -2,7 +2,7 @@ use itertools::Itertools as _;
 use rustc_abi::{self as abi, BackendRepr, FIRST_VARIANT};
 use rustc_middle::ty::adjustment::PointerCoercion;
 use rustc_middle::ty::layout::{HasTyCtxt, HasTypingEnv, LayoutOf, TyAndLayout};
-use rustc_middle::ty::{self, Instance, Ty, TyCtxt};
+use rustc_middle::ty::{self, Instance, Mutability, Ty, TyCtxt};
 use rustc_middle::{bug, mir, span_bug};
 use rustc_session::config::OptLevel;
 use tracing::{debug, instrument};
@@ -23,7 +23,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
         rvalue: &mir::Rvalue<'tcx>,
     ) {
         match *rvalue {
-            mir::Rvalue::Use(ref operand, _) => {
+            mir::Rvalue::Use(ref operand, with_retag) => {
                 if let mir::Operand::Constant(const_op) = operand {
                     let val = self.eval_mir_constant(&const_op);
                     if val.all_bytes_uninit(self.cx.tcx()) {
@@ -36,13 +36,24 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                 // semantics regarding when assignment operators allow overlap of LHS and RHS.
                 if matches!(
                     cg_operand.layout.backend_repr,
-                    BackendRepr::Scalar(..) | BackendRepr::ScalarPair(..),
+                    BackendRepr::Scalar(..) | BackendRepr::ScalarPair { .. },
                 ) {
                     debug_assert!(!matches!(cg_operand.val, OperandValue::Ref(..)));
                 }
+                // If this is storing a &Freeze reference with a retag, record that it's not
+                // possible to perform writes through the stored pointer.
+                let flags = if let ty::Ref(_, pointee_ty, Mutability::Not) =
+                    cg_operand.layout.ty.kind()
+                    && with_retag.yes()
+                    && pointee_ty.is_freeze(self.cx.tcx(), self.cx.typing_env())
+                {
+                    MemFlags::CAPTURES_READ_ONLY
+                } else {
+                    MemFlags::empty()
+                };
                 // FIXME: consider not copying constants through stack. (Fixable by codegen'ing
                 // constants into `OperandValue::Ref`; why don’t we do that yet if we don’t?)
-                cg_operand.store_with_annotation(bx, dest);
+                cg_operand.store_with_annotation_and_flags(bx, dest, flags);
             }
 
             mir::Rvalue::Cast(
@@ -312,9 +323,12 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
             }
             (
                 OperandValue::Pair(imm_a, imm_b),
-                abi::BackendRepr::ScalarPair(in_a, in_b),
-                abi::BackendRepr::ScalarPair(out_a, out_b),
-            ) if in_a.size(cx) == out_a.size(cx) && in_b.size(cx) == out_b.size(cx) => {
+                abi::BackendRepr::ScalarPair { a: in_a, b: in_b, b_offset: in_offset },
+                abi::BackendRepr::ScalarPair { a: out_a, b: out_b, b_offset: out_offset },
+            ) if in_a.size(cx) == out_a.size(cx)
+                && in_b.size(cx) == out_b.size(cx)
+                && in_offset == out_offset =>
+            {
                 OperandValue::Pair(
                     transmute_scalar(bx, imm_a, in_a, out_a),
                     transmute_scalar(bx, imm_b, in_b, out_b),
@@ -423,7 +437,12 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                                     args,
                                 )
                                 .unwrap();
-                                OperandValue::Immediate(bx.get_fn_addr(instance))
+                                OperandValue::Immediate(
+                                    bx.get_fn_addr(
+                                        instance,
+                                        Some(PacMetadata::default()),
+                                    ),
+                                )
                             }
                             _ => bug!("{} cannot be reified to a fn ptr", operand.layout.ty),
                         }
@@ -437,7 +456,12 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                                     args,
                                     ty::ClosureKind::FnOnce,
                                 );
-                                OperandValue::Immediate(bx.cx().get_fn_addr(instance))
+                                OperandValue::Immediate(
+                                    bx.cx().get_fn_addr(
+                                        instance,
+                                        Some(PacMetadata::default()),
+                                    ),
+                                )
                             }
                             _ => bug!("{} cannot be cast to a fn ptr", operand.layout.ty),
                         }
@@ -522,7 +546,12 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                 let mk_ref = move |tcx: TyCtxt<'tcx>, ty: Ty<'tcx>| {
                     Ty::new_ref(tcx, tcx.lifetimes.re_erased, ty, bk.to_mutbl_lossy())
                 };
-                self.codegen_place_to_pointer(bx, place, mk_ref)
+                let op = self.codegen_place_to_pointer(bx, place, mk_ref);
+                if self.cx.tcx().sess.opts.unstable_opts.codegen_emit_retag.is_some() {
+                    self.codegen_retag_operand(bx, op, false)
+                } else {
+                    op
+                }
             }
 
             // Note: Exclusive reborrowing is always equal to a memcpy, as the types do not change.
@@ -649,10 +678,10 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                 let static_ = if !def_id.is_local() && bx.cx().tcx().needs_thread_local_shim(def_id)
                 {
                     let instance = ty::Instance {
-                        def: ty::InstanceKind::ThreadLocalShim(def_id),
+                        def: ty::InstanceKind::Shim(ty::ShimKind::ThreadLocal(def_id)),
                         args: ty::GenericArgs::empty(),
                     };
-                    let fn_ptr = bx.get_fn_addr(instance);
+                    let fn_ptr = bx.get_fn_addr(instance, Some(PacMetadata::default()));
                     let fn_abi = bx.fn_abi_of_instance(instance, ty::List::empty());
                     let fn_ty = bx.fn_decl_backend_type(fn_abi);
                     let fn_attrs = if bx.tcx().def_kind(instance.def_id()).has_codegen_attrs() {

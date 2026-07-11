@@ -1,4 +1,5 @@
 use rustc_ast::LitKind;
+use rustc_feature::AttributeStability;
 use rustc_hir::attrs::{DeprecatedSince, Deprecation};
 use rustc_hir::{RustcVersion, VERSION_PLACEHOLDER};
 
@@ -31,7 +32,7 @@ fn get(
 pub(crate) struct DeprecatedParser;
 impl SingleAttributeParser for DeprecatedParser {
     const PATH: &[Symbol] = &[sym::deprecated];
-    const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowListWarnRest(&[
+    const ALLOWED_TARGETS: AllowedTargets<'_> = AllowedTargets::AllowListWarnRest(&[
         Allow(Target::Fn),
         Allow(Target::Mod),
         Allow(Target::Struct),
@@ -62,6 +63,7 @@ impl SingleAttributeParser for DeprecatedParser {
         List: &[r#"since = "version""#, r#"note = "reason""#, r#"since = "version", note = "reason""#],
         NameValueStr: "reason"
     );
+    const STABILITY: AttributeStability = AttributeStability::Stable;
 
     fn convert(cx: &mut AcceptContext<'_, '_>, args: &ArgParser) -> Option<AttributeKind> {
         let features = cx.features();

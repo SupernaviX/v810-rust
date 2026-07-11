@@ -822,7 +822,7 @@ impl Item {
                 {
                     hir::Constness::NotConst
                 } else {
-                    hir::Constness::Const
+                    hir::Constness::Const { always: false }
                 }
             } else {
                 hir::Constness::NotConst
@@ -853,11 +853,8 @@ impl Item {
                         safety.into()
                     },
                     abi,
-                    constness: if tcx.is_const_fn(def_id) {
-                        hir::Constness::Const
-                    } else {
-                        hir::Constness::NotConst
-                    },
+                    // Foreign functions can never be const or comptime
+                    constness: hir::Constness::NotConst,
                     asyncness: hir::IsAsync::NotAsync,
                 }
             }
@@ -1201,11 +1198,8 @@ impl GenericBound {
     }
 
     fn is_bounded_by_lang_item(&self, tcx: TyCtxt<'_>, lang_item: LangItem) -> bool {
-        if let GenericBound::TraitBound(
-            PolyTrait { ref trait_, .. },
-            rustc_hir::TraitBoundModifiers::NONE,
-        ) = *self
-            && tcx.is_lang_item(trait_.def_id(), lang_item)
+        if let GenericBound::TraitBound(poly_trait_ref, rustc_hir::TraitBoundModifiers::NONE) = self
+            && tcx.is_lang_item(poly_trait_ref.trait_.def_id(), lang_item)
         {
             return true;
         }
@@ -1213,8 +1207,8 @@ impl GenericBound {
     }
 
     pub(crate) fn get_trait_path(&self) -> Option<Path> {
-        if let GenericBound::TraitBound(PolyTrait { ref trait_, .. }, _) = *self {
-            Some(trait_.clone())
+        if let GenericBound::TraitBound(poly_trait_ref, _) = self {
+            Some(poly_trait_ref.trait_.clone())
         } else {
             None
         }
@@ -1253,7 +1247,7 @@ impl PreciseCapturingArg {
 pub(crate) enum WherePredicate {
     BoundPredicate { ty: Type, bounds: Vec<GenericBound>, bound_params: Vec<GenericParamDef> },
     RegionPredicate { lifetime: Lifetime, bounds: Vec<GenericBound> },
-    EqPredicate { lhs: QPathData, rhs: Term },
+    ProjectionPredicate { lhs: QPathData, rhs: Term },
 }
 
 impl WherePredicate {
@@ -1776,7 +1770,7 @@ impl PrimitiveType {
             ty::Tuple(elems) if elems.is_empty() => Some(Self::Unit),
             ty::Tuple(_) => Some(Self::Tuple),
             ty::Adt(..)
-            | ty::Alias(..)
+            | ty::Alias(_, ..)
             | ty::Bound(..)
             | ty::Closure(..)
             | ty::Coroutine(..)

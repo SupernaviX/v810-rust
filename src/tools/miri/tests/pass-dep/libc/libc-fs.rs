@@ -1,8 +1,9 @@
 //@ignore-target: windows # no libc
 //@compile-flags: -Zmiri-disable-isolation
+//@run-native
 
 use std::ffi::{CStr, CString, OsString};
-use std::fs::{File, canonicalize, create_dir, remove_dir, remove_file};
+use std::fs::{self, File, canonicalize, create_dir, remove_dir, remove_file};
 use std::io::{Error, ErrorKind, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::AsRawFd;
@@ -28,6 +29,7 @@ fn main() {
     test_file_open_unix_allow_two_args();
     test_file_open_unix_needs_three_args();
     test_file_open_unix_extra_third_arg();
+    test_file_open_dir();
     #[cfg(target_os = "linux")]
     test_o_tmpfile_flag();
     test_posix_mkstemp();
@@ -68,11 +70,12 @@ fn main() {
     #[cfg(not(target_os = "solaris"))]
     test_pwritev();
     test_pwrite();
+    test_linkat();
 }
 
 #[cfg(target_os = "linux")]
 #[track_caller]
-fn assert_statx_matches_metadata(stx: &libc::statx, meta: &std::fs::Metadata, expected_size: u64) {
+fn assert_statx_matches_metadata(stx: &libc::statx, meta: &fs::Metadata, expected_size: u64) {
     use std::os::unix::fs::MetadataExt;
     let mask = stx.stx_mask;
 
@@ -152,7 +155,7 @@ fn test_statx_on_file_path() {
         assert_eq!(ret, 0, "statx failed: {}", std::io::Error::last_os_error());
 
         let stx = stx.assume_init();
-        let meta = std::fs::metadata(&path).unwrap();
+        let meta = fs::metadata(&path).unwrap();
         assert_statx_matches_metadata(&stx, &meta, bytes.len() as u64);
     }
 
@@ -211,21 +214,46 @@ fn test_file_open_unix_allow_two_args() {
     let path = utils::prepare_with_content("test_file_open_unix_allow_two_args.txt", &[]);
     let name = CString::new(path.into_os_string().into_encoded_bytes()).unwrap();
 
-    let _fd = unsafe { libc::open(name.as_ptr(), libc::O_RDONLY) };
+    let _fd = errno_result(unsafe { libc::open(name.as_ptr(), libc::O_RDONLY) }).unwrap();
 }
 
 fn test_file_open_unix_needs_three_args() {
     let path = utils::prepare_with_content("test_file_open_unix_needs_three_args.txt", &[]);
     let name = CString::new(path.into_os_string().into_encoded_bytes()).unwrap();
 
-    let _fd = unsafe { libc::open(name.as_ptr(), libc::O_CREAT, 0o666) };
+    let _fd =
+        errno_result(unsafe { libc::open(name.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o666) })
+            .unwrap();
 }
 
 fn test_file_open_unix_extra_third_arg() {
     let path = utils::prepare_with_content("test_file_open_unix_extra_third_arg.txt", &[]);
     let name = CString::new(path.into_os_string().into_encoded_bytes()).unwrap();
 
-    let _fd = unsafe { libc::open(name.as_ptr(), libc::O_RDONLY, 42) };
+    let _fd = errno_result(unsafe { libc::open(name.as_ptr(), libc::O_RDONLY, 42) }).unwrap();
+}
+
+fn test_file_open_dir() {
+    let dir_path = utils::prepare_dir("miri_test_fs_dir");
+    create_dir(&dir_path).unwrap();
+    let dir_name = CString::new(dir_path.into_os_string().into_encoded_bytes()).unwrap();
+
+    // Opening it for read-write fails. The error code differs between Unix and Windows hosts.
+    let err = errno_result(unsafe { libc::open(dir_name.as_ptr(), libc::O_RDWR) }).unwrap_err();
+    assert!(
+        [libc::EISDIR, libc::EPERM].contains(&err.raw_os_error().unwrap()),
+        "unexpected errno: {err}"
+    );
+
+    // Opening it for reading succeeds, but then reading fails.
+    // FIXME: currently does not behave as expected on Windows hosts.
+    // See <https://github.com/rust-lang/miri/issues/5084>.
+    // let fd = errno_result(unsafe { libc::open(dir_name.as_ptr(), libc::O_RDONLY) }).unwrap();
+    // let mut buf = [0u8; 4];
+    // let err =
+    //     errno_result(unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) }).unwrap_err();
+    // assert_eq!(err.raw_os_error().unwrap(), libc::EISDIR, "unexpected errno: {err}");
+    // libc_utils::errno_check(unsafe { libc::close(fd) });
 }
 
 fn test_dup_stdout_stderr() {
@@ -244,7 +272,7 @@ fn test_dup() {
     let name = CString::new(path.into_os_string().into_encoded_bytes()).unwrap();
 
     unsafe {
-        let fd = libc::open(name.as_ptr(), libc::O_RDONLY);
+        let fd = errno_result(libc::open(name.as_ptr(), libc::O_RDONLY)).unwrap();
         let new_fd = libc::dup(fd);
         let new_fd2 = libc::dup2(fd, 8);
 
@@ -396,17 +424,21 @@ fn test_posix_mkstemp() {
     drop(file);
     remove_file(path).unwrap();
 
-    let invalid_templates = vec!["foo", "barXX", "XXXXXXbaz", "whatXXXXXXever", "X"];
-    for t in invalid_templates {
-        let ptr = CString::new(t).unwrap().into_raw();
-        let fd = unsafe { libc::mkstemp(ptr) };
-        let _ = unsafe { CString::from_raw(ptr) };
-        // "On error, -1 is returned, and errno is set to
-        // indicate the error"
-        assert_eq!(fd, -1);
-        let e = std::io::Error::last_os_error();
-        assert_eq!(e.raw_os_error(), Some(libc::EINVAL));
-        assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+    // Test invalid inputs. We skip this on native macOS since macOS apparently does
+    // not bother to validate inputs.
+    if !cfg!(all(not(miri), target_vendor = "apple")) {
+        let invalid_templates = vec!["foo", "barXX", "XXXXXXbaz", "whatXXXXXXever", "X"];
+        for t in invalid_templates {
+            let ptr = CString::new(t).unwrap().into_raw();
+            let fd = unsafe { libc::mkstemp(ptr) };
+            let _ = unsafe { CString::from_raw(ptr) };
+            // "On error, -1 is returned, and errno is set to
+            // indicate the error"
+            assert_eq!(fd, -1, "mkstemp succeeded on invalid template {t:?}");
+            let e = std::io::Error::last_os_error();
+            assert_eq!(e.raw_os_error(), Some(libc::EINVAL));
+            assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+        }
     }
 
     env::set_current_dir(old_cwd).unwrap();
@@ -824,8 +856,8 @@ fn test_readdir() {
         assert!(!dirp.is_null());
         let mut entries = Vec::new();
         loop {
-            cfg_if::cfg_if! {
-                if #[cfg(target_os = "macos")] {
+            cfg_select! {
+                target_os = "macos" => {
                     // On macos we only support readdir_r as that's what std uses there.
                     use std::mem::MaybeUninit;
                     use libc::dirent;
@@ -834,7 +866,8 @@ fn test_readdir() {
                     let ret = libc::readdir_r(dirp, entry.as_mut_ptr(), &mut result);
                     assert_eq!(ret, 0);
                     let entry_ptr = result;
-                } else {
+                }
+                _ => {
                     let entry_ptr = libc::readdir(dirp);
                 }
             }
@@ -908,6 +941,11 @@ fn test_readv() {
 
 /// Test that vectored reads without any buffers return zero.
 fn test_readv_empty_bufs() {
+    if cfg!(all(not(miri), target_vendor = "apple")) {
+        // native macOS returns an error here :shrug:
+        return;
+    }
+
     let path = utils::prepare_with_content("pass-libc-readv-empty-bufs.txt", &[1u8, 2, 3]);
     let cpath = CString::new(path.into_os_string().into_encoded_bytes()).unwrap();
     let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY) };
@@ -1036,6 +1074,11 @@ fn test_writev() {
 
 /// Test that vectored writes without any buffers return zero.
 fn test_writev_empty_bufs() {
+    if cfg!(all(not(miri), target_vendor = "apple")) {
+        // native macOS returns an error here :shrug:
+        return;
+    }
+
     let path = utils::prepare_with_content("pass-libc-writev-empty-bufs.txt", &[1u8, 2, 3]);
     let cpath = CString::new(path.into_os_string().into_encoded_bytes()).unwrap();
     let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_WRONLY) };
@@ -1146,4 +1189,33 @@ fn test_pwrite() {
 
     // The write should start at the provided byte offset.
     assert_eq!(&write_buffer[0..bytes_written], &read_buffer[OFFSET..(bytes_written + OFFSET)]);
+}
+
+fn test_linkat() {
+    let source = utils::prepare_with_content("miri_test_libc_linkat_source.txt", b"hello");
+    let link = utils::prepare("miri_test_libc_linkat_link.txt");
+
+    let c_source = CString::new(source.as_os_str().as_bytes()).expect("CString::new failed");
+    let c_link = CString::new(link.as_os_str().as_bytes()).expect("CString::new failed");
+
+    // Call linkat
+    unsafe {
+        libc_utils::errno_check(libc::linkat(
+            libc::AT_FDCWD,
+            c_source.as_ptr(),
+            libc::AT_FDCWD,
+            c_link.as_ptr(),
+            0,
+        ));
+    }
+
+    // Verify that the hard link works:
+    // Modifications to one are visible through the other.
+    fs::write(&source, b"hello world").unwrap();
+    let contents = fs::read(&link).unwrap();
+    assert_eq!(contents, b"hello world");
+
+    // Cleanup
+    remove_file(&source).unwrap();
+    remove_file(&link).unwrap();
 }

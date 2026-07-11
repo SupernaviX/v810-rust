@@ -63,6 +63,12 @@ impl QueryKey for () {
     }
 }
 
+impl<'tcx> QueryKey for ty::ShimKind<'tcx> {
+    fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
+        tcx.def_span(self.def_id())
+    }
+}
+
 impl<'tcx> QueryKey for ty::InstanceKind<'tcx> {
     fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
         tcx.def_span(self.def_id())
@@ -265,6 +271,18 @@ impl<'tcx> QueryKey for ty::Clauses<'tcx> {
     }
 }
 
+impl<'tcx> QueryKey for ty::AliasTyKind<'tcx> {
+    fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
+        let def_id = match self {
+            ty::AliasTyKind::Projection { def_id }
+            | ty::AliasTyKind::Inherent { def_id }
+            | ty::AliasTyKind::Opaque { def_id }
+            | ty::AliasTyKind::Free { def_id } => def_id,
+        };
+        tcx.def_span(*def_id)
+    }
+}
+
 impl<'tcx, T: QueryKey> QueryKey for ty::PseudoCanonicalInput<'tcx, T> {
     fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
         self.value.default_span(tcx)
@@ -385,7 +403,12 @@ fn def_id_of_type_cached<'a>(ty: Ty<'a>, visited: &mut SsoHashSet<Ty<'a>>) -> Op
         | ty::CoroutineWitness(def_id, _)
         | ty::Foreign(def_id) => Some(def_id),
 
-        ty::Alias(alias) => Some(alias.kind.def_id()),
+        ty::Alias(_, alias) => match alias.kind {
+            ty::AliasTyKind::Projection { def_id }
+            | ty::AliasTyKind::Inherent { def_id }
+            | ty::AliasTyKind::Opaque { def_id }
+            | ty::AliasTyKind::Free { def_id } => Some(def_id),
+        },
 
         ty::Bool
         | ty::Char

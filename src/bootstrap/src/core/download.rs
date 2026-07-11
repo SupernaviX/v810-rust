@@ -248,11 +248,11 @@ impl Config {
 
     #[cfg(not(test))]
     pub(crate) fn maybe_download_ci_llvm(&self) {
-        use build_helper::exit;
         use build_helper::git::PathFreshness;
 
         use crate::core::build_steps::llvm::detect_llvm_freshness;
         use crate::core::config::toml::llvm::check_incompatible_options_for_ci_llvm;
+        use crate::exit;
 
         if !self.llvm_from_ci {
             return;
@@ -1093,7 +1093,7 @@ fn download_http_with_retries(
                     ),
                 ]).run_capture_stdout(exec_ctx);
 
-                if powershell.is_failure() {
+                if powershell.is_success() {
                     return;
                 }
 

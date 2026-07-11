@@ -153,18 +153,22 @@ pub struct Flags {
 
     /// generate PGO profile with rustc build
     #[arg(global = true, value_hint = clap::ValueHint::FilePath, long, value_name = "PROFILE")]
-    pub rust_profile_generate: Option<String>,
+    // FIXME: Remove this option at the end of 2026
+    pub rust_profile_generate: Option<PathBuf>,
     /// use PGO profile for rustc build
+    // FIXME: Remove this option at the end of 2026
     #[arg(global = true, value_hint = clap::ValueHint::FilePath, long, value_name = "PROFILE")]
-    pub rust_profile_use: Option<String>,
+    pub rust_profile_use: Option<PathBuf>,
     /// use PGO profile for LLVM build
+    // FIXME: Remove this option at the end of 2026
     #[arg(global = true, value_hint = clap::ValueHint::FilePath, long, value_name = "PROFILE")]
-    pub llvm_profile_use: Option<String>,
+    pub llvm_profile_use: Option<PathBuf>,
     // LLVM doesn't support a custom location for generating profile
     // information.
     //
     // llvm_out/build/profiles/ is the location this writes to.
     /// generate PGO profile with llvm built for rustc
+    // FIXME: Remove this option at the end of 2026
     #[arg(global = true, long)]
     pub llvm_profile_generate: bool,
     /// Enable BOLT link flags
@@ -440,6 +444,15 @@ pub enum Subcommand {
         #[arg(long)]
         #[doc(hidden)]
         no_doc: bool,
+
+        /// Record all the failed tests in a file in the build directory.
+        ///
+        /// On subsequent invocations, this set of tests can be rerun by passing `--rerun`
+        #[arg(long)]
+        record: bool,
+        /// Rerun tests that previously failed, and stored with `--record`.
+        #[arg(long)]
+        rerun: bool,
     },
     /// Build and run some test suites *in Miri*
     Miri {
@@ -723,6 +736,20 @@ impl Subcommand {
             _ => false,
         }
     }
+
+    pub fn record(&self) -> bool {
+        match self {
+            Subcommand::Test { record, .. } => *record,
+            _ => false,
+        }
+    }
+
+    pub fn rerun(&self) -> bool {
+        match self {
+            Subcommand::Test { rerun, .. } => *rerun,
+            _ => false,
+        }
+    }
 }
 
 /// Returns the shell completion for a given shell, if the result differs from the current
@@ -734,7 +761,7 @@ pub fn get_completion(shell: &dyn Generator, path: &Path) -> Option<String> {
     } else {
         std::fs::read_to_string(path).unwrap_or_else(|_| {
             eprintln!("couldn't read {}", path.display());
-            crate::exit!(1)
+            crate::exit!(1);
         })
     };
     let mut buf = Vec::new();

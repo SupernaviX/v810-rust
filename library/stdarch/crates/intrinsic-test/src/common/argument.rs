@@ -1,34 +1,45 @@
 use itertools::Itertools;
 
+use crate::common::SupportedArchitecture;
 use crate::common::intrinsic_helpers::TypeKind;
+use crate::common::values::test_values_array_name;
 
 use super::constraint::Constraint;
-use super::gen_rust::PASSES;
-use super::intrinsic_helpers::IntrinsicTypeDefinition;
+use super::intrinsic_helpers::TypeDefinition;
+use super::{PASSES, PREDICATE_LOCAL};
 
 /// An argument for the intrinsic.
 #[derive(Debug, PartialEq, Clone)]
-pub struct Argument<T: IntrinsicTypeDefinition> {
+pub struct Argument<A: SupportedArchitecture> {
     /// The argument's index in the intrinsic function call.
     pub pos: usize,
     /// The argument name.
     pub name: String,
     /// The type of the argument.
-    pub ty: T,
+    pub ty: A::Type,
     /// Any constraints that are on this argument
     pub constraint: Option<Constraint>,
+    /// Is the argument a predicate for a scalable intrinsic?
+    pub is_predicate: bool,
 }
 
-impl<T> Argument<T>
+impl<A> Argument<A>
 where
-    T: IntrinsicTypeDefinition,
+    A: SupportedArchitecture,
 {
-    pub fn new(pos: usize, name: String, ty: T, constraint: Option<Constraint>) -> Self {
+    pub fn new(
+        pos: usize,
+        name: String,
+        ty: A::Type,
+        constraint: Option<Constraint>,
+        is_predicate: bool,
+    ) -> Self {
         Argument {
             pos,
             name,
             ty,
             constraint,
+            is_predicate,
         }
     }
 
@@ -36,8 +47,14 @@ where
         self.ty.c_type()
     }
 
+    /// Generates local variable name for the value passed to this argument
     pub fn generate_name(&self) -> String {
-        format!("{}_val", self.name)
+        // The same predicate is used for scalable intrinsic invocations
+        if self.is_predicate {
+            format!("{PREDICATE_LOCAL}")
+        } else {
+            format!("{}_val", self.name)
+        }
     }
 
     pub fn is_simd(&self) -> bool {
@@ -52,17 +69,6 @@ where
         self.constraint.is_some()
     }
 
-    /// Returns a string with the name of the static variable containing test values for intrinsic
-    /// arguments of this type.
-    pub(crate) fn rust_vals_array_name(&self) -> impl std::fmt::Display {
-        let loads = crate::common::gen_rust::PASSES;
-        format!(
-            "{ty}_{load_size}",
-            ty = self.ty.rust_scalar_type().to_uppercase(),
-            load_size = self.ty.num_lanes() * self.ty.num_vectors() + loads - 1,
-        )
-    }
-
     /// Should this argument be passed by reference in C wrapper function declarations?
     ///
     /// SIMD types and `f16` are currently passed by reference.
@@ -73,13 +79,13 @@ where
 
 /// Arguments of an intrinsic - including parameters that end up being const generics.
 #[derive(Debug, PartialEq, Clone)]
-pub struct ArgumentList<T: IntrinsicTypeDefinition> {
-    pub args: Vec<Argument<T>>,
+pub struct ArgumentList<A: SupportedArchitecture> {
+    pub args: Vec<Argument<A>>,
 }
 
-impl<T> ArgumentList<T>
+impl<A> ArgumentList<A>
 where
-    T: IntrinsicTypeDefinition,
+    A: SupportedArchitecture,
 {
     /// Returns a string with the arguments in `self` as a parameter list for a wrapper fn
     /// definition in C (e.g. `$ty1 $arg1, $ty2 $arg2`).
@@ -165,41 +171,6 @@ where
             .join("")
     }
 
-    /// Returns a string defining a static variable with test values used for all intrinsics with
-    /// arguments of `arg`'s type.
-    ///
-    /// e.g.
-    /// ```rust,ignore
-    /// static U8_20: [u8; 20] = [
-    ///     0x0, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xa, 0xb, 0xc, 0xd, 0xe, 0xf, 0xf0,
-    ///     0x80, 0x3b, 0xff,
-    /// ];
-    /// ```
-    ///
-    /// `num_lanes * num_vectors + loads - 1` elements are present in the array, which is sufficient
-    /// for a `loads` number of `num_lanes * num_vectors` windows into the array to be loaded:
-    ///
-    /// ```text
-    /// [0x0, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xa, 0xb, 0xc, 0xd, 0xe, 0xf, 0xf0, 0x80, 0x3b, 0xff]
-    /// ^^^^^^^^^^^^^^^^^^^ first window of `num_lanes * num_vectors` elements (e.g. four elements)
-    ///       ^^^^^^^^^^^^^^^^^^ second window
-    ///                                                                 `loads`th window ^^^^^^^^^^^^^^^^^^^^^^
-    /// ```
-    pub fn gen_arg_rust(
-        arg: &Argument<T>,
-        w: &mut impl std::io::Write,
-        loads: u32,
-    ) -> std::io::Result<()> {
-        writeln!(
-            w,
-            "static {name}: [{ty}; {load_size}] = {values};\n",
-            name = arg.rust_vals_array_name(),
-            ty = arg.ty.rust_scalar_type(),
-            load_size = arg.ty.num_lanes() * arg.ty.num_vectors() + loads - 1,
-            values = arg.ty.populate_random(loads)
-        )
-    }
-
     /// Returns a string defining a local variable for each argument and loading a value into each
     /// using a load intrinsic.
     ///
@@ -220,20 +191,16 @@ where
     pub fn load_values_rust(&self) -> String {
         self.iter()
             .filter(|&arg| !arg.has_constraint())
+            .filter(|&arg| !arg.is_predicate)
             .enumerate()
             .map(|(idx, arg)| {
                 if arg.is_simd() {
-                    format!(
-                        "let {name} = {load}({vals_name}.as_ptr().add((i+{idx}) % {PASSES}) as _);\n",
-                        name = arg.generate_name(),
-                        vals_name = arg.rust_vals_array_name(),
-                        load = arg.ty.get_load_function(),
-                    )
+                    A::load_call(arg, idx)
                 } else {
                     format!(
-                        "let {name} = {vals_name}[(i+{idx}) % {PASSES}];\n",
+                        "let {name} = {vals_name}[(i+{idx}) % {PASSES}];",
                         name = arg.generate_name(),
-                        vals_name = arg.rust_vals_array_name(),
+                        vals_name = test_values_array_name(&arg.ty),
                     )
                 }
             })
@@ -241,7 +208,7 @@ where
     }
 
     /// Returns an iterator over the contained arguments
-    pub fn iter(&self) -> std::slice::Iter<'_, Argument<T>> {
+    pub fn iter(&self) -> std::slice::Iter<'_, Argument<A>> {
         self.args.iter()
     }
 }

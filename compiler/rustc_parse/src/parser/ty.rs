@@ -2,9 +2,9 @@ use rustc_ast::token::{self, IdentIsRaw, MetaVarKind, Token, TokenKind};
 use rustc_ast::util::case::Case;
 use rustc_ast::{
     self as ast, BoundAsyncness, BoundConstness, BoundPolarity, DUMMY_NODE_ID, FnPtrTy, FnRetTy,
-    GenericBound, GenericBounds, GenericParam, Generics, Lifetime, MacCall, MgcaDisambiguation,
-    MutTy, Mutability, Pinnedness, PolyTraitRef, PreciseCapturingArg, TraitBoundModifiers,
-    TraitObjectSyntax, Ty, TyKind, UnsafeBinderTy,
+    GenericBound, GenericBounds, GenericParam, Generics, Lifetime, MacCall, MutTy, Mutability,
+    Pinnedness, PolyTraitRef, PreciseCapturingArg, TraitBoundModifiers, TraitObjectSyntax, Ty,
+    TyKind, UnsafeBinderTy,
 };
 use rustc_data_structures::stack::ensure_sufficient_stack;
 use rustc_errors::{Applicability, Diag, E0516, PResult};
@@ -19,7 +19,7 @@ use crate::errors::{
     NeedPlusAfterTraitObjectLifetime, NestedCVariadicType, ReturnTypesUseThinArrow,
 };
 use crate::parser::item::FrontMatterParsingMode;
-use crate::parser::{ExpTokenPair, FnContext, FnParseMode};
+use crate::parser::{FnContext, FnParseMode};
 use crate::{exp, maybe_recover_from_interpolated_ty_qpath};
 
 /// Signals whether parsing a type should allow `+`.
@@ -576,7 +576,7 @@ impl<'a> Parser<'a> {
             lo.to(self.prev_token.span),
             parens,
         );
-        let bounds = vec![GenericBound::Trait(poly_trait_ref)];
+        let bounds = thin_vec![GenericBound::Trait(poly_trait_ref)];
         self.parse_remaining_bounds(bounds, parse_plus)
     }
 
@@ -660,7 +660,7 @@ impl<'a> Parser<'a> {
         };
 
         let ty = if self.eat(exp!(Semi)) {
-            let mut length = self.parse_expr_anon_const(|_, _| MgcaDisambiguation::Direct)?;
+            let mut length = self.parse_expr_anon_const()?;
 
             if let Err(e) = self.expect(exp!(CloseBracket)) {
                 // Try to recover from `X<Y, ...>` when `X::<Y, ...>` works
@@ -704,7 +704,7 @@ impl<'a> Parser<'a> {
 
         // FIXME(mgca): recovery is broken for `const {` args
         // we first try to parse pattern like `[u8 5]`
-        let length = match self.parse_expr_anon_const(|_, _| MgcaDisambiguation::Direct) {
+        let length = match self.parse_expr_anon_const() {
             Ok(length) => length,
             Err(e) => {
                 e.cancel();
@@ -768,25 +768,6 @@ impl<'a> Parser<'a> {
             self.bump_with((dyn_tok, dyn_tok_sp));
         }
         let ty = self.parse_ty_no_plus()?;
-        if self.token == TokenKind::Dot && self.look_ahead(1, |t| t.kind == TokenKind::OpenBrace) {
-            // & [mut] <type> . { <fields> }
-            //                ^
-            //                we are here
-            let view_start_span = self.token.span;
-            self.bump();
-            let fields = self
-                .parse_delim_comma_seq(
-                    ExpTokenPair { tok: TokenKind::OpenBrace, token_type: TokenType::OpenBrace },
-                    ExpTokenPair { tok: TokenKind::CloseBrace, token_type: TokenType::CloseBrace },
-                    |p| p.parse_ident(),
-                )?
-                .0;
-            // FIXME(scrabsha): actually propagate field view in the AST.
-            let _ = fields;
-            let view_end_span = self.prev_token.span;
-            let span = view_start_span.to(view_end_span);
-            self.psess.gated_spans.gate(sym::view_types, span);
-        }
         Ok(match pinned {
             Pinnedness::Not => TyKind::Ref(opt_lifetime, MutTy { ty, mutbl }),
             Pinnedness::Pinned => TyKind::PinnedRef(opt_lifetime, MutTy { ty, mutbl }),
@@ -813,7 +794,7 @@ impl<'a> Parser<'a> {
     /// an error type.
     fn parse_typeof_ty(&mut self, lo: Span) -> PResult<'a, TyKind> {
         self.expect(exp!(OpenParen))?;
-        let _expr = self.parse_expr_anon_const(|_, _| MgcaDisambiguation::AnonConst)?;
+        let _expr = self.parse_expr_anon_const()?;
         self.expect(exp!(CloseParen))?;
         let span = lo.to(self.prev_token.span);
         let guar = self
@@ -1080,7 +1061,7 @@ impl<'a> Parser<'a> {
     /// Only if `allow_plus` this parses a `+`-separated list of bounds (trailing `+` is admitted).
     /// Otherwise, this only parses a single bound or none.
     fn parse_generic_bounds_common(&mut self, allow_plus: AllowPlus) -> PResult<'a, GenericBounds> {
-        let mut bounds = Vec::new();
+        let mut bounds = ThinVec::new();
 
         // In addition to looping while we find generic bounds:
         // We continue even if we find a keyword. This is necessary for error recovery on,
@@ -1092,7 +1073,7 @@ impl<'a> Parser<'a> {
                 && (self.token.can_begin_type()
                     || (self.token.is_reserved_ident() && !self.token.is_keyword(kw::Where))))
         {
-            if self.token.is_keyword(kw::Dyn) {
+            if self.token.is_keyword(kw::Dyn) && self.token.span.edition().at_least_rust_2018() {
                 // Account for `&dyn Trait + dyn Other`.
                 self.bump();
                 self.dcx().emit_err(InvalidDynKeyword {
@@ -1432,7 +1413,7 @@ impl<'a> Parser<'a> {
             // Someone has written something like `&dyn (Trait + Other)`. The correct code
             // would be `&(dyn Trait + Other)`
             if self.token.is_like_plus() && leading_token.is_keyword(kw::Dyn) {
-                let bounds = vec![];
+                let bounds = thin_vec![];
                 self.parse_remaining_bounds(bounds, true)?;
                 self.expect(exp!(CloseParen))?;
                 self.dcx().emit_err(errors::IncorrectParensTraitBounds {
@@ -1617,7 +1598,7 @@ impl<'a> Parser<'a> {
                 id: lt.id,
                 ident: lt.ident,
                 attrs: ast::AttrVec::new(),
-                bounds: Vec::new(),
+                bounds: ThinVec::new(),
                 is_placeholder: false,
                 kind: ast::GenericParamKind::Lifetime,
                 colon_span: None,

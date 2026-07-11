@@ -1,13 +1,14 @@
 use rustc_abi::{Align, ExternAbi};
 use rustc_hir::attrs::{
-    AttributeKind, EiiImplResolution, InlineAttr, Linkage, RtsanSetting, UsedBy,
+    AttributeKind, EiiImplResolution, InlineAttr, InstrumentFnAttr as HirInstrumentFnAttr, Linkage,
+    RtsanSetting, UsedBy,
 };
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, LOCAL_CRATE, LocalDefId};
 use rustc_hir::{self as hir, Attribute, find_attr};
 use rustc_macros::Diagnostic;
 use rustc_middle::middle::codegen_fn_attrs::{
-    CodegenFnAttrFlags, CodegenFnAttrs, PatchableFunctionEntry, SanitizerFnAttrs,
+    CodegenFnAttrFlags, CodegenFnAttrs, InstrumentFnAttr, PatchableFunctionEntry, SanitizerFnAttrs,
 };
 use rustc_middle::mono::Visibility;
 use rustc_middle::query::Providers;
@@ -259,7 +260,7 @@ fn process_builtin_attrs(
 
                     codegen_fn_attrs.foreign_item_symbol_aliases.push((
                         foreign_item,
-                        if i.is_default { Linkage::LinkOnceAny } else { Linkage::External },
+                        if i.is_default { Linkage::WeakAny } else { Linkage::External },
                         Visibility::Default,
                     ));
                     codegen_fn_attrs.flags |= CodegenFnAttrFlags::EXTERNALLY_IMPLEMENTABLE_ITEM;
@@ -290,9 +291,17 @@ fn process_builtin_attrs(
             AttributeKind::RustcOffloadKernel => {
                 codegen_fn_attrs.flags |= CodegenFnAttrFlags::OFFLOAD_KERNEL
             }
-            AttributeKind::PatchableFunctionEntry { prefix, entry } => {
+            AttributeKind::PatchableFunctionEntry { prefix, entry, section } => {
                 codegen_fn_attrs.patchable_function_entry =
-                    Some(PatchableFunctionEntry::from_prefix_and_entry(*prefix, *entry));
+                    Some(PatchableFunctionEntry::from_prefix_entry_and_section(
+                        *prefix, *entry, *section,
+                    ));
+            }
+            AttributeKind::InstrumentFn(instrument_fn) => {
+                codegen_fn_attrs.instrument_fn = match instrument_fn {
+                    HirInstrumentFnAttr::On => InstrumentFnAttr::On,
+                    HirInstrumentFnAttr::Off => InstrumentFnAttr::Off,
+                };
             }
             _ => {}
         }

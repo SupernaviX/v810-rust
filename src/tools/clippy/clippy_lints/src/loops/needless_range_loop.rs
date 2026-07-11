@@ -3,7 +3,7 @@ use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::source::snippet;
 use clippy_utils::ty::has_iter_method;
 use clippy_utils::visitors::is_local_used;
-use clippy_utils::{SpanlessEq, contains_name, higher, is_integer_const, peel_hir_expr_while, sugg};
+use clippy_utils::{SpanlessEq, contains_name, higher, is_integer_literal, peel_hir_expr_while, sugg};
 use rustc_ast::ast;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet, FxIndexMap};
 use rustc_errors::Applicability;
@@ -29,7 +29,7 @@ pub(super) fn check<'tcx>(
     if let Some(higher::Range {
         start: Some(start),
         ref end,
-        limits,
+        ty: range_ty,
         span,
     }) = higher::Range::hir(cx, arg)
         // the var must be a single name
@@ -83,7 +83,7 @@ pub(super) fn check<'tcx>(
                 return;
             }
 
-            let starts_at_zero = is_integer_const(cx, start, 0);
+            let starts_at_zero = is_integer_literal(start, 0);
 
             let skip = if starts_at_zero {
                 String::new()
@@ -114,12 +114,12 @@ pub(super) fn check<'tcx>(
                     end_is_start_plus_val = start_equal_left | start_equal_right;
                 }
 
-                if is_len_call(end, indexed) || is_end_eq_array_len(cx, end, limits, indexed_ty) {
+                if is_len_call(end, indexed) || is_end_eq_array_len(cx, end, range_ty, indexed_ty) {
                     String::new()
                 } else if visitor.indexed_mut.contains(&indexed) && contains_name(indexed, take_expr, cx) {
                     return;
                 } else {
-                    match limits {
+                    match range_ty.limits() {
                         ast::RangeLimits::Closed => {
                             let take_expr = sugg::Sugg::hir(cx, take_expr, "<count>");
                             format!(".take({})", take_expr + sugg::ONE)
@@ -205,7 +205,7 @@ fn is_len_call(expr: &Expr<'_>, var: Symbol) -> bool {
 fn is_end_eq_array_len<'tcx>(
     cx: &LateContext<'tcx>,
     end: &Expr<'_>,
-    limits: ast::RangeLimits,
+    range_ty: higher::RangeTy,
     indexed_ty: Ty<'tcx>,
 ) -> bool {
     if let ExprKind::Lit(lit) = end.kind
@@ -213,7 +213,7 @@ fn is_end_eq_array_len<'tcx>(
         && let ty::Array(_, arr_len_const) = indexed_ty.kind()
         && let Some(arr_len) = arr_len_const.try_to_target_usize(cx.tcx)
     {
-        return match limits {
+        return match range_ty.limits() {
             ast::RangeLimits::Closed => end_int.get() + 1 >= arr_len.into(),
             ast::RangeLimits::HalfOpen => end_int.get() >= arr_len.into(),
         };

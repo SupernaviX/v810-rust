@@ -6,7 +6,6 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::{assert_matches, fs, io, mem, str, thread};
 
 use rustc_abi::Size;
-use rustc_data_structures::fx::FxIndexMap;
 use rustc_data_structures::jobserver::{self, Acquired};
 use rustc_data_structures::profiling::{SelfProfilerRef, VerboseTimingGuard};
 use rustc_errors::emitter::Emitter;
@@ -16,13 +15,11 @@ use rustc_errors::{
 };
 use rustc_fs_util::link_or_copy;
 use rustc_hir::find_attr;
-use rustc_incremental::{
-    copy_cgu_workproduct_to_incr_comp_cache_dir, in_incr_comp_dir, in_incr_comp_dir_sess,
-};
+use rustc_incremental::{copy_cgu_workproduct_to_incr_comp_cache_dir, in_incr_comp_dir_sess};
 use rustc_macros::{Decodable, Encodable};
 use rustc_metadata::fs::copy_to_stdout;
 use rustc_middle::bug;
-use rustc_middle::dep_graph::{WorkProduct, WorkProductId};
+use rustc_middle::dep_graph::{WorkProduct, WorkProductMap};
 use rustc_middle::ty::TyCtxt;
 use rustc_session::Session;
 use rustc_session::config::{
@@ -109,6 +106,7 @@ pub struct ModuleConfig {
     pub emit_lifetime_markers: bool,
     pub llvm_plugins: Vec<String>,
     pub autodiff: Vec<config::AutoDiff>,
+    pub autodiff_post_passes: Option<String>,
     pub offload: Vec<config::Offload>,
 }
 
@@ -260,6 +258,10 @@ impl ModuleConfig {
             emit_lifetime_markers: sess.emit_lifetime_markers(),
             llvm_plugins: if_regular!(sess.opts.unstable_opts.llvm_plugins.clone(), vec![]),
             autodiff: if_regular!(sess.opts.unstable_opts.autodiff.clone(), vec![]),
+            autodiff_post_passes: if_regular!(
+                sess.opts.unstable_opts.autodiff_post_passes.clone(),
+                None
+            ),
             offload: if_regular!(sess.opts.unstable_opts.offload.clone(), vec![]),
         }
     }
@@ -460,10 +462,11 @@ pub(crate) fn start_async_codegen<B: WriteBackendMethods>(
 fn copy_all_cgu_workproducts_to_incr_comp_cache_dir(
     sess: &Session,
     compiled_modules: &CompiledModules,
-) -> FxIndexMap<WorkProductId, WorkProduct> {
-    let mut work_products = FxIndexMap::default();
+) -> WorkProductMap {
+    let mut work_products = WorkProductMap::default();
 
-    if sess.opts.incremental.is_none() {
+    if sess.opts.incremental.is_none() || sess.opts.unstable_opts.disable_incr_comp_backend_caching
+    {
         return work_products;
     }
 
@@ -489,14 +492,13 @@ fn copy_all_cgu_workproducts_to_incr_comp_cache_dir(
         if let Some(path) = &module.bytecode {
             files.push((OutputType::Bitcode.extension(), path.as_path()));
         }
-        if let Some((id, product)) = copy_cgu_workproduct_to_incr_comp_cache_dir(
+        let (id, product) = copy_cgu_workproduct_to_incr_comp_cache_dir(
             sess,
             &module.name,
             files.as_slice(),
             &module.links_from_incr_cache,
-        ) {
-            work_products.insert(id, product);
-        }
+        );
+        work_products.insert(id, product);
     }
 
     work_products
@@ -885,20 +887,24 @@ fn execute_copy_from_cache_work_item(
     let mut links_from_incr_cache = Vec::new();
 
     let mut load_from_incr_comp_dir = |output_path: PathBuf, saved_path: &str| {
-        let source_file = in_incr_comp_dir(incr_comp_session_dir, saved_path);
+        let source_file_in_incr_comp_dir = incr_comp_session_dir.join(saved_path);
         debug!(
             "copying preexisting module `{}` from {:?} to {}",
             module.name,
-            source_file,
+            source_file_in_incr_comp_dir,
             output_path.display()
         );
-        match link_or_copy(&source_file, &output_path) {
+        match link_or_copy(&source_file_in_incr_comp_dir, &output_path) {
             Ok(_) => {
-                links_from_incr_cache.push(source_file);
+                links_from_incr_cache.push(source_file_in_incr_comp_dir);
                 Some(output_path)
             }
             Err(error) => {
-                dcx.emit_err(errors::CopyPathBuf { source_file, output_path, error });
+                dcx.emit_err(errors::CopyPathBuf {
+                    source_file: source_file_in_incr_comp_dir,
+                    output_path,
+                    error,
+                });
                 None
             }
         }
@@ -1964,7 +1970,7 @@ impl Emitter for SharedEmitter {
         assert_eq!(diag.is_lint, None);
         // No sensible check for `diag.emitted_at`.
 
-        let args = mem::replace(&mut diag.args, DiagArgMap::default());
+        let args = mem::take(&mut diag.args);
         drop(
             self.sender.send(SharedEmitterMessage::Diagnostic(Diagnostic {
                 span: diag.span.primary_spans().iter().map(|span| span.data()).collect::<Vec<_>>(),
@@ -2098,11 +2104,7 @@ pub struct OngoingCodegen<B: WriteBackendMethods> {
 }
 
 impl<B: WriteBackendMethods> OngoingCodegen<B> {
-    pub fn join(
-        self,
-        sess: &Session,
-        crate_info: &CrateInfo,
-    ) -> (CompiledModules, FxIndexMap<WorkProductId, WorkProduct>) {
+    pub fn join(self, sess: &Session, crate_info: &CrateInfo) -> (CompiledModules, WorkProductMap) {
         self.shared_emitter_main.check(sess, true);
 
         let maybe_lto_modules = sess.time("join_worker_thread", || match self.coordinator.join() {

@@ -1,6 +1,7 @@
 from __future__ import annotations
 import sys
-from typing import Generator, List, TYPE_CHECKING, Optional
+from typing import Generator, Dict, List, TYPE_CHECKING, Optional
+from enum import Flag, auto
 
 from lldb import (
     SBData,
@@ -8,6 +9,15 @@ from lldb import (
     eBasicTypeLong,
     eBasicTypeUnsignedLong,
     eBasicTypeUnsignedChar,
+    eBasicTypeUnsignedShort,
+    eBasicTypeUnsignedLongLong,
+    eBasicTypeSignedChar,
+    eBasicTypeShort,
+    eBasicTypeLongLong,
+    eBasicTypeFloat,
+    eBasicTypeDouble,
+    eBasicTypeHalf,
+    eBasicTypeChar32,
     eFormatChar,
     eTypeIsInteger,
 )
@@ -53,6 +63,27 @@ if TYPE_CHECKING:
 PY3 = sys.version_info[0] == 3
 
 
+class LLDBFeature(Flag):
+    """Used to track which features we rely on and whether or not we can access them. The global
+    `lldb_providers.FEATURE_FLAGS` is initialized in `lldb_lookup.__lldb_init_module` and is
+    expected not to change after that point.
+
+    This is used rather than `debugger.GetVersionString` because Apple's fork of LLDB (used for
+    xcode) uses a non-standard versioning scheme that has no relation to LLVM's.
+    """
+
+    StaticFields = auto()
+    """Added in LLDB 18. Adds functions to `SBType` the inspection of a struct's static fields."""
+    TypeRecognizers = auto()
+    """Added in LLDB 19. Callback-based type matching for synthetic/summary providers."""
+    Float128 = auto()
+    """Added in LLDB 22.1. Adds builtin support for Float 128's, including an `eBasicTypeFloat128`,
+    a formatter, and handlers in `TypeSystemClang`"""
+
+
+FEATURE_FLAGS: LLDBFeature = LLDBFeature(0)
+
+
 class LLDBOpaque:
     """
     An marker type for use in type hints to denote LLDB bookkeeping variables. Values marked with
@@ -70,14 +101,18 @@ class ValueBuilder:
     def from_int(self, name: str, value: int) -> SBValue:
         type = self.valobj.GetType().GetBasicType(eBasicTypeLong)
         data = SBData.CreateDataFromSInt64Array(
-            self.endianness, self.pointer_size, [value]
+            self.endianness,
+            self.pointer_size,
+            [value],
         )
         return self.valobj.CreateValueFromData(name, data, type)
 
     def from_uint(self, name: str, value: int) -> SBValue:
         type = self.valobj.GetType().GetBasicType(eBasicTypeUnsignedLong)
         data = SBData.CreateDataFromUInt64Array(
-            self.endianness, self.pointer_size, [value]
+            self.endianness,
+            self.pointer_size,
+            [value],
         )
         return self.valobj.CreateValueFromData(name, data, type)
 
@@ -118,37 +153,6 @@ class DefaultSyntheticProvider:
 
     def has_children(self) -> bool:
         return self.valobj.MightHaveChildren()
-
-    def get_value(self):
-        return self.valobj.value
-
-
-class IndirectionSyntheticProvider:
-    def __init__(self, valobj: SBValue, _dict: LLDBOpaque):
-        self.valobj = valobj
-
-    def num_children(self) -> int:
-        return 1
-
-    def get_child_index(self, name: str) -> int:
-        if name == "$$dereference$$":
-            return 0
-        return -1
-
-    def get_child_at_index(self, index: int) -> Optional[SBValue]:
-        if index == 0:
-            value = self.valobj.Dereference()
-            if (synth := value.GetSyntheticValue()).IsValid():
-                return synth
-            else:
-                return value
-        return None
-
-    def update(self):
-        pass
-
-    def has_children(self) -> bool:
-        return True
 
     def get_value(self):
         return self.valobj.value
@@ -206,6 +210,21 @@ def get_template_args(type_name: str) -> Generator[str, None, None]:
 
 MSVC_PTR_PREFIX: List[str] = ["ref$<", "ref_mut$<", "ptr_const$<", "ptr_mut$<"]
 
+PRIMITIVE_TYPES: Dict[str, int] = {
+    "u8": eBasicTypeUnsignedChar,
+    "u16": eBasicTypeUnsignedShort,
+    "u32": eBasicTypeUnsignedLong,
+    "u64": eBasicTypeUnsignedLongLong,
+    "i8": eBasicTypeSignedChar,
+    "i16": eBasicTypeShort,
+    "i32": eBasicTypeLong,
+    "i64": eBasicTypeLongLong,
+    "f16": eBasicTypeHalf,
+    "f32": eBasicTypeFloat,
+    "f64": eBasicTypeDouble,
+    "char": eBasicTypeChar32,
+}
+
 
 def resolve_msvc_template_arg(arg_name: str, target: SBTarget) -> SBType:
     """
@@ -222,6 +241,22 @@ def resolve_msvc_template_arg(arg_name: str, target: SBTarget) -> SBType:
     current version of LLDB, so instead the types are generated via `base_type.GetPointerType()` and
     `base_type.GetArrayType()`, which bypass the PDB file and ask clang directly for the type node.
     """
+
+    # As of LLDB 22, finding primitives based on `FindFirstType` with their rust name no longer
+    # works. Instead, we can look them up by their `eBasicType` equivalent. For usize and isize,
+    # we convert them to their bit-sized counterpart before the lookup
+    if arg_name == "isize" or arg_name == "usize":
+        equivalent = f"{arg_name[0]}{target.GetAddressByteSize() * 8}"
+        return target.GetBasicType(PRIMITIVE_TYPES[equivalent])
+
+    if (basic_type := PRIMITIVE_TYPES.get(arg_name)) is not None:
+        return target.GetBasicType(basic_type)
+
+    if arg_name == "f128" and LLDBFeature.Float128 in FEATURE_FLAGS:
+        from lldb import eBasicTypeFloat128
+
+        return target.GetBasicType(eBasicTypeFloat128)
+
     result = target.FindFirstType(arg_name)
 
     if result.IsValid():
@@ -638,6 +673,8 @@ class ClangEncodedEnumProvider:
 
 
 def ClangEncodedEnumSummaryProvider(valobj: SBValue, _dict: LLDBOpaque) -> str:
+    if valobj.TypeIsPointerType():
+        valobj = valobj.Dereference()
     enum_synth = ClangEncodedEnumProvider(valobj.GetNonSyntheticValue(), _dict)
     variant = enum_synth.variant
     name = _getVariantName(variant)
@@ -670,6 +707,10 @@ class MSVCEnumSyntheticProvider:
 
     def __init__(self, valobj: SBValue, _dict: LLDBOpaque):
         self.valobj = valobj
+        # This allows the summary provider to still print something
+        # even if we can't find the variant for whatever reason
+        self.variant = valobj
+        self.value = valobj
         self.update()
 
     def update(self):

@@ -2182,7 +2182,13 @@ fn test_rename_directory_to_non_empty_directory() {
     fs::write(target_path.join("target_file.txt"), b"target hello world").unwrap();
 
     let err = fs::rename(source_path, target_path).unwrap_err();
-    assert_eq!(err.kind(), ErrorKind::DirectoryNotEmpty);
+    assert_matches!(
+        err.kind(),
+        // On ext4, ntfs, apfs, tmpfs, and btrfs `DirectoryNotEmpty` is returned.
+        // On xfs `AlreadyExists` is returned.
+        ErrorKind::DirectoryNotEmpty | ErrorKind::AlreadyExists,
+        "Expected DirectoryNotEmpty or AlreadyExists error, got {err}"
+    );
 }
 
 #[test]
@@ -2363,6 +2369,9 @@ fn test_fs_set_times_follows_symlink() {
     use crate::os::windows::fs::FileTimesExt;
 
     let tmp = tmpdir();
+    if !got_symlink_permission(&tmp) {
+        return;
+    }
 
     // Create a target file
     let target = tmp.join("target");
@@ -2461,6 +2470,9 @@ fn test_fs_set_times_nofollow() {
     use crate::os::windows::fs::FileTimesExt;
 
     let tmp = tmpdir();
+    if !got_symlink_permission(&tmp) {
+        return;
+    }
 
     // Create a target file and a symlink to it
     let target = tmp.join("target");
@@ -2544,4 +2556,12 @@ fn test_dir_read_file() {
     let f = check!(dir.open_file(tmpdir.join("foo.txt")));
     let buf = check!(io::read_to_string(f));
     assert_eq!("bar", &buf);
+}
+
+#[test]
+fn test_dir_metadata() {
+    let tmpdir = tmpdir();
+    let dir = check!(Dir::open(tmpdir.path()));
+    let metadata = check!(dir.metadata());
+    assert!(metadata.is_dir());
 }

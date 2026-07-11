@@ -367,6 +367,12 @@ impl<'a, 'tcx> Visitor<'tcx> for CfgChecker<'a, 'tcx> {
                 self.check_unwind_edge(location, *unwind);
                 if let Some(drop) = drop {
                     self.check_edge(location, *drop, EdgeKind::Normal);
+                    if self.body.phase >= MirPhase::Runtime(RuntimePhase::Initial) {
+                        self.fail(
+                            location,
+                            "`async drop` should have been removed after drop elaboration",
+                        );
+                    }
                 }
             }
             TerminatorKind::Call { func, args, .. }
@@ -673,7 +679,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                 };
 
                 let kind = match parent_ty.ty.kind() {
-                    &ty::Alias(ty::AliasTy { kind: ty::Opaque { def_id }, args, .. }) => {
+                    &ty::Alias(_, ty::AliasTy { kind: ty::Opaque { def_id }, args, .. }) => {
                         self.tcx.type_of(def_id).instantiate(self.tcx, args).skip_norm_wip().kind()
                     }
                     kind => kind,
@@ -777,7 +783,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                                 return;
                             };
 
-                            ty::EarlyBinder::bind(f_ty.ty)
+                            ty::EarlyBinder::bind(self.tcx, f_ty.ty)
                                 .instantiate(self.tcx, args)
                                 .skip_norm_wip()
                         } else {
@@ -1545,7 +1551,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                     pty.kind(),
                     ty::Adt(..)
                         | ty::Coroutine(..)
-                        | ty::Alias(ty::AliasTy { kind: ty::Opaque { .. }, .. })
+                        | ty::Alias(_, ty::AliasTy { kind: ty::Opaque { .. }, .. })
                 ) {
                     self.fail(
                         location,

@@ -856,7 +856,7 @@ unsafe impl<T: PointeeSized> TrivialClone for PhantomData<T> {}
 
 #[stable(feature = "rust1", since = "1.0.0")]
 #[rustc_const_unstable(feature = "const_default", issue = "143894")]
-impl<T: PointeeSized> const Default for PhantomData<T> {
+const impl<T: PointeeSized> Default for PhantomData<T> {
     fn default() -> Self {
         Self
     }
@@ -1023,6 +1023,7 @@ pub auto trait Unpin {}
 // will likely eventually be deprecated, and all new code should be using `UnsafePinned` instead.
 #[stable(feature = "pin", since = "1.33.0")]
 #[derive(Debug, Default, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[rustc_diagnostic_item = "PhantomPinned"]
 pub struct PhantomPinned;
 
 #[stable(feature = "pin", since = "1.33.0")]
@@ -1065,12 +1066,26 @@ pub const trait Destruct: PointeeSized {}
 ///
 /// The implementation of this trait is built-in and cannot be implemented
 /// for any user type.
-#[unstable(feature = "tuple_trait", issue = "none")]
+#[unstable(feature = "tuple_trait", issue = "157987")]
 #[lang = "tuple_trait"]
 #[diagnostic::on_unimplemented(message = "`{Self}` is not a tuple")]
 #[rustc_deny_explicit_impl]
 #[rustc_dyn_incompatible_trait]
 pub trait Tuple {}
+
+/// Creates a new style directly represented const argument.
+/// ```ignore (cannot test this from within core yet)
+/// type const BAR<const N: usize>: usize = N;
+/// type const FOO<const N: usize>: usize = direct!(BAR::<N>);
+/// ```
+#[rustc_builtin_macro(direct_const_arg)]
+#[unstable(feature = "min_generic_const_args", issue = "132980")]
+#[macro_export]
+macro_rules! direct_const_arg {
+    ($($arg:tt)*) => {
+        /* compiler built-in */
+    };
+}
 
 /// A marker for types which can be used as types of `const` generic parameters.
 ///

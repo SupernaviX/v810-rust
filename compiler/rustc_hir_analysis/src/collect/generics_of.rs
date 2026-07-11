@@ -97,8 +97,6 @@ pub(super) fn generics_of(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::Generics {
             match tcx.anon_const_kind(def_id) {
                 // Stable: anon consts are not able to use any generic parameters...
                 ty::AnonConstKind::MCG => None,
-                // GCA anon consts inherit their parent's generics.
-                ty::AnonConstKind::GCA => Some(parent_did),
                 // we provide generics to repeat expr counts as a backwards compatibility hack. #76200
                 ty::AnonConstKind::RepeatExprCount => Some(parent_did),
 
@@ -126,11 +124,11 @@ pub(super) fn generics_of(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::Generics {
                     //        ^ parent_def_id
                     //
                     // then we only want to return generics for params to the left of `N`. If we don't do that we
-                    // end up with that const looking like: `ty::ConstKind::Unevaluated(def_id, args: [N#0])`.
+                    // end up with that const looking like: `ty::ConstKind::Alias(def_id, args: [N#0])`.
                     //
                     // This causes ICEs (#86580) when building the args for Foo in `fn foo() -> Foo { .. }` as
                     // we instantiate the defaults with the partially built args when we build the args. Instantiating
-                    // the `N#0` on the unevaluated const indexes into the empty args we're in the process of building.
+                    // the `N#0` on the alias const indexes into the empty args we're in the process of building.
                     //
                     // We fix this by having this function return the parent's generics ourselves and truncating the
                     // generics to only include non-forward declared params (with the exception of the `Self` ty)
@@ -215,6 +213,17 @@ pub(super) fn generics_of(tcx: TyCtxt<'_>, def_id: LocalDefId) -> ty::Generics {
             tcx.def_span(def_id),
             "synthetic HIR should have its `generics_of` explicitly fed"
         ),
+
+        Node::ConstArg(..) => {
+            // These can show up in mGCA when representing "direct" const arguments. The
+            // DefCollector cannot know whether an anon const will be represented by an actual HIR
+            // Node::AnonConst, or whether it will be represented directly, so it must generate a
+            // DefId. If it ends up being direct, this DefId is then attached to the top-level
+            // ConstArg, which is what we are seeing here.
+            debug_assert!(tcx.features().min_generic_const_args());
+            // Forward to the real parent.
+            Some(tcx.local_parent(def_id))
+        }
 
         _ => span_bug!(tcx.def_span(def_id), "generics_of: unexpected node kind {node:?}"),
     };

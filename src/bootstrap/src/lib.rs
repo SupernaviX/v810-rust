@@ -26,7 +26,6 @@ use std::time::{Instant, SystemTime};
 use std::{env, fs, io, str};
 
 use build_helper::ci::gha;
-use build_helper::exit;
 use cc::Tool;
 use termcolor::{ColorChoice, StandardStream, WriteColor};
 use utils::build_stamp::BuildStamp;
@@ -42,9 +41,9 @@ use crate::utils::helpers::{self, dir_is_empty, exe, libdir, set_file_times, spl
 mod core;
 mod utils;
 
-pub use core::builder::PathSet;
 #[cfg(feature = "tracing")]
 pub use core::builder::STEP_SPAN_TARGET;
+pub use core::builder::{PathSet, StepStack};
 pub use core::config::flags::{Flags, Subcommand};
 pub use core::config::{ChangeId, Config};
 
@@ -1280,7 +1279,7 @@ impl Build {
 
     /// Returns C flags that `cc-rs` thinks should be enabled for the
     /// specified target by default.
-    fn cc_handled_clags(&self, target: TargetSelection, c: CLang) -> Vec<String> {
+    fn cc_handled_cflags(&self, target: TargetSelection, c: CLang) -> Vec<String> {
         if self.config.dry_run() {
             return Vec::new();
         }
@@ -2120,9 +2119,11 @@ impl Compiler {
 }
 
 fn envify(s: &str) -> String {
+    // Converting foo-bar to FOO_BAR is a fairly idomatic mapping to an environment variable name.
+    // We also convert '.' to '_' to fix https://github.com/rust-lang/rust/issues/158090
     s.chars()
         .map(|c| match c {
-            '-' => '_',
+            '-' | '.' => '_',
             c => c,
         })
         .flat_map(|c| c.to_uppercase())
@@ -2146,4 +2147,11 @@ pub fn prepare_behaviour_dump_dir(build: &Build) {
 
         t!(INITIALIZED.set(true));
     }
+}
+
+#[macro_export]
+macro_rules! exit {
+    ($code:expr) => {
+        $crate::utils::helpers::detail_exit($code, cfg!(test));
+    };
 }

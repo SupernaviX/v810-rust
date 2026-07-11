@@ -4,13 +4,13 @@
 #![feature(try_blocks)]
 // tidy-alphabetical-end
 
-mod errors;
+mod diagnostics;
 
 use std::marker::PhantomData;
 use std::ops::ControlFlow;
 use std::{debug_assert_matches, fmt};
 
-use errors::{
+use diagnostics::{
     FieldIsPrivate, FieldIsPrivateLabel, FromPrivateDependencyInPublicInterface, InPublicInterface,
     ItemIsPrivate, PrivateInterfacesOrBoundsLint, ReportEffectiveVisibility, UnnameableTypesLint,
     UnnamedItemIsPrivate,
@@ -215,6 +215,7 @@ where
                 }
             }
             ty::Alias(
+                _,
                 data @ ty::AliasTy {
                     kind:
                         kind @ (ty::Inherent { def_id }
@@ -274,7 +275,7 @@ where
                     try_visit!(self.def_id_visitor.visit_def_id(def_id, "trait", &trait_ref));
                 }
             }
-            ty::Alias(ty::AliasTy { kind: ty::Opaque { def_id }, .. }) => {
+            ty::Alias(_, ty::AliasTy { kind: ty::Opaque { def_id }, .. }) => {
                 // Skip repeated `Opaque`s to avoid infinite recursion.
                 if self.visited_tys.insert(ty) {
                     // The intent is to treat `impl Trait1 + Trait2` identically to
@@ -788,8 +789,7 @@ impl ReachEverythingInTheInterfaceVisitor<'_, '_> {
             }
 
             DefKind::AssocConst { .. } | DefKind::AssocFn | DefKind::AssocTy => {
-                // FIXME: `EmbargoVisitor` can't check assoc items(see `check_def_id`).
-                // Let's traverse the whole impl/trait.
+                // Traverse the whole impl/trait.
                 self.ev.queue.insert(self.ev.tcx.local_parent(def_id));
             }
 
@@ -843,6 +843,10 @@ impl<'tcx> DefIdVisitor<'tcx> for ReachEverythingInTheInterfaceVisitor<'_, 'tcx>
             // All effective visibilities except `reachable_through_impl_trait` are limited to
             // nominal visibility. If any type or trait is leaked farther than that, it will
             // produce type privacy errors on any use, so we don't consider it leaked.
+            //
+            // FIXME: If self.level == Level::Reachable and self.ev == (priv, priv, priv, pub),
+            // then the effective visibility of def_id wouldn't be updated at level
+            // `ReachableThroughImplTrait` due to max_vis. Could this lead to a privacy violation?
             let max_vis = (self.level != Level::ReachableThroughImplTrait)
                 .then(|| self.ev.tcx.local_visibility(def_id));
             if self.ev.update_eff_vis(def_id, self.effective_vis, max_vis, self.level) {
@@ -944,7 +948,8 @@ impl<'tcx> NamePrivacyVisitor<'tcx> {
 
         // definition of the field
         let ident = Ident::new(sym::dummy, use_ctxt);
-        let (_, def_id) = self.tcx.adjust_ident_and_get_scope(ident, def.did(), hir_id);
+        let (_, def_id) =
+            self.tcx.adjust_ident_and_get_scope(ident, def.did(), hir_id.owner.def_id);
         !field.vis.is_accessible_from(def_id, self.tcx)
     }
 

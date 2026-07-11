@@ -2,6 +2,7 @@
 
 #![stable(feature = "rust1", since = "1.0.0")]
 
+use crate::convert::{BoundedCastFromInt, CheckedCastFromInt};
 use crate::panic::const_panic;
 use crate::str::FromStr;
 use crate::ub_checks::assert_unsafe_precondition;
@@ -1124,8 +1125,8 @@ impl u8 {
     /// before using this function.
     ///
     /// [infra-aw]: https://infra.spec.whatwg.org/#ascii-whitespace
-    /// [pct]: https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/V1_chap07.html#tag_07_03_01
-    /// [bfs]: https://pubs.opengroup.org/onlinepubs/9699919799/utilities/V3_chap02.html#tag_18_06_05
+    /// [pct]: https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/V1_chap07.html#tag_07_03_01
+    /// [bfs]: https://pubs.opengroup.org/onlinepubs/9799919799/utilities/V3_chap02.html#tag_19_06_05
     ///
     /// # Examples
     ///
@@ -1586,7 +1587,7 @@ macro_rules! from_str_int_impl {
     ($signedness:ident $($int_ty:ty)+) => {$(
         #[stable(feature = "rust1", since = "1.0.0")]
         #[rustc_const_unstable(feature = "const_convert", issue = "143773")]
-        impl const FromStr for $int_ty {
+        const impl FromStr for $int_ty {
             type Err = ParseIntError;
 
             /// Parses an integer from a string slice with decimal digits.
@@ -1848,12 +1849,3 @@ macro_rules! from_str_int_impl {
 
 from_str_int_impl! { signed isize i8 i16 i32 i64 i128 }
 from_str_int_impl! { unsigned usize u8 u16 u32 u64 u128 }
-
-macro_rules! impl_sealed {
-    ($($t:ty)*) => {$(
-        /// Allows extension traits within `core`.
-        #[unstable(feature = "sealed", issue = "none")]
-        impl crate::sealed::Sealed for $t {}
-    )*}
-}
-impl_sealed! { isize i8 i16 i32 i64 i128 usize u8 u16 u32 u64 u128 }

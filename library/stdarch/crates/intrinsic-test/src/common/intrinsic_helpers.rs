@@ -1,11 +1,7 @@
 use std::cmp;
 use std::fmt;
-use std::ops::Deref;
+use std::ops::DerefMut;
 use std::str::FromStr;
-
-use itertools::Itertools as _;
-
-use super::values::value_for_array;
 
 #[derive(Debug, PartialEq, Copy, Clone)]
 pub enum Sign {
@@ -94,9 +90,13 @@ impl TypeKind {
         }
     }
 
-    /// Returns the Rust prefix for this type kind i.e. `i`, `u`, or `f`.
+    /// Returns the Rust prefix for this type kind (i.e. `i` for `i16`, or `u` for `u16`). For type
+    /// kinds without any bit length at the end (e.g. `bool`), returns the whole type name.
     pub fn rust_prefix(&self) -> &str {
         match self {
+            Self::Bool => "bool",
+            Self::SvPattern => "svpattern",
+            Self::SvPrefetchOp => "svprfop",
             Self::BFloat => "bf",
             Self::Float => "f",
             Self::Int(Sign::Signed) => "i",
@@ -105,7 +105,7 @@ impl TypeKind {
             Self::Char(Sign::Unsigned) => "u",
             Self::Char(Sign::Signed) => "i",
             Self::Mask => "u",
-            _ => unreachable!("Unused type kind: {self:#?}"),
+            _ => unreachable!("type kind without Rust prefix: {self:#?}"),
         }
     }
 }
@@ -114,6 +114,15 @@ impl TypeKind {
 pub enum SimdLen {
     Scalable,
     Fixed(u32),
+}
+
+impl SimdLen {
+    pub fn expect_fixed(&self) -> u32 {
+        match self {
+            SimdLen::Fixed(lanes) => *lanes,
+            SimdLen::Scalable => panic!("`expect_fixed` with scalable length"),
+        }
+    }
 }
 
 impl std::fmt::Display for SimdLen {
@@ -173,14 +182,8 @@ impl IntrinsicType {
     }
 
     /// Returns the number of lanes of the type
-    pub fn num_lanes(&self) -> u32 {
-        self.simd_len
-            .as_ref()
-            .map(|len| match len {
-                SimdLen::Scalable => unimplemented!(),
-                SimdLen::Fixed(len) => *len,
-            })
-            .unwrap_or(1)
+    pub fn num_lanes(&self) -> SimdLen {
+        self.simd_len.unwrap_or(SimdLen::Fixed(1))
     }
 
     /// Returns the number of vectors of the type
@@ -197,97 +200,21 @@ impl IntrinsicType {
     pub fn is_ptr(&self) -> bool {
         self.ptr
     }
-
-    /// Returns the elements used in the test value arrays in `gen_arg_rust`. Uses the same
-    /// `num_lanes * num_vectors + loads - 1` arithmetic to produce the number of values that
-    /// `ArgumentList::gen_arg_rust` expects and `ArgumentList::load_values_rust` needs.
-    ///
-    /// Each value in the array starts as a bit pattern from `common::values::value_from_array`
-    /// which is then printed as a hex value in the generated code (and if identified as a negative
-    /// value, with the appropriate minus and corrected hex pattern). Calls to `fN::from_bits` are
-    /// generated for floats.
-    pub fn populate_random(&self, loads: u32) -> String {
-        match self {
-            IntrinsicType {
-                bit_len: Some(bit_len @ (1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 16 | 32 | 64)),
-                kind:
-                    kind @ (TypeKind::Int(_) | TypeKind::Poly | TypeKind::Char(_) | TypeKind::Mask),
-                vec_len,
-                ..
-            } => {
-                format!(
-                    "[\n{body}\n]",
-                    body = (0..(self.num_lanes() * vec_len.unwrap_or(1) + loads - 1)).format_with(
-                        ",\n",
-                        |i, fmt| {
-                            let src = value_for_array(*bit_len, i);
-                            assert!(src == 0 || src.ilog2() < *bit_len);
-                            if *kind == TypeKind::Int(Sign::Signed) && (src >> (*bit_len - 1)) != 0
-                            {
-                                // `src` is a two's complement representation of a negative value.
-                                let mask = !0u64 >> (64 - *bit_len);
-                                let ones_compl = src ^ mask;
-                                let twos_compl = ones_compl + 1;
-                                fmt(&format_args!("-{twos_compl:#x}"))
-                            } else {
-                                fmt(&format_args!("{src:#x}"))
-                            }
-                        }
-                    )
-                )
-            }
-            IntrinsicType {
-                kind: TypeKind::Float,
-                bit_len: Some(bit_len @ (16 | 32 | 64)),
-                vec_len,
-                ..
-            } => {
-                format!(
-                    "[\n{body}\n]",
-                    body = (0..(self.num_lanes() * vec_len.unwrap_or(1) + loads - 1)).format_with(
-                        ",\n",
-                        |i, fmt| fmt(&format_args!(
-                            "f{bit_len}::from_bits({src:#x})",
-                            src = value_for_array(*bit_len, i)
-                        ))
-                    )
-                )
-            }
-            IntrinsicType {
-                kind: TypeKind::Vector,
-                bit_len: Some(128 | 256 | 512),
-                vec_len,
-                ..
-            } => {
-                let effective_bit_len = 32;
-                format!(
-                    "[\n{body}\n]",
-                    body = (0..(vec_len.unwrap_or(1) * self.num_lanes() + loads - 1)).format_with(
-                        ",\n",
-                        |i, fmt| {
-                            let src = value_for_array(effective_bit_len, i);
-                            assert!(src == 0 || src.ilog2() < effective_bit_len);
-                            if (src >> (effective_bit_len - 1)) != 0 {
-                                // `src` is a two's complement representation of a negative value.
-                                let mask = !0u64 >> (64 - effective_bit_len);
-                                let ones_compl = src ^ mask;
-                                let twos_compl = ones_compl + 1;
-                                fmt(&format_args!("-{twos_compl:#x}"))
-                            } else {
-                                fmt(&format_args!("{src:#x}"))
-                            }
-                        }
-                    )
-                )
-            }
-            _ => unimplemented!("populate random: {self:#?}"),
-        }
-    }
 }
 
-pub trait IntrinsicTypeDefinition: Deref<Target = IntrinsicType> {
+pub trait TypeDefinition: Clone + DerefMut<Target = IntrinsicType> {
     /// Determines the load function for this type.
-    fn get_load_function(&self) -> String;
+    fn load_function(&self) -> String;
+
+    /// Determines the comparison function for this type.
+    fn comparison_function(&self) -> String {
+        match self.simd_len {
+            Some(SimdLen::Scalable) => unimplemented!("architecture-specific"),
+            Some(SimdLen::Fixed(_)) | None => {
+                default_fixed_vector_comparison(self, self.num_lanes().expect_fixed())
+            }
+        }
+    }
 
     /// Gets a string containing the typename for this type in C.
     fn c_type(&self) -> String;
@@ -298,14 +225,55 @@ pub trait IntrinsicTypeDefinition: Deref<Target = IntrinsicType> {
     /// Gets a string containing the name of the scalar type corresponding to this type if it is a
     /// vector.
     fn rust_scalar_type(&self) -> String {
-        if self.is_simd() {
-            format!(
-                "{prefix}{bits}",
-                prefix = self.kind().rust_prefix(),
-                bits = self.inner_size()
-            )
-        } else {
-            self.rust_type()
-        }
+        let mut ty = self.clone();
+        ty.simd_len = None;
+        ty.vec_len = None;
+        ty.rust_type()
     }
+
+    /// Gets a string containing the name of the scalar type corresponding to this type that should
+    /// be used as the element type for the test value array.
+    fn rust_scalar_type_for_test_value_array(&self) -> String {
+        self.rust_scalar_type()
+    }
+}
+
+/// Returns the default comparison between results of an intrinsic - casting the vectors to arrays
+/// and using `assert_eq` - using `NanEqF*` where required for floats.
+pub(crate) fn default_fixed_vector_comparison<Ty: TypeDefinition>(
+    ty: &Ty,
+    num_lanes: u32,
+) -> String {
+    let (cast_prefix, cast_suffix) = if ty.is_simd() {
+        (
+            format!(
+                "std::mem::transmute::<_, [{}; {}]>(",
+                ty.rust_scalar_type().replace("f", "NanEqF"),
+                num_lanes * ty.num_vectors()
+            ),
+            ")",
+        )
+    } else if ty.kind == TypeKind::Float {
+        (
+            match ty.inner_size() {
+                16 => format!("NanEqF16("),
+                32 => format!("NanEqF32("),
+                64 => format!("NanEqF64("),
+                _ => unimplemented!(),
+            },
+            ")",
+        )
+    } else {
+        ("".to_string(), "")
+    };
+
+    format!(
+        r#"
+assert_eq!(
+    {cast_prefix}__rust_return_value{cast_suffix},
+    {cast_prefix}__c_return_value{cast_suffix},
+    "{{id}}"
+);
+"#,
+    )
 }

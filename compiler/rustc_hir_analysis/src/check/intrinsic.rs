@@ -8,7 +8,7 @@ use rustc_span::def_id::LocalDefId;
 use rustc_span::{Span, Symbol, sym};
 
 use crate::check::check_function_signature;
-use crate::errors::{UnrecognizedIntrinsicFunction, WrongNumberOfGenericArgumentsToIntrinsic};
+use crate::diagnostics::{UnrecognizedIntrinsicFunction, WrongNumberOfGenericArgumentsToIntrinsic};
 
 fn equate_intrinsic_type<'tcx>(
     tcx: TyCtxt<'tcx>,
@@ -631,6 +631,7 @@ pub(crate) fn check_intrinsic_type(
                 vec![Ty::new_imm_ref(tcx, ty::Region::new_bound(tcx, ty::INNERMOST, br), param(0))],
                 Ty::new_projection_from_args(
                     tcx,
+                    ty::IsRigid::No,
                     discriminant_def_id,
                     tcx.mk_args(&[param(0).into()]),
                 ),

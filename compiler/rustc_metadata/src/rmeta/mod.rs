@@ -193,7 +193,14 @@ type ExpnHashTable = LazyTable<ExpnIndex, Option<LazyValue<ExpnHash>>>;
 pub(crate) struct ProcMacroData {
     proc_macro_decls_static: DefIndex,
     stability: Option<hir::Stability>,
-    macros: LazyArray<DefIndex>,
+    macros: LazyArray<(DefIndex, LazyValue<ProcMacroKind>)>,
+}
+
+#[derive(MetadataEncodable, LazyDecodable)]
+pub enum ProcMacroKind {
+    CustomDerive { trait_name: String, attributes: Vec<String> },
+    Attr { name: String },
+    Bang { name: String },
 }
 
 /// Serialized crate metadata.
@@ -364,7 +371,7 @@ macro_rules! define_tables {
         }
 
         impl TableBuilders {
-            fn encode(&self, buf: &mut FileEncoder) -> LazyTables {
+            fn encode(&self, buf: &mut FileEncoder<'_>) -> LazyTables {
                 LazyTables {
                     $($name1: self.$name1.encode(buf),)+
                     $($name2: self.$name2.encode(buf),)+
@@ -473,6 +480,8 @@ define_tables! {
     anon_const_kind: Table<DefIndex, LazyValue<ty::AnonConstKind>>,
     const_of_item: Table<DefIndex, LazyValue<ty::EarlyBinder<'static, ty::Const<'static>>>>,
     associated_types_for_impl_traits_in_trait_or_impl: Table<DefIndex, LazyValue<DefIdMap<Vec<DefId>>>>,
+    live_args_for_alias_from_outlives_bounds: Table<DefIndex, LazyValue<Option<ty::EarlyBinder<'static, Vec<ty::GenericArg<'static>>>>>>,
+    args_known_to_outlive_alias_params: Table<DefIndex, LazyValue<ty::EarlyBinder<'static, Vec<(ty::Region<'static>, Vec<ty::GenericArg<'static>>)>>>>,
 }
 
 #[derive(TyEncodable, TyDecodable)]

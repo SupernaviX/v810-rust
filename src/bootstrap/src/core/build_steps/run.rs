@@ -5,7 +5,6 @@
 
 use std::path::PathBuf;
 
-use build_helper::exit;
 use build_helper::git::get_git_untracked_files;
 use clap_complete::{Generator, shells};
 
@@ -17,7 +16,7 @@ use crate::core::builder::{Builder, Kind, RunConfig, ShouldRun, Step, StepMetada
 use crate::core::config::TargetSelection;
 use crate::core::config::flags::{get_completion, top_level_help};
 use crate::utils::exec::command;
-use crate::{Mode, t};
+use crate::{Mode, exit, t};
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct BuildManifest;
@@ -510,7 +509,7 @@ impl Step for Rustfmt {
         let compilers = RustcPrivateCompilers::new(builder, stage, host);
         let rustfmt_build = builder.ensure(tool::Rustfmt::from_compilers(compilers));
 
-        let mut rustfmt = tool::prepare_tool_cargo(
+        let mut cargo = tool::prepare_tool_cargo(
             builder,
             rustfmt_build.build_compiler,
             Mode::ToolRustcPrivate,
@@ -521,10 +520,10 @@ impl Step for Rustfmt {
             &[],
         );
 
-        rustfmt.args(["--bin", "rustfmt", "--"]);
-        rustfmt.args(builder.config.args());
+        cargo.args(["--bin", "rustfmt", "--"]);
+        cargo.args(builder.config.args());
 
-        rustfmt.into_cmd().run(builder);
+        cargo.into_cmd().run(builder);
     }
 }
 

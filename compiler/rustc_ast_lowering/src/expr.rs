@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use rustc_ast::node_id::NodeMap;
 use rustc_ast::*;
-use rustc_ast_pretty::pprust::expr_to_string;
 use rustc_data_structures::stack::ensure_sufficient_stack;
 use rustc_errors::msg;
 use rustc_hir as hir;
@@ -19,17 +18,17 @@ use visit::{Visitor, walk_expr};
 
 mod closure;
 
-use super::errors::{
+use crate::diagnostics::{
     AsyncCoroutinesNotSupported, AwaitOnlyInAsyncFnAndBlocks,
-    FunctionalRecordUpdateDestructuringAssignment, InclusiveRangeWithNoEnd, MatchArmWithNoBody,
-    MoveExprOnlyInPlainClosures, NeverPatternWithBody, NeverPatternWithGuard,
-    UnderscoreExprLhsAssign,
+    FunctionalRecordUpdateDestructuringAssignment, InclusiveRangeWithNoEnd,
+    InvalidLegacyConstGenericArg, MatchArmWithNoBody, MoveExprOnlyInPlainClosures,
+    NeverPatternWithBody, NeverPatternWithGuard, UnderscoreExprLhsAssign, UseConstGenericArg,
+    YieldInClosure,
 };
-use super::{
-    GenericArgsMode, ImplTraitContext, LoweringContext, ParamMode, ResolverAstLoweringExt,
+use crate::{
+    AllowReturnTypeNotation, GenericArgsMode, ImplTraitContext, ImplTraitPosition, LoweringContext,
+    ParamMode, ResolverAstLoweringExt, TryBlockScope,
 };
-use crate::errors::{InvalidLegacyConstGenericArg, UseConstGenericArg, YieldInClosure};
-use crate::{AllowReturnTypeNotation, ImplTraitPosition, TryBlockScope};
 
 pub(super) struct WillCreateDefIdsVisitor;
 
@@ -499,6 +498,18 @@ impl<'hir> LoweringContext<'_, 'hir> {
                 }
 
                 ExprKind::MacCall(_) => panic!("{:?} shouldn't exist here", e.span),
+
+                ExprKind::DirectConstArg(_) => {
+                    let e = self
+                        .tcx
+                        .dcx()
+                        .struct_span_err(
+                            e.span,
+                            "expected expression, found `direct_const_arg!()` constant",
+                        )
+                        .emit();
+                    hir::ExprKind::Err(e)
+                }
             };
 
             hir::Expr { hir_id: expr_hir_id, kind, span }
@@ -557,13 +568,16 @@ impl<'hir> LoweringContext<'_, 'hir> {
         let mut invalid_expr_error = |tcx: TyCtxt<'_>, span| {
             // Avoid emitting the error multiple times.
             if error.is_none() {
+                let sm = tcx.sess.source_map();
                 let mut const_args = vec![];
                 let mut other_args = vec![];
                 for (idx, arg) in args.iter().enumerate() {
-                    if legacy_args_idx.contains(&idx) {
-                        const_args.push(format!("{{ {} }}", expr_to_string(arg)));
-                    } else {
-                        other_args.push(expr_to_string(arg));
+                    if let Ok(arg) = sm.span_to_snippet(arg.span) {
+                        if legacy_args_idx.contains(&idx) {
+                            const_args.push(format!("{{ {} }}", arg));
+                        } else {
+                            other_args.push(arg);
+                        }
                     }
                 }
                 let suggestion = UseConstGenericArg {
@@ -597,11 +611,7 @@ impl<'hir> LoweringContext<'_, 'hir> {
                         arg
                     };
 
-                let anon_const = AnonConst {
-                    id: node_id,
-                    value: const_value,
-                    mgca_disambiguation: MgcaDisambiguation::AnonConst,
-                };
+                let anon_const = AnonConst { id: node_id, value: const_value };
                 generic_args.push(AngleBracketedArg::Arg(GenericArg::Const(anon_const)));
             } else {
                 real_args.push(arg);

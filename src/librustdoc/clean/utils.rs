@@ -323,7 +323,7 @@ pub(crate) fn name_from_pat(p: &hir::Pat<'_>) -> Symbol {
             warn!(
                 "tried to get argument name from PatKind::Expr, which is silly in function arguments"
             );
-            return Symbol::intern("()");
+            return sym::empty_parens;
         }
         PatKind::Slice(begin, mid, end) => {
             fn print_pat(pat: &Pat<'_>, wild: bool) -> impl Display {
@@ -350,13 +350,19 @@ pub(crate) fn name_from_pat(p: &hir::Pat<'_>) -> Symbol {
 
 pub(crate) fn print_const(tcx: TyCtxt<'_>, n: ty::Const<'_>) -> String {
     match n.kind() {
-        ty::ConstKind::Unevaluated(ty::UnevaluatedConst { def, args: _ }) => {
-            if let Some(def) = def.as_local()
-                && let Some(body_id) = tcx.hir_maybe_body_owned_by(def)
+        ty::ConstKind::Alias(_, ty::AliasConst { kind, .. }) => {
+            let def_id: DefId = match kind {
+                ty::AliasConstKind::Projection { def_id } => def_id.into(),
+                ty::AliasConstKind::Inherent { def_id } => def_id.into(),
+                ty::AliasConstKind::Free { def_id } => def_id.into(),
+                ty::AliasConstKind::Anon { def_id } => def_id.into(),
+            };
+            if let Some(local_def_id) = def_id.as_local()
+                && let Some(body_id) = tcx.hir_maybe_body_owned_by(local_def_id)
             {
-                rendered_const(tcx, body_id, def)
+                rendered_const(tcx, body_id, local_def_id)
             } else {
-                inline::print_inlined_const(tcx, def)
+                n.to_string()
             }
         }
         // array lengths are obviously usize

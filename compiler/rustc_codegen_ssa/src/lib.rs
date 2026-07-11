@@ -2,6 +2,7 @@
 #![feature(deref_patterns)]
 #![feature(file_buffered)]
 #![feature(negative_impls)]
+#![feature(option_into_flat_iter)]
 #![feature(string_from_utf8_lossy_owned)]
 #![feature(trait_alias)]
 #![feature(try_blocks)]
@@ -39,7 +40,7 @@ use rustc_session::Session;
 use rustc_session::config::{CrateType, OutputFilenames, OutputType};
 use rustc_session::cstore::{self, CrateSource};
 use rustc_session::lint::builtin::LINKER_MESSAGES;
-use rustc_span::Symbol;
+use rustc_span::{Span, Symbol};
 
 pub mod assert_module_sources;
 pub mod back;
@@ -162,11 +163,16 @@ pub enum ModuleKind {
 }
 
 bitflags::bitflags! {
+    /// This previously had an `UNALIGNED` variant, but that should never be done via flags.
+    /// If you want something to be unaligned, see [`mir::place::PlaceRef::unaligned`].
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct MemFlags: u8 {
         const VOLATILE = 1 << 0;
         const NONTEMPORAL = 1 << 1;
-        const UNALIGNED = 1 << 2;
+        /// Indicates that writing through the stored pointer is undefined behavior.
+        /// Only valid on stores of pointers, or pairs where the first element is a pointer.
+        /// In the latter case, the flag only applies to the first element of the pair.
+        const CAPTURES_READ_ONLY = 1 << 3;
     }
 }
 
@@ -229,6 +235,41 @@ impl From<&cstore::NativeLib> for NativeLib {
     }
 }
 
+/// A symbol to make visible from a linked artifact.
+#[derive(Clone, Debug, Encodable, Decodable)]
+pub struct SymbolExport {
+    /// Name to make visible from the linked artifact.
+    pub name: String,
+    /// Kind of symbol, used for target-specific export directives and name decoration.
+    pub kind: SymbolExportKind,
+    /// Name of the symbol as seen by the linker, when it differs from `name`.
+    pub link_name: Option<String>,
+}
+
+impl SymbolExport {
+    pub fn new(name: String, kind: SymbolExportKind) -> SymbolExport {
+        SymbolExport { name, kind, link_name: None }
+    }
+
+    pub fn with_link_name(name: String, kind: SymbolExportKind, link_name: String) -> SymbolExport {
+        let link_name = if link_name == name { None } else { Some(link_name) };
+        SymbolExport { name, kind, link_name }
+    }
+}
+
+#[derive(Clone, Debug, Encodable, Decodable)]
+pub struct EiiLinkageImplInfo {
+    pub span: Span,
+    pub impl_crate: CrateNum,
+}
+
+#[derive(Clone, Debug, Encodable, Decodable)]
+pub struct EiiLinkageInfo {
+    pub name: Symbol,
+    pub impls: Vec<EiiLinkageImplInfo>,
+    pub default_impl: Option<EiiLinkageImplInfo>,
+}
+
 /// Misc info we load from metadata to persist beyond the tcx.
 ///
 /// Note: though `CrateNum` is only meaningful within the same tcx, information within `CrateInfo`
@@ -243,7 +284,7 @@ pub struct CrateInfo {
     pub target_cpu: String,
     pub target_features: Vec<String>,
     pub crate_types: Vec<CrateType>,
-    pub exported_symbols: UnordMap<CrateType, Vec<(String, SymbolExportKind)>>,
+    pub exported_symbols: UnordMap<CrateType, Vec<SymbolExport>>,
     pub linked_symbols: FxIndexMap<CrateType, Vec<(String, SymbolExportKind)>>,
     pub local_crate_name: Symbol,
     pub compiler_builtins: Option<CrateNum>,
@@ -255,10 +296,14 @@ pub struct CrateInfo {
     pub used_crate_source: UnordMap<CrateNum, Arc<CrateSource>>,
     pub used_crates: Vec<CrateNum>,
     pub dependency_formats: Arc<Dependencies>,
+    /// EII implementations used by the link-time duplicate check, so `-Zno-link` can serialize the data needed by a
+    /// later `-Zlink-only` invocation.
+    pub eii_linkage: Vec<EiiLinkageInfo>,
     pub windows_subsystem: Option<WindowsSubsystemKind>,
     pub natvis_debugger_visualizers: BTreeSet<DebuggerVisualizerFile>,
     pub lint_level_specs: CodegenLintLevelSpecs,
     pub metadata_symbol: String,
+    pub symbol_rename_suffix: String,
     pub each_linked_rlib_file_for_lto: Vec<PathBuf>,
     pub exported_symbols_for_lto: Vec<String>,
 }

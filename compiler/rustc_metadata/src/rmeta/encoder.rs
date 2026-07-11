@@ -35,12 +35,12 @@ use rustc_span::{
 };
 use tracing::{debug, instrument, trace};
 
+use crate::diagnostics::{FailCreateFileEncoder, FailWriteFile};
 use crate::eii::EiiMapEncodedKeyValue;
-use crate::errors::{FailCreateFileEncoder, FailWriteFile};
 use crate::rmeta::*;
 
 pub(super) struct EncodeContext<'a, 'tcx> {
-    opaque: opaque::FileEncoder,
+    opaque: opaque::FileEncoder<'a>,
     tcx: TyCtxt<'tcx>,
     feat: &'tcx rustc_feature::Features,
     tables: TableBuilders,
@@ -1108,7 +1108,7 @@ fn should_encode_mir(
         // instance_mir uses mir_for_ctfe rather than optimized_mir for constructors
         DefKind::Ctor(_, _) => (true, false),
         // Constants
-        DefKind::AnonConst { .. }
+        DefKind::AnonConst
         | DefKind::InlineConst
         | DefKind::AssocConst { .. }
         | DefKind::Const { .. } => (true, false),
@@ -1122,6 +1122,9 @@ fn should_encode_mir(
                     && reachable_set.contains(&def_id)
                     && (tcx.generics_of(def_id).requires_monomorphization(tcx)
                         || tcx.cross_crate_inlinable(def_id)));
+            // Comptime fns do not have optimized MIR at all.
+            let opt =
+                opt && !matches!(tcx.constness(def_id), hir::Constness::Const { always: true });
             // The function has a `const` modifier or is in a `const trait`.
             let is_const_fn = tcx.is_const_fn(def_id.to_def_id());
             (is_const_fn, opt)
@@ -1153,6 +1156,7 @@ fn should_encode_variances<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId, def_kind: Def
         | DefKind::Static { .. }
         | DefKind::Const { .. }
         | DefKind::ForeignMod
+        | DefKind::TyAlias
         | DefKind::Impl { .. }
         | DefKind::Trait
         | DefKind::TraitAlias
@@ -1166,7 +1170,6 @@ fn should_encode_variances<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId, def_kind: Def
         | DefKind::Closure
         | DefKind::ExternCrate
         | DefKind::SyntheticCoroutineBody => false,
-        DefKind::TyAlias => tcx.type_alias_is_lazy(def_id),
     }
 }
 
@@ -1435,27 +1438,11 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
             // for trivial const arguments which are directly lowered to
             // `ConstArgKind::Path`. We never actually access this `DefId`
             // anywhere so we don't need to encode it for other crates.
+            // FIXME(mgca): This probably isn't true, they probably are accessed, but, test case?
             if def_kind == DefKind::AnonConst
-                && match tcx.hir_node_by_def_id(local_id) {
-                    hir::Node::ConstArg(hir::ConstArg { kind, .. }) => match kind {
-                        // Skip encoding defs for these as they should not have had a `DefId` created
-                        hir::ConstArgKind::Error(..)
-                        | hir::ConstArgKind::Struct(..)
-                        | hir::ConstArgKind::Array(..)
-                        | hir::ConstArgKind::TupleCall(..)
-                        | hir::ConstArgKind::Tup(..)
-                        | hir::ConstArgKind::Path(..)
-                        | hir::ConstArgKind::Literal { .. }
-                        | hir::ConstArgKind::Infer(..) => true,
-                        hir::ConstArgKind::Anon(..) => false,
-                    },
-                    _ => false,
-                }
+                && matches!(tcx.hir_node_by_def_id(local_id), hir::Node::ConstArg(_))
             {
-                // MGCA doesn't have unnecessary DefIds
-                if !tcx.features().min_generic_const_args() {
-                    continue;
-                }
+                continue;
             }
 
             if def_kind == DefKind::Field
@@ -1533,7 +1520,7 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
             if let Some(name) = tcx.intrinsic(def_id) {
                 record!(self.tables.intrinsic[def_id] <- name);
             }
-            if let DefKind::TyParam = def_kind {
+            if let DefKind::TyParam | DefKind::Trait = def_kind {
                 let default = self.tcx.object_lifetime_default(def_id);
                 record!(self.tables.object_lifetime_default[def_id] <- default);
             }
@@ -1610,6 +1597,9 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
                 self.tables
                     .type_alias_is_lazy
                     .set(def_id.index, self.tcx.type_alias_is_lazy(def_id));
+                if self.tcx.type_alias_is_lazy(def_id) {
+                    record!(self.tables.args_known_to_outlive_alias_params[def_id] <- tcx.args_known_to_outlive_alias_params(def_id));
+                }
             }
             if let DefKind::OpaqueTy = def_kind {
                 self.encode_explicit_item_bounds(def_id);
@@ -1620,8 +1610,21 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
                     record_defaulted_array!(self.tables.explicit_implied_const_bounds[def_id]
                         <- tcx.explicit_implied_const_bounds(def_id).skip_binder());
                 }
+                record!(self.tables.args_known_to_outlive_alias_params[def_id] <- tcx.args_known_to_outlive_alias_params(def_id));
             }
-            if let DefKind::AnonConst = def_kind {
+            if let DefKind::AssocTy = def_kind {
+                let assoc_item = tcx.associated_item(def_id);
+                match assoc_item.container {
+                    ty::AssocContainer::Trait => {
+                        record!(self.tables.args_known_to_outlive_alias_params[def_id] <- tcx.args_known_to_outlive_alias_params(def_id));
+                    }
+                    ty::AssocContainer::InherentImpl => {
+                        record!(self.tables.args_known_to_outlive_alias_params[def_id] <- tcx.args_known_to_outlive_alias_params(def_id));
+                    }
+                    ty::AssocContainer::TraitImpl(_) => {}
+                }
+            }
+            if let DefKind::AnonConst | DefKind::InlineConst = def_kind {
                 record!(self.tables.anon_const_kind[def_id] <- self.tcx.anon_const_kind(def_id));
             }
             if should_encode_const_of_item(self.tcx, def_id, def_kind) {
@@ -1984,8 +1987,6 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
             let tcx = self.tcx;
             let proc_macro_decls_static = tcx.proc_macro_decls_static(()).unwrap().local_def_index;
             let stability = tcx.lookup_stability(CRATE_DEF_ID);
-            let macros =
-                self.lazy_array(tcx.resolutions(()).proc_macros.iter().map(|p| p.local_def_index));
             for (i, span) in self.tcx.sess.proc_macro_quoted_spans() {
                 let span = self.lazy(span);
                 self.tables.proc_macro_quoted_spans.set_some(i, span);
@@ -2007,6 +2008,8 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
                 record_array!(self.tables.doc_link_traits_in_scope[LOCAL_CRATE.as_def_id()] <- traits);
             }
 
+            let mut macros = vec![];
+
             // Normally, this information is encoded when we walk the items
             // defined in this crate. However, we skip doing that for proc-macro crates,
             // so we manually encode just the information that we need
@@ -2018,18 +2021,29 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
                 // Proc-macros may have attributes like `#[allow_internal_unstable]`,
                 // so downstream crates need access to them.
                 let attrs = tcx.hir_attrs(proc_macro);
-                let macro_kind = if find_attr!(attrs, ProcMacro) {
-                    MacroKind::Bang
+                let (macro_kind, kind) = if find_attr!(attrs, ProcMacro) {
+                    (MacroKind::Bang, ProcMacroKind::Bang { name: name.as_str().to_owned() })
                 } else if find_attr!(attrs, ProcMacroAttribute) {
-                    MacroKind::Attr
-                } else if let Some(trait_name) =
-                    find_attr!(attrs, ProcMacroDerive { trait_name, ..} => trait_name)
+                    (MacroKind::Attr, ProcMacroKind::Attr { name: name.as_str().to_owned() })
+                } else if let Some((trait_name, helper_attrs)) = find_attr!(attrs,
+                    ProcMacroDerive { trait_name, helper_attrs } => (trait_name, helper_attrs))
                 {
                     name = *trait_name;
-                    MacroKind::Derive
+                    (
+                        MacroKind::Derive,
+                        ProcMacroKind::CustomDerive {
+                            trait_name: name.as_str().to_owned(),
+                            attributes: helper_attrs
+                                .iter()
+                                .map(|attr| attr.as_str().to_owned())
+                                .collect(),
+                        },
+                    )
                 } else {
                     bug!("Unknown proc-macro type for item {:?}", id);
                 };
+
+                macros.push((id.local_def_index, self.lazy(kind)));
 
                 let mut def_key = self.tcx.hir_def_key(id);
                 def_key.disambiguated_data.data = DefPathData::MacroNs(name);
@@ -2045,6 +2059,8 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
                     record!(self.tables.lookup_stability[def_id] <- stability);
                 }
             }
+
+            let macros = self.lazy_array(macros);
 
             Some(ProcMacroData { proc_macro_decls_static, stability, macros })
         } else {
@@ -2456,10 +2472,10 @@ pub fn encode_metadata(tcx: TyCtxt<'_>, path: &Path, ref_path: Option<&Path>) {
         && tcx.dep_graph.try_mark_green(tcx, &dep_node).is_some()
     {
         let saved_path = &work_product.saved_files["rmeta"];
-        let incr_comp_session_dir = tcx.sess.incr_comp_session_dir_opt().unwrap();
-        let source_file = rustc_incremental::in_incr_comp_dir(&incr_comp_session_dir, saved_path);
-        debug!("copying preexisting metadata from {source_file:?} to {path:?}");
-        match rustc_fs_util::link_or_copy(&source_file, path) {
+        let incr_comp_session_dir = tcx.sess.incr_comp_session_dir();
+        let source_file_in_incr_dir = &incr_comp_session_dir.join(saved_path);
+        debug!("copying preexisting metadata from {source_file_in_incr_dir:?} to {path:?}");
+        match rustc_fs_util::link_or_copy(&source_file_in_incr_dir, path) {
             Ok(_) => {}
             Err(err) => tcx.dcx().emit_fatal(FailCreateFileEncoder { err }),
         };

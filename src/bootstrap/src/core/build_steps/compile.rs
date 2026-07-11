@@ -38,7 +38,7 @@ use crate::utils::helpers::{
 };
 use crate::{
     CLang, CodegenBackendKind, Compiler, DependencyType, FileType, GitRepo, LLVM_TOOLS, Mode,
-    debug, trace,
+    debug, exit, trace,
 };
 
 /// Build a standard library for the given `target` using the given `build_compiler`.
@@ -1293,12 +1293,10 @@ pub fn rustc_cargo(
         cargo.rustflag("-Clink-args=-Wl,--icf=all");
     }
 
-    if builder.config.rust_profile_use.is_some() && builder.config.rust_profile_generate.is_some() {
-        panic!("Cannot use and generate PGO profiles at the same time");
-    }
-    let is_collecting = if let Some(path) = &builder.config.rust_profile_generate {
+    let is_collecting = if let Some(path) = &builder.config.rust_pgo.generate_profile {
         if build_compiler.stage == 1 {
-            cargo.rustflag(&format!("-Cprofile-generate={path}"));
+            cargo
+                .rustflag(&format!("-Cprofile-generate={}", path.to_str().expect("non-UTF8 path")));
             // Apparently necessary to avoid overflowing the counters during
             // a Cargo build profile
             cargo.rustflag("-Cllvm-args=-vp-counters-per-site=4");
@@ -1306,9 +1304,9 @@ pub fn rustc_cargo(
         } else {
             false
         }
-    } else if let Some(path) = &builder.config.rust_profile_use {
+    } else if let Some(path) = &builder.config.rust_pgo.use_profile {
         if build_compiler.stage == 1 {
-            cargo.rustflag(&format!("-Cprofile-use={path}"));
+            cargo.rustflag(&format!("-Cprofile-use={}", path.to_str().expect("non-UTF8 path")));
             if builder.is_verbose() {
                 cargo.rustflag("-Cllvm-args=-pgo-warn-missing-function");
             }
@@ -1464,7 +1462,7 @@ fn rustc_llvm_env(builder: &Builder<'_>, cargo: &mut Cargo, target: TargetSelect
     // found. This is to avoid the linker errors about undefined references to
     // `__llvm_profile_instrument_memop` when linking `rustc_driver`.
     let mut llvm_linker_flags = String::new();
-    if builder.config.llvm_profile_generate
+    if builder.config.llvm_pgo.generate_profile.is_some()
         && target.is_msvc()
         && let Some(ref clang_cl_path) = builder.config.llvm_clang_cl
     {
@@ -1917,7 +1915,7 @@ pub fn compiler_file(
         return PathBuf::new();
     }
     let mut cmd = command(compiler);
-    cmd.args(builder.cc_handled_clags(target, c));
+    cmd.args(builder.cc_handled_cflags(target, c));
     cmd.args(builder.cc_unhandled_cflags(target, GitRepo::Rustc, c));
     cmd.arg(format!("-print-file-name={file}"));
     let out = cmd.run_capture_stdout(builder).stdout();
@@ -1999,12 +1997,16 @@ impl Step for Sysroot {
             }
 
             // Copy the compiler into the correct sysroot.
-            // NOTE(#108767): We intentionally don't copy `rustc-dev` artifacts until they're requested with `builder.ensure(Rustc)`.
-            // This fixes an issue where we'd have multiple copies of libc in the sysroot with no way to tell which to load.
-            // There are a few quirks of bootstrap that interact to make this reliable:
+            //
+            // FIXME(#156525): investigate if this is still needed.
+            //
+            // NOTE(#108767): We intentionally don't copy `rustc-dev` artifacts until they're
+            // requested with `builder.ensure(Rustc)`. This fixes an issue where we'd have multiple
+            // copies of libc in the sysroot with no way to tell which to load. There are a few
+            // quirks of bootstrap that interact to make this reliable:
             // 1. The order `Step`s are run is hard-coded in `builder.rs` and not configurable. This
-            //    avoids e.g. reordering `test::UiFulldeps` before `test::Ui` and causing the latter to
-            //    fail because of duplicate metadata.
+            //    avoids e.g. reordering `test::UiFulldeps` before `test::Ui` and causing the latter
+            //    to fail because of duplicate metadata.
             // 2. The sysroot is deleted and recreated between each invocation, so running `x test
             //    ui-fulldeps && x test ui` can't cause failures.
             let mut filtered_files = Vec::new();
@@ -2064,7 +2066,7 @@ impl Step for Sysroot {
                         sysroot_lib_rustlib_src_rust.display(),
                     );
                 }
-                build_helper::exit!(1);
+                exit!(1);
             }
         }
 
@@ -2082,7 +2084,7 @@ impl Step for Sysroot {
                     builder.src.display(),
                     e,
                 );
-                build_helper::exit!(1);
+                exit!(1);
             }
         }
 
@@ -2662,8 +2664,8 @@ pub fn run_cargo(
 ) -> Vec<PathBuf> {
     // `target_root_dir` looks like $dir/$target/release
     let target_root_dir = stamp.path().parent().unwrap();
-    // `target_deps_dir` looks like $dir/$target/release/deps
-    let target_deps_dir = target_root_dir.join("deps");
+    // `target_build_dir` looks like $dir/$target/release/build
+    let target_build_dir = target_root_dir.join("build");
     // `host_root_dir` looks like $dir/release
     let host_root_dir = target_root_dir
         .parent()
@@ -2734,7 +2736,7 @@ pub fn run_cargo(
 
             // If this was output in the `deps` dir then this is a precise file
             // name (hash included) so we start tracking it.
-            if filename.starts_with(&target_deps_dir) {
+            if filename.starts_with(&target_build_dir) {
                 deps.push((filename.to_path_buf(), DependencyType::Target));
                 continue;
             }
@@ -2769,11 +2771,18 @@ pub fn run_cargo(
 
     // Ok now we need to actually find all the files listed in `toplevel`. We've
     // got a list of prefix/extensions and we basically just need to find the
-    // most recent file in the `deps` folder corresponding to each one.
-    let contents = target_deps_dir
+    // most recent file in the `build` folder corresponding to each one.
+    //
+    // Cargo's build folder is structured as `build/<pkg>/<hash>/out/<artifacts>` so
+    // we need to traverse multiple directory layers to get to actual files.
+    let read_dir = |path: &Path| path.read_dir().ok().into_iter().flatten().filter_map(Result::ok);
+    let contents = target_build_dir
         .read_dir()
-        .unwrap_or_else(|e| panic!("Couldn't read {}: {}", target_deps_dir.display(), e))
-        .map(|e| t!(e))
+        .unwrap_or_else(|e| panic!("Couldn't read {}: {}", target_build_dir.display(), e))
+        .map(|e| e.unwrap())
+        .flat_map(|e| read_dir(&e.path()))
+        .flat_map(|e| read_dir(&e.path()))
+        .flat_map(|e| read_dir(&e.path()))
         .map(|e| (e.path(), e.file_name().into_string().unwrap(), t!(e.metadata())))
         .collect::<Vec<_>>();
     for (prefix, extension, expected_len) in toplevel {
