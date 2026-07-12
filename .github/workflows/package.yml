@@ -23,7 +23,7 @@ jobs:
           - os: macos-14
             host: aarch64-apple-darwin
             free_disk: false
-          - os: ubuntu-22.04
+          - os: ubuntu-24.04
             host: x86_64-unknown-linux-gnu
             free_disk: true
     steps:
@@ -109,7 +109,7 @@ jobs:
             rust-src-v810.tar.xz
 
   release:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     needs: package
     steps:
       - id: getDate
