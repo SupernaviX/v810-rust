@@ -127,7 +127,7 @@ jobs:
       - name: Download Linux artifacts
         uses: actions/download-artifact@v5
         with:
-          name: ubuntu-22.04
+          name: ubuntu-24.04
       - name: Release
         uses: softprops/action-gh-release@v1
         with:
