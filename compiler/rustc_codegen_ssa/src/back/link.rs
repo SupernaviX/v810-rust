@@ -1009,6 +1009,18 @@ fn report_linker_output(
         });
     };
 
+    escaped_stderr = for_each(escaped_stderr.as_bytes(), |line, output| {
+        if line.contains("archive member 'lib.rmeta' is neither ET_REL nor LLVM bitcode")
+            || line.contains("archive member 'lib.rmeta-link' is neither ET_REL nor LLVM bitcode")
+        {
+            linker_info += line;
+            linker_info += "\n";
+        } else {
+            *output += line;
+            *output += "\n";
+        }
+    });
+
     let lint_msg = |msg| {
         emit_lint_base(
             sess,
