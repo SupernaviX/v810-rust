@@ -828,7 +828,15 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                     ConstraintCategory::Boring,
                 );
 
-                let sig = self.deeply_normalize(unnormalized_sig, term_location);
+                let sig = match self
+                    .deeply_normalize(ty::Unnormalized::new_wip(unnormalized_sig), term_location)
+                {
+                    Ok(sig) => sig,
+                    Err(guar) => {
+                        let _: ErrorGuaranteed = guar;
+                        return;
+                    }
+                };
                 // HACK(#114936): `WF(sig)` does not imply `WF(normalized(sig))`
                 // with built-in `Fn` implementations, since the impl may not be
                 // well-formed itself.
@@ -1709,7 +1717,9 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                 if uv.promoted.is_none() {
                     let tcx = self.tcx();
                     let def_id = uv.def;
-                    if tcx.def_kind(def_id) == DefKind::InlineConst {
+                    if tcx.def_kind(def_id) == DefKind::AnonConst
+                        && tcx.anon_const_kind(def_id) == ty::AnonConstKind::NonTypeSystemInline
+                    {
                         let def_id = def_id.expect_local();
                         let predicates = self.prove_closure_bounds(tcx, def_id, uv.args, location);
                         self.normalize_and_prove_instantiated_predicates(
@@ -1828,6 +1838,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
             }
 
             if let ty::FnDef(def_id, args) = *constant.const_.ty().kind() {
+                let args = args.no_bound_vars().unwrap();
                 let instantiated_predicates = tcx.predicates_of(def_id).instantiate(tcx, args);
                 self.normalize_and_prove_instantiated_predicates(
                     def_id,
@@ -2653,7 +2664,11 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
                 // length as the `typeck_root_args`.
                 &args[..typeck_root_args.len()]
             }
-            DefKind::InlineConst => args.as_inline_const().parent_args(),
+            DefKind::AnonConst
+                if tcx.anon_const_kind(def_id) == ty::AnonConstKind::NonTypeSystemInline =>
+            {
+                args.as_inline_const().parent_args()
+            }
             other => bug!("unexpected item {:?}", other),
         };
         let parent_args = tcx.mk_args(parent_args);

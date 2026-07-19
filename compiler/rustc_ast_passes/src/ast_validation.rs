@@ -30,7 +30,7 @@ use rustc_data_structures::fx::FxIndexMap;
 use rustc_errors::{DiagCtxtHandle, Diagnostic, LintBuffer};
 use rustc_feature::Features;
 use rustc_session::Session;
-use rustc_session::errors::feature_err;
+use rustc_session::diagnostics::feature_err;
 use rustc_session::lint::builtin::{
     DEPRECATED_WHERE_CLAUSE_LOCATION, MISSING_ABI, MISSING_UNSAFE_ON_EXTERN,
     PATTERNS_IN_FNS_WITHOUT_BODY, UNUSED_VISIBILITIES,
@@ -514,22 +514,19 @@ impl<'a> AstValidator<'a> {
     }
 
     fn check_decl_attrs(&self, fn_decl: &FnDecl) {
+        use SyntheticAttr::*;
         fn_decl
             .inputs
             .iter()
             .flat_map(|i| i.attrs.as_ref())
-            .filter(|attr| {
-                let arr = [
-                    sym::allow,
-                    sym::cfg_trace,
-                    sym::cfg_attr_trace,
-                    sym::deny,
-                    sym::expect,
-                    sym::forbid,
-                    sym::splat,
-                    sym::warn,
-                ];
-                !attr.has_any_name(&arr) && rustc_attr_parsing::is_builtin_attr(*attr)
+            .filter(|attr| match &attr.kind {
+                AttrKind::Normal(normal) => {
+                    let arr =
+                        [sym::allow, sym::deny, sym::expect, sym::forbid, sym::splat, sym::warn];
+                    !attr.has_any_name(&arr) && rustc_attr_parsing::is_builtin_attr(&normal.item)
+                }
+                AttrKind::Synthetic(CfgTrace(_) | CfgAttrTrace) => false,
+                AttrKind::DocComment(..) => true,
             })
             .for_each(|attr| {
                 if attr.is_doc_comment() {
@@ -1517,7 +1514,7 @@ impl Visitor<'_> for AstValidator<'_> {
                 }
                 visit::walk_item(self, item)
             }
-            ItemKind::Struct(ident, generics, vdata) => {
+            ItemKind::Struct(.., vdata) => {
                 self.with_tilde_const(Some(TildeConstReason::Struct { span: item.span }), |this| {
                     // Scalable vectors can only be tuple structs
                     let scalable_vector_attr =
@@ -1536,29 +1533,15 @@ impl Visitor<'_> for AstValidator<'_> {
                         }
                     }
 
-                    match vdata {
-                        VariantData::Struct { fields, .. } => {
-                            this.visit_attrs_vis_ident(&item.attrs, &item.vis, ident);
-                            this.visit_generics(generics);
-                            walk_list!(this, visit_field_def, fields);
-                        }
-                        _ => visit::walk_item(this, item),
-                    }
+                    visit::walk_item(this, item);
                 })
             }
-            ItemKind::Union(ident, generics, vdata) => {
+            ItemKind::Union(.., vdata) => {
                 if vdata.fields().is_empty() {
                     self.dcx().emit_err(diagnostics::FieldlessUnion { span: item.span });
                 }
                 self.with_tilde_const(Some(TildeConstReason::Union { span: item.span }), |this| {
-                    match vdata {
-                        VariantData::Struct { fields, .. } => {
-                            this.visit_attrs_vis_ident(&item.attrs, &item.vis, ident);
-                            this.visit_generics(generics);
-                            walk_list!(this, visit_field_def, fields);
-                        }
-                        _ => visit::walk_item(this, item),
-                    }
+                    visit::walk_item(this, item)
                 });
             }
             ItemKind::Const(ConstItem { defaultness, ident, rhs_kind, .. }) => {
@@ -1609,7 +1592,7 @@ impl Visitor<'_> for AstValidator<'_> {
                 }
                 self.check_type_no_bounds(bounds, "this context");
 
-                if self.features.lazy_type_alias() {
+                if self.features.checked_type_aliases() {
                     if let Err(err) = self.check_type_alias_where_clause_location(ty_alias) {
                         self.dcx().emit_err(err);
                     }

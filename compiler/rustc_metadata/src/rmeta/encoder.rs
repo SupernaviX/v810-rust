@@ -28,6 +28,7 @@ use rustc_middle::{bug, span_bug};
 use rustc_serialize::{Decodable, Decoder, Encodable, Encoder, opaque};
 use rustc_session::config::mitigation_coverage::DeniedPartialMitigation;
 use rustc_session::config::{CrateType, OptLevel, TargetModifier};
+use rustc_span::def_id::CRATE_MOD_ID;
 use rustc_span::hygiene::HygieneEncodeContext;
 use rustc_span::{
     ByteSymbol, ExternalSource, FileName, SourceFile, SpanData, SpanEncoder, StableSourceFileId,
@@ -916,7 +917,6 @@ fn should_encode_span(def_kind: DefKind) -> bool {
         | DefKind::ExternCrate
         | DefKind::Use
         | DefKind::AnonConst
-        | DefKind::InlineConst
         | DefKind::OpaqueTy
         | DefKind::Field
         | DefKind::Impl { .. }
@@ -962,7 +962,6 @@ fn should_encode_attrs(def_kind: DefKind) -> bool {
         | DefKind::ExternCrate
         | DefKind::ForeignMod
         | DefKind::AnonConst
-        | DefKind::InlineConst
         | DefKind::OpaqueTy
         | DefKind::LifetimeParam
         | DefKind::Static { nested: true, .. }
@@ -996,7 +995,6 @@ fn should_encode_expn_that_defined(def_kind: DefKind) -> bool {
         | DefKind::Use
         | DefKind::ForeignMod
         | DefKind::AnonConst
-        | DefKind::InlineConst
         | DefKind::OpaqueTy
         | DefKind::Field
         | DefKind::LifetimeParam
@@ -1032,7 +1030,6 @@ fn should_encode_visibility(def_kind: DefKind) -> bool {
         | DefKind::ConstParam
         | DefKind::LifetimeParam
         | DefKind::AnonConst
-        | DefKind::InlineConst
         | DefKind::Static { nested: true, .. }
         | DefKind::OpaqueTy
         | DefKind::GlobalAsm
@@ -1071,7 +1068,6 @@ fn should_encode_stability(def_kind: DefKind) -> bool {
         DefKind::Use
         | DefKind::LifetimeParam
         | DefKind::AnonConst
-        | DefKind::InlineConst
         | DefKind::GlobalAsm
         | DefKind::Closure
         | DefKind::ExternCrate
@@ -1108,10 +1104,7 @@ fn should_encode_mir(
         // instance_mir uses mir_for_ctfe rather than optimized_mir for constructors
         DefKind::Ctor(_, _) => (true, false),
         // Constants
-        DefKind::AnonConst
-        | DefKind::InlineConst
-        | DefKind::AssocConst { .. }
-        | DefKind::Const { .. } => (true, false),
+        DefKind::AnonConst | DefKind::AssocConst { .. } | DefKind::Const { .. } => (true, false),
         // Coroutines require optimized MIR to compute layout.
         DefKind::Closure if tcx.is_coroutine(def_id.to_def_id()) => (false, true),
         DefKind::SyntheticCoroutineBody => (false, true),
@@ -1165,7 +1158,6 @@ fn should_encode_variances<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId, def_kind: Def
         | DefKind::Use
         | DefKind::LifetimeParam
         | DefKind::AnonConst
-        | DefKind::InlineConst
         | DefKind::GlobalAsm
         | DefKind::Closure
         | DefKind::ExternCrate
@@ -1191,7 +1183,6 @@ fn should_encode_generics(def_kind: DefKind) -> bool {
         | DefKind::AssocFn
         | DefKind::AssocConst { .. }
         | DefKind::AnonConst
-        | DefKind::InlineConst
         | DefKind::OpaqueTy
         | DefKind::Impl { .. }
         | DefKind::Field
@@ -1228,7 +1219,6 @@ fn should_encode_type(tcx: TyCtxt<'_>, def_id: LocalDefId, def_kind: DefKind) ->
         | DefKind::Closure
         | DefKind::ConstParam
         | DefKind::AnonConst
-        | DefKind::InlineConst
         | DefKind::SyntheticCoroutineBody => true,
 
         DefKind::OpaqueTy => {
@@ -1290,7 +1280,6 @@ fn should_encode_fn_sig(def_kind: DefKind) -> bool {
         | DefKind::Closure
         | DefKind::ConstParam
         | DefKind::AnonConst
-        | DefKind::InlineConst
         | DefKind::AssocTy
         | DefKind::TyParam
         | DefKind::Trait
@@ -1327,7 +1316,6 @@ fn should_encode_constness(def_kind: DefKind) -> bool {
         | DefKind::Impl { .. }
         | DefKind::ForeignTy
         | DefKind::ConstParam
-        | DefKind::InlineConst
         | DefKind::AssocTy
         | DefKind::TyParam
         | DefKind::Trait
@@ -1348,10 +1336,7 @@ fn should_encode_constness(def_kind: DefKind) -> bool {
 fn should_encode_const(def_kind: DefKind) -> bool {
     match def_kind {
         // FIXME(mgca): should we remove Const and AssocConst here?
-        DefKind::Const { .. }
-        | DefKind::AssocConst { .. }
-        | DefKind::AnonConst
-        | DefKind::InlineConst => true,
+        DefKind::Const { .. } | DefKind::AssocConst { .. } | DefKind::AnonConst => true,
 
         DefKind::Struct
         | DefKind::Union
@@ -1471,8 +1456,10 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
                 record!(self.tables.codegen_fn_attrs[def_id] <- self.tcx.codegen_fn_attrs(def_id));
             }
             if should_encode_visibility(def_kind) {
-                let vis =
-                    self.tcx.local_visibility(local_id).map_id(|def_id| def_id.local_def_index);
+                let vis = self
+                    .tcx
+                    .local_visibility(local_id)
+                    .map_id(|mod_id| mod_id.to_local_def_id().local_def_index);
                 record!(self.tables.visibility[def_id] <- vis);
             }
             if should_encode_stability(def_kind) {
@@ -1595,9 +1582,9 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
             }
             if let DefKind::TyAlias = def_kind {
                 self.tables
-                    .type_alias_is_lazy
-                    .set(def_id.index, self.tcx.type_alias_is_lazy(def_id));
-                if self.tcx.type_alias_is_lazy(def_id) {
+                    .type_alias_is_checked
+                    .set(def_id.index, self.tcx.type_alias_is_checked(def_id));
+                if self.tcx.type_alias_is_checked(def_id) {
                     record!(self.tables.args_known_to_outlive_alias_params[def_id] <- tcx.args_known_to_outlive_alias_params(def_id));
                 }
             }
@@ -1624,7 +1611,7 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
                     ty::AssocContainer::TraitImpl(_) => {}
                 }
             }
-            if let DefKind::AnonConst | DefKind::InlineConst = def_kind {
+            if let DefKind::AnonConst = def_kind {
                 record!(self.tables.anon_const_kind[def_id] <- self.tcx.anon_const_kind(def_id));
             }
             if should_encode_const_of_item(self.tcx, def_id, def_kind) {
@@ -1995,16 +1982,18 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
             self.tables.def_kind.set_some(LOCAL_CRATE.as_def_id().index, DefKind::Mod);
             record!(self.tables.def_span[LOCAL_CRATE.as_def_id()] <- tcx.def_span(LOCAL_CRATE.as_def_id()));
             self.encode_attrs(LOCAL_CRATE.as_def_id().expect_local());
-            let vis = tcx.local_visibility(CRATE_DEF_ID).map_id(|def_id| def_id.local_def_index);
+            let vis = tcx
+                .local_visibility(CRATE_DEF_ID)
+                .map_id(|mod_id| mod_id.to_local_def_id().local_def_index);
             record!(self.tables.visibility[LOCAL_CRATE.as_def_id()] <- vis);
             if let Some(stability) = stability {
                 record!(self.tables.lookup_stability[LOCAL_CRATE.as_def_id()] <- stability);
             }
             self.encode_deprecation(LOCAL_CRATE.as_def_id());
-            if let Some(res_map) = tcx.resolutions(()).doc_link_resolutions.get(&CRATE_DEF_ID) {
+            if let Some(res_map) = tcx.resolutions(()).doc_link_resolutions.get(&CRATE_MOD_ID) {
                 record!(self.tables.doc_link_resolutions[LOCAL_CRATE.as_def_id()] <- res_map);
             }
-            if let Some(traits) = tcx.resolutions(()).doc_link_traits_in_scope.get(&CRATE_DEF_ID) {
+            if let Some(traits) = tcx.resolutions(()).doc_link_traits_in_scope.get(&CRATE_MOD_ID) {
                 record_array!(self.tables.doc_link_traits_in_scope[LOCAL_CRATE.as_def_id()] <- traits);
             }
 

@@ -10,7 +10,7 @@ use crate::diagnostics::TidyCtx;
 const ALLOWED_SOURCES: &[&str] = &[
     r#""registry+https://github.com/rust-lang/crates.io-index""#,
     // This is `rust_team_data` used by `site` in src/tools/rustc-perf,
-    r#""git+https://github.com/rust-lang/team#a5260e76d3aa894c64c56e6ddc8545b9a98043ec""#,
+    r#""git+https://github.com/rust-lang/team#db2c1ed9fbc0216e533db954cd249045c01c7406""#,
     // Custom cc-rs version so the build can pass,
     r#""git+https://github.com/SupernaviX/cc-rs.git?tag=1.2.30-v810#c93f2a84fe7f463d28b08a100909c53ad51d6ac9""#,
 ];

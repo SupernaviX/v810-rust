@@ -221,7 +221,7 @@ impl<'a, 'ra, 'tcx> visit::Visitor<'a> for DefCollector<'a, 'ra, 'tcx> {
             i.span,
             |this, feed| {
                 if let Some(ext) = opt_syn_ext {
-                    this.r.local_macro_map.insert(feed.def_id(), self.r.arenas.alloc_macro(ext));
+                    this.r.local_macro_map.insert(feed.def_id(), this.r.arenas.alloc_macro(ext));
                 }
 
                 this.with_parent(feed.def_id(), |this| {
@@ -423,8 +423,6 @@ impl<'a, 'ra, 'tcx> visit::Visitor<'a> for DefCollector<'a, 'ra, 'tcx> {
     }
 
     fn visit_anon_const(&mut self, constant: &'a AnonConst) {
-        // Note that `visit_anon_const` is skipped for AnonConst nodes wrapped in an
-        // ExprKind::ConstBlock - these are handled in visit_expr, and are DefKind::InlineConst.
         let parent =
             self.create_def(constant.id, None, DefKind::AnonConst, constant.value.span).def_id();
         self.with_parent(parent, |this| visit::walk_anon_const(this, constant));
@@ -442,17 +440,6 @@ impl<'a, 'ra, 'tcx> visit::Visitor<'a> for DefCollector<'a, 'ra, 'tcx> {
             ExprKind::Closure(..) | ExprKind::Gen(..) => {
                 let def = self.create_def(expr.id, None, DefKind::Closure, expr.span).def_id();
                 self.with_parent(def, |this| visit::walk_expr(this, expr));
-            }
-            ExprKind::ConstBlock(constant) => {
-                for attr in &expr.attrs {
-                    visit::walk_attribute(self, attr);
-                }
-
-                let def = self
-                    .create_def(constant.id, None, DefKind::InlineConst, constant.value.span)
-                    .def_id();
-                // use specifically walk_anon_const, not walk_expr, to skip self.visit_anon_const
-                self.with_parent(def, |this| visit::walk_anon_const(this, constant));
             }
             _ => visit::walk_expr(self, expr),
         }
@@ -570,11 +557,18 @@ impl<'a, 'ra, 'tcx> visit::Visitor<'a> for DefCollector<'a, 'ra, 'tcx> {
     }
 
     fn visit_attribute(&mut self, attr: &'a Attribute) {
+        use SyntheticAttr::*;
         let orig_in_attr = mem::replace(&mut self.invocation_parent.in_attr, true);
-        if !attr.is_doc_comment() && attr::is_builtin_attr(attr) {
-            self.r
-                .builtin_attrs
-                .push((attr.get_normal_item().path.segments[0].ident, self.parent_scope));
+        match &attr.kind {
+            AttrKind::Normal(normal) => {
+                if attr::is_builtin_attr(&normal.item) {
+                    self.r
+                        .builtin_attrs
+                        .push((normal.item.path.segments[0].ident, self.parent_scope));
+                }
+            }
+            AttrKind::Synthetic(CfgTrace(_) | CfgAttrTrace) => {}
+            AttrKind::DocComment(..) => {}
         }
         visit::walk_attribute(self, attr);
         self.invocation_parent.in_attr = orig_in_attr;
@@ -606,12 +600,7 @@ impl<'a, 'ra, 'tcx> visit::Visitor<'a> for DefCollector<'a, 'ra, 'tcx> {
                 }
                 InlineAsmOperand::Const { anon_const } => {
                     let def = self
-                        .create_def(
-                            anon_const.id,
-                            None,
-                            DefKind::InlineConst,
-                            anon_const.value.span,
-                        )
+                        .create_def(anon_const.id, None, DefKind::AnonConst, anon_const.value.span)
                         .def_id();
                     self.with_parent(def, |this| visit::walk_anon_const(this, anon_const));
                 }

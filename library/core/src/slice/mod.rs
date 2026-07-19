@@ -906,16 +906,12 @@ impl<T> [T] {
     #[inline]
     #[track_caller]
     pub const fn swap(&mut self, a: usize, b: usize) {
-        // FIXME: use swap_unchecked here (https://github.com/rust-lang/rust/pull/88540#issuecomment-944344343)
-        // Can't take two mutable loans from one vector, so instead use raw pointers.
-        let pa = &raw mut self[a];
-        let pb = &raw mut self[b];
-        // SAFETY: `pa` and `pb` have been created from safe mutable references and refer
-        // to elements in the slice and therefore are guaranteed to be valid and aligned.
-        // Note that accessing the elements behind `a` and `b` is checked and will
-        // panic when out of bounds.
+        // Bounds checks that panic exactly like indexing would.
+        let _ = &self[a];
+        let _ = &self[b];
+        // SAFETY: `a` and `b` were checked to be in bounds above.
         unsafe {
-            ptr::swap(pa, pb);
+            self.swap_unchecked(a, b);
         }
     }
 
@@ -2759,7 +2755,7 @@ impl<T> [T] {
     /// assert_eq!(v.strip_circumfix(&[10, 50, 40], &[50, 40, 30]), None);
     /// ```
     #[must_use = "returns the subslice without modifying the original"]
-    #[stable(feature = "strip_circumfix", since = "CURRENT_RUSTC_VERSION")]
+    #[stable(feature = "strip_circumfix", since = "1.98.0")]
     pub fn strip_circumfix<S, P>(&self, prefix: &P, suffix: &S) -> Option<&[T]>
     where
         T: PartialEq,
@@ -5321,7 +5317,7 @@ impl<T> [T] {
     /// assert_eq!(iter.next(), Some(Range { start: 5, end: 6 }));
     /// ```
     #[must_use]
-    #[stable(feature = "substr_range", since = "CURRENT_RUSTC_VERSION")]
+    #[stable(feature = "substr_range", since = "1.98.0")]
     pub fn subslice_range(&self, subslice: &[T]) -> Option<core::range::Range<usize>> {
         if T::IS_ZST {
             panic!("elements are zero-sized");

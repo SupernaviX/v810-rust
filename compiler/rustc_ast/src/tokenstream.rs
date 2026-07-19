@@ -18,7 +18,7 @@ use rustc_span::{DUMMY_SP, Span, SpanDecoder, SpanEncoder, Symbol, sym};
 use thin_vec::ThinVec;
 
 use crate::ast::AttrStyle;
-use crate::ast_traits::{HasAttrs, HasTokens};
+use crate::ast_traits::HasTokens;
 use crate::token::{self, Delimiter, Token, TokenKind};
 use crate::{AttrVec, Attribute};
 
@@ -89,6 +89,22 @@ impl TokenTree {
             },
             _ => Cow::Borrowed(self),
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct WithTokens<T> {
+    pub node: T,
+    pub tokens: Option<LazyAttrTokenStream>,
+}
+
+impl<T> WithTokens<T> {
+    pub fn new(node: T) -> WithTokens<T> {
+        WithTokens { node, tokens: None }
+    }
+
+    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> WithTokens<U> {
+        WithTokens { node: f(self.node), tokens: self.tokens }
     }
 }
 
@@ -637,7 +653,7 @@ impl TokenStream {
         TokenStream::new(vec![TokenTree::token_alone(kind, span)])
     }
 
-    pub fn from_ast(node: &(impl HasAttrs + HasTokens + fmt::Debug)) -> TokenStream {
+    pub fn from_ast(node: &(impl HasTokens + fmt::Debug)) -> TokenStream {
         let tokens = node.tokens().unwrap_or_else(|| panic!("missing tokens for node: {:?}", node));
         let mut tts = vec![];
         attrs_and_tokens_to_token_trees(node.attrs(), tokens, &mut tts);

@@ -13,7 +13,7 @@ use rustc_hir::def_id::{DefId, LocalDefId, LocalDefIdMap};
 use rustc_middle::metadata::{AmbigModChild, ModChild, Reexport};
 use rustc_middle::span_bug;
 use rustc_middle::ty::Visibility;
-use rustc_session::errors::feature_err;
+use rustc_session::diagnostics::feature_err;
 use rustc_session::lint::LintId;
 use rustc_session::lint::builtin::{
     AMBIGUOUS_GLOB_REEXPORTS, EXPORTED_PRIVATE_DEPENDENCIES, HIDDEN_GLOB_REEXPORTS,
@@ -25,13 +25,13 @@ use rustc_span::{Ident, Span, Symbol, kw, sym};
 use tracing::debug;
 
 use crate::Namespace::{self, *};
+use crate::diagnostics::impls::{OnUnknownData, Suggestion};
 use crate::diagnostics::{
     self, CannotBeReexportedCratePublic, CannotBeReexportedCratePublicNS,
     CannotBeReexportedPrivate, CannotBeReexportedPrivateNS, CannotDetermineImportResolution,
     CannotGlobImportAllCrates, ConsiderAddingMacroExport, ConsiderMarkingAsPub,
     ConsiderMarkingAsPubCrate,
 };
-use crate::error_helper::{OnUnknownData, Suggestion};
 use crate::ref_mut::{CmCell, CmRefCell};
 use crate::{
     AmbiguityError, BindingKey, CmResolver, Decl, DeclData, DeclKind, Determinacy, Finalize,
@@ -473,7 +473,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
             kind: DeclKind::Import { source_decl: decl, import },
             ambiguity: CmCell::new(None),
             span: import.span,
-            initial_vis: vis.to_def_id(),
+            initial_vis: vis.to_mod_id(),
             ambiguity_vis_max: CmCell::new(None),
             ambiguity_vis_min: CmCell::new(None),
             expansion: import.parent_scope.expansion,
@@ -821,7 +821,9 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                 ) => {
                     self.per_ns(|this, ns| {
                         match import_decls[ns] {
-                            PendingDecl::Ready(Some(import_decl)) => {
+                            PendingDecl::Ready(Some(decl)) => {
+                                // We need the `target`, `source` can be extracted.
+                                let import_decl = this.new_import_decl(decl, import);
                                 if import_decl.is_assoc_item()
                                     && !this.features.import_trait_associated_functions()
                                 {
@@ -1151,11 +1153,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                 Some(import),
             );
             let pending_decl = match binding_result {
-                Ok(binding) => {
-                    // We need the `target`, `source` can be extracted.
-                    let import_decl = this.new_import_decl(binding, import);
-                    PendingDecl::Ready(Some(import_decl))
-                }
+                Ok(binding) => PendingDecl::Ready(Some(binding)),
                 Err(Determinacy::Determined) => PendingDecl::Ready(None),
                 Err(Determinacy::Undetermined) => {
                     indeterminate_count += 1;
@@ -1648,7 +1646,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
         ns: Namespace,
     ) -> Option<BufferedEarlyLint> {
         let crate_private_reexport = match decl.vis() {
-            Visibility::Restricted(def_id) if def_id.is_top_level_module() => true,
+            Visibility::Restricted(mod_id) if mod_id.is_top_level_module() => true,
             _ => false,
         };
 

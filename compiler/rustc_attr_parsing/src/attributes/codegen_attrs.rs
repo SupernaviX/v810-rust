@@ -2,7 +2,7 @@ use rustc_feature::AttributeStability;
 use rustc_hir::attrs::{
     CoverageAttrKind, InstrumentFnAttr, OptimizeAttr, RtsanSetting, SanitizerSet, UsedBy,
 };
-use rustc_session::errors::feature_err;
+use rustc_session::diagnostics::feature_err;
 use rustc_span::edition::Edition::Edition2024;
 
 use super::prelude::*;
@@ -248,9 +248,6 @@ impl AttributeParser for NakedParser {
         // NOTE: when making changes to this list, check that `error_codes/E0736.md` remains
         // accurate.
         const ALLOW_LIST: &[rustc_span::Symbol] = &[
-            // conditional compilation
-            sym::cfg_trace,
-            sym::cfg_attr_trace,
             // testing (allowed here so better errors can be generated in `rustc_builtin_macros::test`)
             sym::test,
             sym::ignore,

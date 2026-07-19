@@ -183,22 +183,13 @@ fn eq_expr(l: &Expr, r: &Expr) -> bool {
         (While(lc, lt, ll), While(rc, rt, rl)) => {
             eq_label(ll.as_ref(), rl.as_ref()) && eq_expr(lc, rc) && eq_block(lt, rt)
         },
-        (
-            ForLoop {
-                pat: lp,
-                iter: li,
-                body: lt,
-                label: ll,
-                kind: lk,
-            },
-            ForLoop {
-                pat: rp,
-                iter: ri,
-                body: rt,
-                label: rl,
-                kind: rk,
-            },
-        ) => eq_label(ll.as_ref(), rl.as_ref()) && eq_pat(lp, rp) && eq_expr(li, ri) && eq_block(lt, rt) && lk == rk,
+        (ForLoop(lf), ForLoop(rf)) => {
+            eq_label(lf.label.as_ref(), rf.label.as_ref())
+                && eq_pat(&lf.pat, &rf.pat)
+                && eq_expr(&lf.iter, &rf.iter)
+                && eq_block(&lf.body, &rf.body)
+                && lf.kind == rf.kind
+        }
         (Loop(lt, ll, _), Loop(rt, rl, _)) => eq_label(ll.as_ref(), rl.as_ref()) && eq_block(lt, rt),
         (Block(lb, ll), Block(rb, rl)) => eq_label(ll.as_ref(), rl.as_ref()) && eq_block(lb, rb),
         (TryBlock(lb, lt), TryBlock(rb, rt)) => eq_block(lb, rb) && both(lt.as_deref(), rt.as_deref(), eq_ty),
@@ -1013,18 +1004,11 @@ fn eq_attr(l: &Attribute, r: &Attribute) -> bool {
         && match (&l.kind, &r.kind) {
             (DocComment(l1, l2), DocComment(r1, r2)) => l1 == r1 && l2 == r2,
             (Normal(l), Normal(r)) => {
-                eq_path(&l.item.path, &r.item.path) && eq_attr_item_kind(&l.item.args, &r.item.args)
+                eq_path(&l.item.path, &r.item.path) && eq_attr_args(&l.item.args, &r.item.args)
             },
+            (Synthetic(..), _) | (_, Synthetic(..)) => unreachable!(),
             _ => false,
         }
-}
-
-fn eq_attr_item_kind(l: &AttrItemKind, r: &AttrItemKind) -> bool {
-    match (l, r) {
-        (AttrItemKind::Unparsed(l), AttrItemKind::Unparsed(r)) => eq_attr_args(l, r),
-        (AttrItemKind::Parsed(_l), AttrItemKind::Parsed(_r)) => todo!(),
-        _ => false,
-    }
 }
 
 fn eq_attr_args(l: &AttrArgs, r: &AttrArgs) -> bool {
@@ -1051,8 +1035,8 @@ pub fn is_cfg_test(item: &impl HasAttrs) -> bool {
             && item_list.iter().any(|item| item.has_name(sym::test))
         {
             true
-        } else if attr.has_name(sym::cfg_trace)
-            && let AttrItemKind::Parsed(EarlyParsedAttribute::CfgTrace(cfg)) = &attr.get_normal_item().args
+        } else if let AttrKind::Synthetic(synthetic) = &attr.kind
+            && let SyntheticAttr::CfgTrace(cfg) = &**synthetic
         {
             requires_test_cfg(cfg)
         } else {

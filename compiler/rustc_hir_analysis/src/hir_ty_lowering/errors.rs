@@ -16,7 +16,7 @@ use rustc_middle::ty::{
     self, AdtDef, GenericParamDefKind, Ty, TyCtxt, TypeVisitableExt,
     suggest_constraining_type_param,
 };
-use rustc_session::errors::feature_err;
+use rustc_session::diagnostics::feature_err;
 use rustc_span::edit_distance::find_best_match_for_name;
 use rustc_span::{BytePos, DUMMY_SP, Ident, Span, Symbol, kw, sym};
 use rustc_trait_selection::error_reporting::traits::report_dyn_incompatibility;
@@ -281,7 +281,7 @@ impl<'tcx> dyn HirTyLowerer<'tcx> + '_ {
                     let identically_named = suggested_name == assoc_ident.name;
 
                     if let DefKind::TyAlias = tcx.def_kind(item_def_id)
-                        && !tcx.type_alias_is_lazy(item_def_id)
+                        && !tcx.type_alias_is_checked(item_def_id)
                     {
                         err.sugg =
                             Some(diagnostics::AssocItemNotFoundSugg::SimilarInOtherTraitQPath {
