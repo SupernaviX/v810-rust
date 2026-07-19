@@ -13,7 +13,7 @@ use clap::ValueEnum;
 #[cfg(feature = "tracing")]
 use tracing::instrument;
 
-pub use self::cargo::{Cargo, cargo_profile_var};
+pub use self::cargo::{Cargo, apply_pgo, cargo_profile_var};
 pub use crate::Compiler;
 use crate::core::build_steps::compile::{Std, StdLink};
 use crate::core::build_steps::tool::RustcPrivateCompilers;
@@ -515,29 +515,39 @@ pub struct ShouldRun<'a> {
 
     // use a BTreeSet to maintain sort order
     paths: BTreeSet<PathSet>,
+
+    default_to_suites_only: bool,
 }
 
 impl<'a> ShouldRun<'a> {
     fn new(builder: &'a Builder<'_>, kind: Kind) -> ShouldRun<'a> {
-        ShouldRun { builder, kind, paths: BTreeSet::new() }
+        ShouldRun { builder, kind, paths: BTreeSet::new(), default_to_suites_only: false }
     }
 
-    /// Indicates it should run if the command-line selects the given crate or
-    /// any of its (local) dependencies.
+    /// The corresponding step should run if the bootstrap command-line selects
+    /// the given crate or any of its (local) dependencies.
     ///
-    /// `make_run` will be called a single time with all matching command-line paths.
-    pub fn crate_or_deps(self, name: &str) -> Self {
-        let crates = self.builder.in_tree_crates(name, None);
-        self.crates(crates)
+    /// Delegates to [`Self::crate_or_deps_filtered`] with a filter that accepts all crates.
+    pub(crate) fn crate_or_deps(self, root_crate_name: &str) -> Self {
+        self.crate_or_deps_filtered(root_crate_name, |_: &Crate| true)
     }
 
-    /// Indicates it should run if the command-line selects any of the given crates.
+    /// The corresponding step should run if the bootstrap command-line selects
+    /// the given crate or any of its (local) dependencies, not counting any
+    /// crates rejected by the given filter function.
     ///
     /// `make_run` will be called a single time with all matching command-line paths.
-    ///
-    /// Prefer [`ShouldRun::crate_or_deps`] to this function where possible.
-    pub(crate) fn crates(mut self, crates: Vec<&Crate>) -> Self {
+    pub(crate) fn crate_or_deps_filtered(
+        mut self,
+        root_crate_name: &str,
+        crate_filter_fn: impl Fn(&Crate) -> bool,
+    ) -> Self {
+        let crates = self.builder.in_tree_crates(root_crate_name, None);
         for krate in crates {
+            if !crate_filter_fn(krate) {
+                continue;
+            }
+
             let path = krate.local_path(self.builder);
             self.paths.insert(PathSet::one(path, self.kind));
         }
@@ -635,6 +645,28 @@ impl<'a> ShouldRun<'a> {
             }
         }
         sets
+    }
+
+    /// When generating pathsets for a step that is being run "by default"
+    /// (i.e. when running bootstrap without an explicit command-line path),
+    /// discard any paths that were not registered as test suites.
+    ///
+    /// This is basically a hack to make path-based skipping work properly for
+    /// coverage tests, since otherwise the `coverage-map` and `coverage-run`
+    /// aliases would prevent `./x test --skip=tests` from skipping them.
+    pub(crate) fn default_to_suites_only(mut self) -> Self {
+        self.default_to_suites_only = true;
+        self
+    }
+
+    /// When the corresponding step is run "by default" (without explicit command-line paths),
+    /// act as though the user had explicitly specified these paths.
+    fn default_pathsets(&self) -> Vec<PathSet> {
+        let mut default_pathsets = self.paths.iter().cloned().collect::<Vec<_>>();
+        if self.default_to_suites_only {
+            default_pathsets.retain(|p| matches!(p, PathSet::Suite(_)));
+        }
+        default_pathsets
     }
 }
 

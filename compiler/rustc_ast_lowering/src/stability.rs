@@ -3,7 +3,7 @@ use std::fmt;
 use rustc_abi::ExternAbi;
 use rustc_feature::Features;
 use rustc_session::Session;
-use rustc_session::errors::feature_err;
+use rustc_session::diagnostics::feature_err;
 use rustc_span::symbol::sym;
 use rustc_span::{Span, Symbol};
 
@@ -119,6 +119,9 @@ pub fn extern_abi_stability(abi: ExternAbi) -> Result<(), UnstableAbi> {
             feature: sym::abi_msp430_interrupt,
             explain: GateReason::Experimental,
         }),
+        ExternAbi::V810Interrupt => {
+            Err(UnstableAbi { abi, feature: sym::interrupt, explain: GateReason::ImplDetail })
+        }
         ExternAbi::X86Interrupt => Err(UnstableAbi {
             abi,
             feature: sym::abi_x86_interrupt,

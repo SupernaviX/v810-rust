@@ -24,7 +24,7 @@ use crate::core::build_steps::tool::{RustcPrivateCompilers, SourceType, copy_lld
 use crate::core::build_steps::{dist, llvm};
 use crate::core::builder;
 use crate::core::builder::{
-    Builder, Cargo, Kind, RunConfig, ShouldRun, Step, StepMetadata, crate_description,
+    Builder, Cargo, Kind, RunConfig, ShouldRun, Step, StepMetadata, apply_pgo, crate_description,
 };
 use crate::core::config::toml::target::DefaultLinuxLinkerOverride;
 use crate::core::config::{
@@ -122,7 +122,7 @@ impl Step for Std {
     }
 
     fn make_run(run: RunConfig<'_>) {
-        let crates = std_crates_for_run_make(&run);
+        let crates = std_crates_for_make_run(&run);
         let builder = run.builder;
 
         // Force compilation of the standard library from source if the `library` is modified. This allows
@@ -479,9 +479,9 @@ fn copy_self_contained_objects(
     target_deps
 }
 
-/// Resolves standard library crates for `Std::run_make` for any build kind (like check, doc,
+/// Resolves standard library crates for [`Std::make_run`] for any build kind (like check, doc,
 /// build, clippy, etc.).
-pub fn std_crates_for_run_make(run: &RunConfig<'_>) -> Vec<String> {
+pub fn std_crates_for_make_run(run: &RunConfig<'_>) -> Vec<String> {
     let mut crates = run.make_run_crates(builder::Alias::Library);
 
     // For no_std targets, we only want to check core and alloc
@@ -1018,16 +1018,11 @@ impl Step for Rustc {
     const IS_HOST: bool = true;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        let mut crates = run.builder.in_tree_crates("rustc-main", None);
-        for (i, krate) in crates.iter().enumerate() {
+        run.crate_or_deps_filtered("rustc-main", |krate| {
             // We can't allow `build rustc` as an alias for this Step, because that's reserved by `Assemble`.
             // Ideally Assemble would use `build compiler` instead, but that seems too confusing to be worth the breaking change.
-            if krate.name == "rustc-main" {
-                crates.swap_remove(i);
-                break;
-            }
-        }
-        run.crates(crates)
+            krate.name != "rustc-main"
+        })
     }
 
     fn is_default_step(_builder: &Builder<'_>) -> bool {
@@ -1293,44 +1288,18 @@ pub fn rustc_cargo(
         cargo.rustflag("-Clink-args=-Wl,--icf=all");
     }
 
-    let is_collecting = if let Some(path) = &builder.config.rust_pgo.generate_profile {
-        if build_compiler.stage == 1 {
-            cargo
-                .rustflag(&format!("-Cprofile-generate={}", path.to_str().expect("non-UTF8 path")));
-            // Apparently necessary to avoid overflowing the counters during
-            // a Cargo build profile
-            cargo.rustflag("-Cllvm-args=-vp-counters-per-site=4");
-            true
-        } else {
-            false
-        }
-    } else if let Some(path) = &builder.config.rust_pgo.use_profile {
-        if build_compiler.stage == 1 {
-            cargo.rustflag(&format!("-Cprofile-use={}", path.to_str().expect("non-UTF8 path")));
-            if builder.is_verbose() {
-                cargo.rustflag("-Cllvm-args=-pgo-warn-missing-function");
-            }
-            true
-        } else {
-            false
-        }
-    } else {
-        false
-    };
-    if is_collecting {
-        // Ensure paths to Rust sources are relative, not absolute.
-        cargo.rustflag(&format!(
-            "-Cllvm-args=-static-func-strip-dirname-prefix={}",
-            builder.config.src.components().count()
-        ));
-    }
+    apply_pgo(builder, cargo, *build_compiler, &builder.config.rust_pgo);
 
     // The stage0 compiler changes infrequently and does not directly depend on code
     // in the current working directory. Therefore, caching it with sccache should be
     // useful.
     // This is only performed for non-incremental builds, as ccache cannot deal with these.
+    //
+    // We skip this on Windows hosts for now because of command line length issues (see CI failure
+    // in https://github.com/rust-lang/rust/pull/158888#issuecomment-4960306292).
     if let Some(ref ccache) = builder.config.ccache
         && build_compiler.stage == 0
+        && !cfg!(windows)
         && !builder.config.incremental
     {
         cargo.env("RUSTC_WRAPPER", ccache);

@@ -7,6 +7,7 @@ IFS=$'\n\t'
 
 source "$(cd "$(dirname "$0")" && pwd)/../shared.sh"
 
+REPO_URL="https://github.com/SupernaviX/v810-llvm"
 BUILD_DATE="2026-07-10"
 
 if isMacOS; then
@@ -23,7 +24,8 @@ else
     exeExt=""
 fi
 
-curl -o "llvm-v810.$bundleExt" -L "https://github.com/SupernaviX/v810-llvm/releases/download/llvm-v810-$BUILD_DATE/llvm-v810-$targetName-main.$bundleExt"
+filename="llvm-v810-$targetName-main.$bundleExt"
+curl -o "llvm-v810.$bundleExt" -L "$REPO_URL/releases/download/llvm-v810-$BUILD_DATE/$filename"
 if [ "$bundleExt" == "7z" ]; then
     7z x "llvm-v810.$bundleExt"
 else

@@ -361,8 +361,7 @@ mod llvm_enzyme {
         let inline_item = ast::AttrItem {
             unsafety: ast::Safety::Default,
             path: ast::Path::from_ident(Ident::with_dummy_span(sym::inline)),
-            args: rustc_ast::ast::AttrItemKind::Unparsed(ast::AttrArgs::Delimited(never_arg)),
-            tokens: None,
+            args: ast::AttrArgs::Delimited(never_arg),
         };
         let inline_never_attr = Box::new(ast::NormalAttr { item: inline_item, tokens: None });
         let new_id = ecx.sess.psess.attr_id_generator.mk_attr_id();
@@ -424,13 +423,11 @@ mod llvm_enzyme {
             }
         };
         // Now update for d_fn
-        rustc_ad_attr.item.args = rustc_ast::ast::AttrItemKind::Unparsed(
-            rustc_ast::AttrArgs::Delimited(rustc_ast::DelimArgs {
-                dspan: DelimSpan::dummy(),
-                delim: rustc_ast::token::Delimiter::Parenthesis,
-                tokens: ts,
-            }),
-        );
+        rustc_ad_attr.item.args = rustc_ast::AttrArgs::Delimited(rustc_ast::DelimArgs {
+            dspan: DelimSpan::dummy(),
+            delim: rustc_ast::token::Delimiter::Parenthesis,
+            tokens: ts,
+        });
 
         let new_id = ecx.sess.psess.attr_id_generator.mk_attr_id();
         let d_attr = outer_normal_attr(&rustc_ad_attr, new_id, span);
@@ -565,7 +562,7 @@ mod llvm_enzyme {
                 .iter()
                 .map(|arg| match arg.pat.kind {
                     PatKind::Ident(_, ident, _) => ecx.expr_path(ecx.path_ident(span, ident)),
-                    _ => todo!(),
+                    _ => unimplemented!(),
                 })
                 .collect::<ThinVec<_>>(),
         );
@@ -626,7 +623,7 @@ mod llvm_enzyme {
             thin_vec![segment]
         };
 
-        let path = Path { span, segments, tokens: None };
+        let path = Path { span, segments };
 
         ecx.expr_path(path)
     }
@@ -738,7 +735,6 @@ mod llvm_enzyme {
                             id: ast::DUMMY_NODE_ID,
                             kind: PatKind::Ident(BindingMode::NONE, ident, None),
                             span: shadow_arg.pat.span,
-                            tokens: shadow_arg.pat.tokens.clone(),
                         });
                         d_inputs.push(shadow_arg.clone());
                     }
@@ -770,7 +766,6 @@ mod llvm_enzyme {
                             id: ast::DUMMY_NODE_ID,
                             kind: PatKind::Ident(BindingMode::NONE, ident, None),
                             span: shadow_arg.pat.span,
-                            tokens: shadow_arg.pat.tokens.clone(),
                         });
                         d_inputs.push(shadow_arg.clone());
                     }
@@ -814,7 +809,6 @@ mod llvm_enzyme {
                             id: ast::DUMMY_NODE_ID,
                             kind: PatKind::Ident(BindingMode::NONE, ident, None),
                             span: ty.span,
-                            tokens: None,
                         }),
                         id: ast::DUMMY_NODE_ID,
                         span: ty.span,
@@ -834,12 +828,7 @@ mod llvm_enzyme {
                 FnRetTy::Default(span) => {
                     // We want to return std::hint::black_box(()).
                     let kind = TyKind::Tup(ThinVec::new());
-                    let ty = Box::new(rustc_ast::Ty {
-                        kind,
-                        id: ast::DUMMY_NODE_ID,
-                        span,
-                        tokens: None,
-                    });
+                    let ty = Box::new(rustc_ast::Ty { kind, id: ast::DUMMY_NODE_ID, span });
                     d_decl.output = FnRetTy::Ty(ty.clone());
                     assert!(matches!(x.ret_activity, DiffActivity::None));
                     // this won't be used below, so any type would be fine.
@@ -860,7 +849,7 @@ mod llvm_enzyme {
                     };
                     TyKind::Array(ty.clone(), anon_const)
                 };
-                let ty = Box::new(rustc_ast::Ty { kind, id: ty.id, span: ty.span, tokens: None });
+                let ty = Box::new(rustc_ast::Ty { kind, id: ty.id, span: ty.span });
                 d_decl.output = FnRetTy::Ty(ty);
             }
             if matches!(x.ret_activity, DiffActivity::DualOnly | DiffActivity::DualvOnly) {
@@ -873,8 +862,7 @@ mod llvm_enzyme {
                         value: ecx.expr_usize(span, x.width as usize),
                     };
                     let kind = TyKind::Array(ty.clone(), anon_const);
-                    let ty =
-                        Box::new(rustc_ast::Ty { kind, id: ty.id, span: ty.span, tokens: None });
+                    let ty = Box::new(rustc_ast::Ty { kind, id: ty.id, span: ty.span });
                     d_decl.output = FnRetTy::Ty(ty);
                 }
             }
@@ -896,14 +884,14 @@ mod llvm_enzyme {
                         act_ret.insert(0, ty.clone());
                     }
                     let kind = TyKind::Tup(act_ret);
-                    Box::new(rustc_ast::Ty { kind, id: ty.id, span: ty.span, tokens: None })
+                    Box::new(rustc_ast::Ty { kind, id: ty.id, span: ty.span })
                 }
                 FnRetTy::Default(span) => {
                     if act_ret.len() == 1 {
                         act_ret[0].clone()
                     } else {
                         let kind = TyKind::Tup(act_ret.iter().map(|arg| arg.clone()).collect());
-                        Box::new(rustc_ast::Ty { kind, id: ast::DUMMY_NODE_ID, span, tokens: None })
+                        Box::new(rustc_ast::Ty { kind, id: ast::DUMMY_NODE_ID, span })
                     }
                 }
             };

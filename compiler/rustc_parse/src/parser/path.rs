@@ -15,7 +15,7 @@ use tracing::debug;
 use super::ty::{AllowPlus, RecoverQPath, RecoverReturnSign};
 use super::{Parser, Restrictions, TokenType};
 use crate::ast::{PatKind, TyKind};
-use crate::errors::{
+use crate::diagnostics::{
     self, AttributeOnEmptyType, AttributeOnGenericArg, ConstGenericWithoutBraces,
     ConstGenericWithoutBracesSugg, FnPathFoundNamedParams, PathFoundAttributeInParams,
     PathFoundCVariadicParams, PathSingleColon, PathTripleColon,
@@ -92,7 +92,7 @@ impl<'a> Parser<'a> {
             path_span = path_lo.to(self.prev_token.span);
         } else {
             path_span = self.token.span.to(self.token.span);
-            path = ast::Path { segments: ThinVec::new(), span: path_span, tokens: None };
+            path = ast::Path { segments: ThinVec::new(), span: path_span };
         }
 
         // See doc comment for `unmatched_angle_bracket_count`.
@@ -112,10 +112,7 @@ impl<'a> Parser<'a> {
             self.parse_path_segments(&mut path.segments, style, None)?;
         }
 
-        Ok((
-            qself,
-            Path { segments: path.segments, span: lo.to(self.prev_token.span), tokens: None },
-        ))
+        Ok((qself, Path { segments: path.segments, span: lo.to(self.prev_token.span) }))
     }
 
     /// Recover from an invalid single colon, when the user likely meant a qualified path.
@@ -187,7 +184,7 @@ impl<'a> Parser<'a> {
                     .filter_map(|segment| segment.args.as_ref())
                     .map(|arg| arg.span())
                     .collect::<Vec<_>>();
-                parser.dcx().emit_err(errors::GenericsInPath { span });
+                parser.dcx().emit_err(diagnostics::GenericsInPath { span });
                 // Ignore these arguments to prevent unexpected behaviors.
                 let segments = path
                     .segments
@@ -221,7 +218,7 @@ impl<'a> Parser<'a> {
             segments.push(PathSegment::path_root(lo.shrink_to_lo().with_ctxt(mod_sep_ctxt)));
         }
         self.parse_path_segments(&mut segments, style, ty_generics)?;
-        Ok(Path { segments, span: lo.to(self.prev_token.span), tokens: None })
+        Ok(Path { segments, span: lo.to(self.prev_token.span) })
     }
 
     pub(super) fn parse_path_segments(
@@ -378,8 +375,10 @@ impl<'a> Parser<'a> {
                         let ty = self.parse_ty()?;
                         let span = lo.to(ty.span);
                         let suggestion = prev_lo.to(ty.span);
-                        self.dcx()
-                            .emit_err(errors::BadReturnTypeNotationOutput { span, suggestion });
+                        self.dcx().emit_err(diagnostics::BadReturnTypeNotationOutput {
+                            span,
+                            suggestion,
+                        });
                     }
 
                     Box::new(ast::GenericArgs::ParenthesizedElided(span))
@@ -668,7 +667,7 @@ impl<'a> Parser<'a> {
                     // i.e. no multibyte characters, in this range.
                     let span = lo
                         .with_hi(lo.lo() + BytePos(snapshot.unmatched_angle_bracket_count.into()));
-                    self.dcx().emit_err(errors::UnmatchedAngle {
+                    self.dcx().emit_err(diagnostics::UnmatchedAngle {
                         span,
                         plural: snapshot.unmatched_angle_bracket_count > 1,
                     });
@@ -801,7 +800,7 @@ impl<'a> Parser<'a> {
                 c.into()
             }
             Some(GenericArg::Lifetime(lt)) => {
-                let guar = self.dcx().emit_err(errors::LifetimeInEqConstraint {
+                let guar = self.dcx().emit_err(diagnostics::LifetimeInEqConstraint {
                     span: lt.ident.span,
                     lifetime: lt.ident,
                     binding_label: span,

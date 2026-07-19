@@ -141,6 +141,7 @@ impl<'tcx> Stable<'tcx> for CanonAbi {
                 InterruptKind::RiscvMachine | InterruptKind::RiscvSupervisor => {
                     CallConvention::RiscvInterrupt
                 }
+                InterruptKind::V810 => CallConvention::V810Interrupt,
                 InterruptKind::X86 => CallConvention::X86Intr,
             },
             CanonAbi::X86(x86_call) => match x86_call {

@@ -94,6 +94,7 @@ pub enum ExternAbi {
     Msp430Interrupt,
     RiscvInterruptM,
     RiscvInterruptS,
+    V810Interrupt,
     X86Interrupt,
 
     /* x86 */
@@ -214,6 +215,7 @@ abi_impls! {
             Thiscall { unwind: false } =><= "thiscall",
             Thiscall { unwind: true } =><= "thiscall-unwind",
             Unadjusted =><= "unadjusted",
+            V810Interrupt =><= "v810-interrupt",
             Vectorcall { unwind: false } =><= "vectorcall",
             Vectorcall { unwind: true } =><= "vectorcall-unwind",
             Win64 { unwind: false } =><= "win64",
@@ -331,6 +333,7 @@ impl ExternAbi {
             | Self::Msp430Interrupt
             | Self::RiscvInterruptM
             | Self::RiscvInterruptS
+            | Self::V810Interrupt
             | Self::X86Interrupt => {
                 // See https://godbolt.org/z/Edfjnxxcq. Interrupts cannot be called directly.
                 false

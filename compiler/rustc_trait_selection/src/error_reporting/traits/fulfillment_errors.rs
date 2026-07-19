@@ -1,4 +1,4 @@
-// ignore-tidy-filelength
+// ignore-tidy-file-filelength
 use core::ops::ControlFlow;
 use std::borrow::Cow;
 use std::collections::hash_set;
@@ -16,7 +16,7 @@ use rustc_errors::{
 use rustc_hir::attrs::diagnostic::CustomDiagnostic;
 use rustc_hir::def_id::{DefId, LOCAL_CRATE, LocalDefId};
 use rustc_hir::intravisit::Visitor;
-use rustc_hir::{self as hir, LangItem, Node, find_attr};
+use rustc_hir::{self as hir, LangItem, Node, expr_needs_parens, find_attr};
 use rustc_infer::infer::{InferOk, TypeTrace};
 use rustc_infer::traits::ImplSource;
 use rustc_infer::traits::solve::Goal;
@@ -1683,27 +1683,61 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                 });
             let mut diag = struct_span_code_err!(self.dcx(), span, E0271, "{msg}");
             *diag.long_ty_path() = file;
+            let mut mention_bounds = true;
             if let Some(span) = closure_span {
-                // Mark the closure decl so that it is seen even if we are pointing at the return
-                // type or expression.
-                //
-                // error[E0271]: expected `{closure@foo.rs:41:16}` to be a closure that returns
-                //               `Unit3`, but it returns `Unit4`
-                //   --> $DIR/foo.rs:43:17
-                //    |
-                // LL |     let v = Unit2.m(
-                //    |                   - required by a bound introduced by this call
-                // ...
-                // LL |             f: |x| {
-                //    |                --- /* this span */
-                // LL |                 drop(x);
-                // LL |                 Unit4
-                //    |                 ^^^^^ expected `Unit3`, found `Unit4`
-                //    |
-                diag.span_label(span, "this closure");
-                if !span.overlaps(obligation.cause.span) {
-                    // Point at the binding corresponding to the closure where it is used.
-                    diag.span_label(obligation.cause.span, "closure used here");
+                if let Some((_, _, expected_ty)) = values
+                    && let Some(expected_ty) = expected_ty.as_type()
+                    && let ty::Closure(def_id, _) = expected_ty.kind()
+                    && self.tcx.def_span(*def_id).overlaps(span)
+                    && let ObligationCauseCode::FunctionArg { parent_code, arg_hir_id, .. } =
+                        obligation.cause.code()
+                    && let ObligationCauseCode::WhereClauseInExpr(def_id, span, _, _)
+                    | ObligationCauseCode::WhereClause(def_id, span) = &**parent_code
+                {
+                    // We have a trait bound for a closure to return itself, like
+                    // `T: FnOnce() -> T`. This is nonsensical, but as far as the type system is
+                    // concerned, valid. This is quite an edge case, but lets produce a reasonable
+                    // diagnostic even in the face of an unreasonable user :)
+                    let mut multispan: MultiSpan = (*span).into();
+                    multispan.push_span_label(*span, "this requires the closure to return itself");
+                    if let Node::Expr(arg) = self.tcx.hir_node(*arg_hir_id) {
+                        multispan
+                            .push_span_label(arg.span, "this closure would have to return itself");
+                    }
+                    let in_the_item = match self.tcx.opt_item_name(*def_id) {
+                        Some(name) => format!("in `{name}`"),
+                        None => String::new(),
+                    };
+                    diag.span_note(
+                        multispan,
+                        format!(
+                            "a bound {in_the_item} requires that a closure return itself, which is \
+                             not possible",
+                        ),
+                    );
+                    mention_bounds = false;
+                } else {
+                    // Mark the closure decl so that it is seen even if we are pointing at the
+                    // return type or expression.
+                    //
+                    // error[E0271]: expected `{closure@foo.rs:41:16}` to be a closure that returns
+                    //               `Unit3`, but it returns `Unit4`
+                    //   --> $DIR/foo.rs:43:17
+                    //    |
+                    // LL |     let v = Unit2.m(
+                    //    |                   - required by a bound introduced by this call
+                    // ...
+                    // LL |             f: |x| {
+                    //    |                --- /* this span */
+                    // LL |                 drop(x);
+                    // LL |                 Unit4
+                    //    |                 ^^^^^ expected `Unit3`, found `Unit4`
+                    //    |
+                    diag.span_label(span, "this closure");
+                    if !span.overlaps(obligation.cause.span) {
+                        // Point at the binding corresponding to the closure where it is used.
+                        diag.span_label(obligation.cause.span, "closure used here");
+                    }
                 }
             }
 
@@ -1775,7 +1809,9 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                 false,
                 Some(span),
             );
-            self.note_obligation_cause(&mut diag, obligation);
+            if mention_bounds {
+                self.note_obligation_cause(&mut diag, obligation);
+            }
             diag.emit()
         })
     }
@@ -3798,13 +3834,24 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                 ty::ConstKind::Alias(_, alias_const) => {
                     let mut err =
                         self.dcx().struct_span_err(span, "unconstrained generic constant");
-                    let const_span = alias_const.kind.def_span(self.tcx);
 
+                    let const_span = alias_const.kind.def_span(self.tcx);
                     let const_ty = alias_const.type_of(self.tcx).skip_norm_wip();
-                    let cast = if const_ty != self.tcx.types.usize { " as usize" } else { "" };
+
                     let msg = "try adding a `where` bound";
                     if let Ok(snippet) = self.tcx.sess.source_map().span_to_snippet(const_span) {
-                        let code = format!("[(); {snippet}{cast}]:");
+                        let code = if const_ty == self.tcx.types.usize {
+                            format!("[(); {snippet}]:")
+                        } else if let ty::AliasConstKind::Anon { def_id } = alias_const.kind
+                            && let Some(local_def_id) = def_id.as_local()
+                            && let Some(local_body) = self.tcx.hir_maybe_body_owned_by(local_def_id)
+                            && expr_needs_parens(local_body.value)
+                        {
+                            format!("[(); ({snippet}) as usize]:")
+                        } else {
+                            format!("[(); {snippet} as usize]:")
+                        };
+
                         let suggestion_def_id = if let ObligationCauseCode::CompareImplItem {
                             trait_item_def_id,
                             ..
@@ -3814,6 +3861,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                         } else {
                             Some(obligation.cause.body_def_id)
                         };
+
                         if let Some(suggestion_def_id) = suggestion_def_id
                             && let Some(generics) = self.tcx.hir_get_generics(suggestion_def_id)
                         {

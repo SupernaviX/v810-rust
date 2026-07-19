@@ -46,7 +46,7 @@ fn fn_sig_for_fn_abi<'tcx>(
     match *ty.kind() {
         ty::FnDef(def_id, args) => {
             let mut sig = tcx.instantiate_bound_regions_with_erased(
-                tcx.fn_sig(def_id).instantiate(tcx, args).skip_norm_wip(),
+                tcx.fn_sig(def_id).instantiate(tcx, args.no_bound_vars().unwrap()).skip_norm_wip(),
             );
 
             // Modify `fn(self, ...)` to `fn(self: *mut Self, ...)`.
@@ -366,11 +366,6 @@ fn arg_attrs_for_rust_scalar<'tcx>(
             // See https://github.com/rust-lang/unsafe-code-guidelines/issues/326
             let noalias_for_box = tcx.sess.opts.unstable_opts.box_noalias;
 
-            // LLVM prior to version 12 had known miscompiles in the presence of noalias attributes
-            // (see #54878), so it was conditionally disabled, but we don't support earlier
-            // versions at all anymore. We still support turning it off using -Zmutable-noalias.
-            let noalias_mut_ref = tcx.sess.opts.unstable_opts.mutable_noalias;
-
             // `&T` where `T` contains no `UnsafeCell<U>` is immutable, and can be marked as both
             // `readonly` and `noalias`, as LLVM's definition of `noalias` is based solely on memory
             // dependencies rather than pointer equality. However this only applies to arguments,
@@ -379,7 +374,7 @@ fn arg_attrs_for_rust_scalar<'tcx>(
             // `&mut T` and `Box<T>` where `T: Unpin` are unique and hence `noalias`.
             let no_alias = match kind {
                 PointerKind::SharedRef { frozen } => frozen,
-                PointerKind::MutableRef { unpin } => unpin && noalias_mut_ref,
+                PointerKind::MutableRef { unpin } => unpin,
                 PointerKind::Box { unpin, global } => unpin && global && noalias_for_box,
             };
             // We can never add `noalias` in return position; that LLVM attribute has some very surprising semantics

@@ -35,13 +35,7 @@ pub struct Finder {
 ///
 /// Targets can be removed from this list during the usual release process bootstrap compiler bumps,
 /// when the newly-bumped stage 0 compiler now knows about the formerly-missing targets.
-const STAGE0_MISSING_TARGETS: &[&str] = &[
-    "v810-unknown-vb",
-    "powerpc64-unknown-linux-gnuelfv2",
-    "aarch64-unknown-linux-pauthtest", // Stage 0 compiler is not guaranteed to see the target yet.
-    "aarch64-unknown-qnx",
-    "x86_64-pc-qnx",
-];
+const STAGE0_MISSING_TARGETS: &[&str] = &["v810-unknown-vb"];
 
 /// Minimum version threshold for libstdc++ required when using prebuilt LLVM
 /// from CI (with`llvm.download-ci-llvm` option).

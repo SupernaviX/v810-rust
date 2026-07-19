@@ -53,7 +53,7 @@ use rustc_data_structures::steal::Steal;
 use rustc_data_structures::tagged_ptr::TaggedRef;
 use rustc_data_structures::unord::ExtendUnord;
 use rustc_errors::codes::*;
-use rustc_errors::{DiagArgFromDisplay, DiagCtxtHandle};
+use rustc_errors::{DiagArgFromDisplay, DiagCtxtHandle, ErrorGuaranteed};
 use rustc_hir::def::{DefKind, LifetimeRes, Namespace, PartialRes, PerNS, Res};
 use rustc_hir::def_id::{DefId, LOCAL_CRATE, LocalDefId, LocalDefIdMap};
 use rustc_hir::definitions::PerParentDisambiguatorState;
@@ -67,7 +67,7 @@ use rustc_macros::extension;
 use rustc_middle::queries::Providers;
 use rustc_middle::span_bug;
 use rustc_middle::ty::{PerOwnerResolverData, ResolverAstLowering, TyCtxt};
-use rustc_session::errors::add_feature_diagnostics;
+use rustc_session::diagnostics::add_feature_diagnostics;
 use rustc_span::symbol::{Ident, Symbol, kw, sym};
 use rustc_span::{DUMMY_SP, DesugaringKind, Span};
 use smallvec::{SmallVec, smallvec};
@@ -351,17 +351,6 @@ impl<'tcx> ResolverAstLowering<'tcx> {
         )
         .map(|fn_indexes| fn_indexes.iter().map(|(num, _)| *num).collect())
     }
-
-    /// Obtain the list of lifetimes parameters to add to an item.
-    ///
-    /// Extra lifetime parameters should only be added in places that can appear
-    /// as a `binder` in `LifetimeRes`.
-    ///
-    /// The extra lifetimes that appear from the parenthesized `Fn`-trait desugaring
-    /// should appear at the enclosing `PolyTraitRef`.
-    fn extra_lifetime_params(&self, id: NodeId) -> &[(Ident, NodeId, MissingLifetimeKind)] {
-        self.extra_lifetime_params_map.get(&id).map_or(&[], |v| &v[..])
-    }
 }
 
 /// How relaxed bounds `?Trait` should be treated.
@@ -557,11 +546,11 @@ fn index_ast<'tcx>(
                 attrs: AttrVec::default(),
                 id,
                 span,
-                vis: Visibility { kind: VisibilityKind::Public, span, tokens: None },
+                vis: Visibility { kind: VisibilityKind::Public, span },
                 // Lacking a better choice, we replace the contents with a macro call.
                 // Unexpanded macros should never reach lowering, so this is not confusing.
                 kind: dummy(Box::new(MacCall {
-                    path: Path { span, segments: thin_vec![], tokens: None },
+                    path: Path { span, segments: thin_vec![] },
                     args: Box::new(DelimArgs {
                         dspan: DelimSpan::from_single(span),
                         delim: Delimiter::Parenthesis,
@@ -664,11 +653,6 @@ fn index_ast<'tcx>(
 
 #[instrument(level = "trace", skip(tcx))]
 fn lower_to_hir(tcx: TyCtxt<'_>, def_id: LocalDefId) -> hir::MaybeOwner<'_> {
-    // Queries that borrow `resolver_for_lowering`.
-    tcx.ensure_done().output_filenames(());
-    tcx.ensure_done().early_lint_checks(());
-    tcx.ensure_done().debugger_visualizers(LOCAL_CRATE);
-    tcx.ensure_done().get_lang_items(());
     let ast_index = tcx.index_ast(());
     let resolver_and_node = ast_index.get(def_id).map(Steal::steal);
 
@@ -1134,7 +1118,7 @@ impl<'hir> LoweringContext<'_, 'hir> {
     ) -> &'hir [hir::GenericParam<'hir>] {
         // Start by creating params for extra lifetimes params, as this creates the definitions
         // that may be referred to by the AST inside `generic_params`.
-        let extra_lifetimes = self.resolver.extra_lifetime_params(binder);
+        let extra_lifetimes = self.owner.extra_lifetime_params(binder);
         debug!(?extra_lifetimes);
         let extra_lifetimes: Vec<_> = extra_lifetimes
             .iter()
@@ -1765,18 +1749,30 @@ impl<'hir> LoweringContext<'_, 'hir> {
                 let fields = self.arena.alloc_slice(fields);
                 hir::TyKind::View(ty, fields)
             }
-            TyKind::DirectConstArg(_) => {
-                let e = self
-                    .tcx
-                    .dcx()
-                    .struct_span_err(t.span, "expected type, found `direct_const_arg!()` constant")
-                    .emit();
+            TyKind::DirectConstArg(expr) => {
+                let e = self.emit_bad_direct_const_arg(t.span, expr, "type");
                 hir::TyKind::Err(e)
             }
             TyKind::Dummy => panic!("`TyKind::Dummy` should never be lowered"),
         };
 
         hir::Ty { kind, span: self.lower_span(t.span), hir_id: self.lower_node_id(t.id) }
+    }
+
+    pub(crate) fn emit_bad_direct_const_arg(
+        &mut self,
+        span: Span,
+        expr: &Expr,
+        expected: &'static str,
+    ) -> ErrorGuaranteed {
+        let msg = format!("expected {expected}, found `direct_const_arg!()` constant");
+        if expr::WillCreateDefIdsVisitor.visit_expr(expr).is_break() {
+            // FIXME(mgca): make this non-fatal once we have a better way to handle
+            // nested items in invalid `direct_const_arg!()` arguments.
+            self.dcx().struct_span_fatal(span, msg).emit()
+        } else {
+            self.dcx().struct_span_err(span, msg).emit()
+        }
     }
 
     fn lower_ty_direct_lifetime(
@@ -2916,7 +2912,7 @@ impl<'hir> LoweringContext<'_, 'hir> {
                 // Do not use lower_anon_const_to_const_arg, as that attempts to represent the body
                 // directly. Instead, force an anon const.
                 let def_id = self.local_def_id(anon_const.id);
-                assert_eq!(DefKind::InlineConst, self.tcx.def_kind(def_id));
+                assert_eq!(DefKind::AnonConst, self.tcx.def_kind(def_id));
                 let lowered_anon = self.lower_anon_const_to_anon_const(anon_const, span);
                 ConstArg {
                     hir_id: self.lower_node_id(node_id),

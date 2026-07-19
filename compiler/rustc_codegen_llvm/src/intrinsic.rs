@@ -9,7 +9,7 @@ use rustc_abi::{
 use rustc_codegen_ssa::RetagInfo;
 use rustc_codegen_ssa::base::{compare_simd_types, wants_msvc_seh, wants_wasm_eh};
 use rustc_codegen_ssa::common::{IntPredicate, TypeKind};
-use rustc_codegen_ssa::errors::{ExpectedPointerMutability, InvalidMonomorphization};
+use rustc_codegen_ssa::diagnostics::{ExpectedPointerMutability, InvalidMonomorphization};
 use rustc_codegen_ssa::mir::IntrinsicResult;
 use rustc_codegen_ssa::mir::operand::{OperandRef, OperandValue};
 use rustc_codegen_ssa::mir::place::{PlaceRef, PlaceValue};
@@ -23,12 +23,12 @@ use rustc_middle::ty::offload_meta::OffloadMetadata;
 use rustc_middle::ty::{self, GenericArgsRef, Instance, SimdAlign, Ty, TyCtxt, TypingEnv};
 use rustc_middle::{bug, span_bug};
 use rustc_session::config::CrateType;
-use rustc_session::errors::feature_err;
+use rustc_session::diagnostics::feature_err;
 use rustc_session::lint::builtin::DEPRECATED_LLVM_INTRINSIC;
 use rustc_span::{ErrorGuaranteed, Span, Symbol, sym};
 use rustc_symbol_mangling::{mangle_internal_symbol, symbol_name_for_instance_in_crate};
 use rustc_target::callconv::PassMode;
-use rustc_target::spec::{Arch, LlvmAbi};
+use rustc_target::spec::Arch;
 use tracing::debug;
 
 use crate::abi::FnAbiLlvmExt;
@@ -37,7 +37,6 @@ use crate::builder::autodiff::{adjust_activity_to_abi, generate_enzyme_call};
 use crate::builder::gpu_offload::{
     OffloadKernelDims, gen_call_handling, gen_define_handling, register_offload,
 };
-use crate::common::pauth_fn_attrs;
 use crate::context::CodegenCx;
 use crate::declare::declare_raw_fn;
 use crate::errors::{
@@ -919,7 +918,7 @@ impl<'ll, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'_, 'll, 'tcx> {
         let fn_ty = instance.ty(tcx, self.typing_env());
         let fn_sig = match *fn_ty.kind() {
             ty::FnDef(def_id, args) => tcx.instantiate_bound_regions_with_erased(
-                tcx.fn_sig(def_id).instantiate(tcx, args).skip_norm_wip(),
+                tcx.fn_sig(def_id).instantiate(tcx, args.no_bound_vars().unwrap()).skip_norm_wip(),
             ),
             _ => unreachable!(),
         };
@@ -1697,9 +1696,12 @@ fn get_rust_try_fn<'a, 'll, 'tcx>(
         hir::Safety::Unsafe,
     ));
     let rust_try = gen_fn(cx, "__rust_try", rust_fn_sig, codegen);
-    if cx.sess().target.llvm_abiname == LlvmAbi::Pauthtest {
+
+    if cx.sess().pointer_authentication() {
+        let cfg = cx.sess().pointer_auth_config.as_ref().unwrap();
         let attrs: Vec<&Attribute> =
-            pauth_fn_attrs().iter().map(|name| llvm::CreateAttrString(cx.llcx, name)).collect();
+            cfg.fn_attrs().into_iter().map(|name| llvm::CreateAttrString(cx.llcx, name)).collect();
+
         let (_ty, rust_try_fn) = rust_try;
         crate::attributes::apply_to_llfn(rust_try_fn, AttributePlace::Function, &attrs);
     }
@@ -1762,7 +1764,7 @@ fn codegen_autodiff<'ll, 'tcx>(
     let fn_to_diff = args[0].immediate();
 
     let (diff_id, diff_args) = match fn_args.into_type_list(tcx)[1].kind() {
-        ty::FnDef(def_id, diff_args) => (def_id, diff_args),
+        ty::FnDef(def_id, diff_args) => (def_id, diff_args.no_bound_vars().unwrap()),
         _ => bug!("invalid args"),
     };
 
@@ -1825,7 +1827,7 @@ fn codegen_offload<'ll, 'tcx>(
     let fn_args = instance.args;
 
     let (target_id, target_args) = match fn_args.into_type_list(tcx)[0].kind() {
-        ty::FnDef(def_id, params) => (def_id, params),
+        ty::FnDef(def_id, params) => (def_id, params.no_bound_vars().unwrap()),
         _ => bug!("invalid offload intrinsic arg"),
     };
 

@@ -658,17 +658,25 @@ impl TargetDataLayout {
 
     /// psABI-mandated alignment for a vector type, if any
     #[inline]
-    fn cabi_vector_align(&self, vec_size: Size) -> Option<Align> {
+    fn c_vector_align(&self, vec_size: Size) -> Option<Align> {
         self.vector_align
             .iter()
             .find(|(size, _align)| *size == vec_size)
             .map(|(_size, align)| *align)
     }
 
-    /// an alignment resembling the one LLVM would pick for a vector
+    /// Rust-assigned alignment of any vector type
+    ///
+    /// When the shape of a vector matches that in a C psABI, we *must* agree when performing FFI.
+    /// This currently answers correctly for C compatibility purposes as it is a useful default.
+    /// Otherwise this choice is arbitrary, as vector types do not necessarily match hardware so
+    /// this can conjure "imaginary" answers that just happen to be convenient for us.
+    ///
+    /// Importantly, Rust vector alignment is not required to be monotonic between vector sizes,
+    /// even though it currently is.
     #[inline]
-    pub fn llvmlike_vector_align(&self, vec_size: Size) -> Align {
-        self.cabi_vector_align(vec_size)
+    pub fn rust_vector_align(&self, vec_size: Size) -> Align {
+        self.c_vector_align(vec_size)
             .unwrap_or(Align::from_bytes(vec_size.bytes().next_power_of_two()).unwrap())
     }
 
@@ -1871,10 +1879,23 @@ impl BackendRepr {
         }
     }
 
-    /// Returns `true` if this is a scalar type
+    /// Returns `true` if this is specifically a [`Self::Scalar`] type.
+    ///
+    /// This excludes SIMD types.
     #[inline]
     pub fn is_scalar(&self) -> bool {
         matches!(*self, BackendRepr::Scalar(_))
+    }
+
+    /// Returns `true` if this is a scalar type or SIMD type.
+    #[inline]
+    pub fn is_scalar_or_simd(&self) -> bool {
+        matches!(
+            *self,
+            BackendRepr::Scalar(_)
+                | BackendRepr::SimdVector { .. }
+                | BackendRepr::SimdScalableVector { .. }
+        )
     }
 
     /// Returns `true` if this is a bool
@@ -2319,6 +2340,25 @@ impl<FieldIdx: Idx, VariantIdx: Idx> LayoutData<FieldIdx, VariantIdx> {
             | BackendRepr::SimdScalableVector { .. }
             | BackendRepr::SimdVector { .. } => false,
             BackendRepr::Memory { sized } => sized && self.size.bytes() == 0,
+        }
+    }
+
+    /// In the backend, a value with this type and layout is fully represented by
+    /// its SSA value(s), independent of the contents of memory.
+    ///
+    /// For example, you can swap by reading both then writing both without using
+    /// an alloca because the store of one cannot affect the value of the other.
+    ///
+    /// Any projection into a standalone type must also yield a standalone type,
+    /// since it might not be in memory at all.
+    #[inline]
+    pub fn is_ssa_standalone(&self) -> bool {
+        match self.backend_repr {
+            BackendRepr::Memory { .. } => self.is_zst(),
+            BackendRepr::Scalar(..)
+            | BackendRepr::ScalarPair { .. }
+            | BackendRepr::SimdVector { .. }
+            | BackendRepr::SimdScalableVector { .. } => true,
         }
     }
 

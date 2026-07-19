@@ -6,7 +6,7 @@ use rustc_ast::{self as ast, NodeId};
 use rustc_errors::ErrorGuaranteed;
 use rustc_hir::def::{DefKind, MacroKinds, Namespace, NonMacroAttrKind, PartialRes, PerNS};
 use rustc_middle::{bug, span_bug};
-use rustc_session::errors::feature_err;
+use rustc_session::diagnostics::feature_err;
 use rustc_session::lint::builtin::PROC_MACRO_DERIVE_RESOLUTION_FALLBACK;
 use rustc_span::edition::Edition;
 use rustc_span::hygiene::{ExpnId, ExpnKind, LocalExpnId, MacroKind, SyntaxContext};
@@ -1831,7 +1831,9 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
     ) -> PathResult<'ra> {
         let mut module = None;
         let mut module_had_parse_errors = !self.mods_with_parse_errors.is_empty()
-            && self.mods_with_parse_errors.contains(&parent_scope.module.nearest_parent_mod());
+            && self
+                .mods_with_parse_errors
+                .contains(&parent_scope.module.nearest_parent_mod().to_def_id());
         let mut allow_super = true;
         let mut second_binding = None;
 

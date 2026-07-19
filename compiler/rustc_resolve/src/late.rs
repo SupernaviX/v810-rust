@@ -1,4 +1,4 @@
-// ignore-tidy-filelength
+// ignore-tidy-file-filelength
 //! "Late resolution" is the pass that resolves most of names in a crate beside imports and macros.
 //! It runs when the crate is fully expanded and its module structure is fully built.
 //! So it just walks through the crate and resolves all the expressions, types, etc.
@@ -32,7 +32,7 @@ use rustc_middle::middle::resolve_bound_vars::Set1;
 use rustc_middle::ty::{AssocTag, DelegationInfo, Visibility};
 use rustc_middle::{bug, span_bug};
 use rustc_session::config::{CrateType, ResolveDocLinks};
-use rustc_session::errors::feature_err;
+use rustc_session::diagnostics::feature_err;
 use rustc_session::lint;
 use rustc_span::{BytePos, DUMMY_SP, Ident, Span, Spanned, Symbol, kw, respan, sym};
 use smallvec::{SmallVec, smallvec};
@@ -424,6 +424,23 @@ impl LifetimeRib {
 pub(crate) enum AliasPossibility {
     No,
     Maybe,
+}
+
+/// Whether resolving `impl` or `mut` restriction paths
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ResolvingRestrictionKind {
+    Impl,
+    Mut,
+}
+
+impl IntoDiagArg for ResolvingRestrictionKind {
+    fn into_diag_arg(self, _: &mut Option<std::path::PathBuf>) -> DiagArgValue {
+        use std::borrow::Cow;
+        match self {
+            ResolvingRestrictionKind::Impl => DiagArgValue::Str(Cow::Borrowed("impl")),
+            ResolvingRestrictionKind::Mut => DiagArgValue::Str(Cow::Borrowed("mut")),
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -832,6 +849,9 @@ struct LateResolutionVisitor<'a, 'ast, 'ra, 'tcx> {
 
     /// Count the number of places a lifetime is used.
     lifetime_uses: FxHashMap<LocalDefId, LifetimeUseSet>,
+
+    /// `use` injections are delayed for better placement and deduplication.
+    use_injections: Vec<UseError<'tcx>>,
 }
 
 impl<'ra, 'tcx> AsRef<Resolver<'ra, 'tcx>> for LateResolutionVisitor<'_, '_, 'ra, 'tcx> {
@@ -1489,11 +1509,12 @@ impl<'ast, 'ra, 'tcx> Visitor<'ast> for LateResolutionVisitor<'_, 'ast, 'ra, 'tc
             ty,
             is_placeholder: _,
             default,
-            mut_restriction: _,
+            mut_restriction,
             safety: _,
         } = f;
         walk_list!(self, visit_attribute, attrs);
         try_visit!(self.visit_vis(vis));
+        self.resolve_restriction_path(&mut_restriction.kind, ResolvingRestrictionKind::Mut);
         visit_opt!(self, visit_ident, ident);
         try_visit!(self.visit_ty(ty));
         if let Some(v) = &default {
@@ -1526,6 +1547,7 @@ impl<'a, 'ast, 'ra, 'tcx> LateResolutionVisitor<'a, 'ast, 'ra, 'tcx> {
             // errors at module scope should always be reported
             in_func_body: false,
             lifetime_uses: Default::default(),
+            use_injections: Vec::new(),
         }
     }
 
@@ -2152,6 +2174,7 @@ impl<'a, 'ast, 'ra, 'tcx> LateResolutionVisitor<'a, 'ast, 'ra, 'tcx> {
 
         // Record the created lifetime parameter so lowering can pick it up and add it to HIR.
         self.r
+            .current_owner
             .extra_lifetime_params_map
             .entry(binder)
             .or_insert_with(Vec::new)
@@ -2864,7 +2887,10 @@ impl<'a, 'ast, 'ra, 'tcx> LateResolutionVisitor<'a, 'ast, 'ra, 'tcx> {
 
             ItemKind::Trait(Trait { generics, bounds, items, impl_restriction, .. }) => {
                 // resolve paths for `impl` restrictions
-                self.resolve_impl_restriction_path(impl_restriction);
+                self.resolve_restriction_path(
+                    &impl_restriction.kind,
+                    ResolvingRestrictionKind::Impl,
+                );
 
                 // Create a new rib for the trait-wide type parameters.
                 self.with_generic_param_rib(
@@ -4480,8 +4506,12 @@ impl<'a, 'ast, 'ra, 'tcx> LateResolutionVisitor<'a, 'ast, 'ra, 'tcx> {
         }
     }
 
-    fn resolve_impl_restriction_path(&mut self, restriction: &'ast ast::ImplRestriction) {
-        match &restriction.kind {
+    fn resolve_restriction_path(
+        &mut self,
+        restriction: &'ast ast::RestrictionKind,
+        kind: ResolvingRestrictionKind,
+    ) {
+        match &restriction {
             ast::RestrictionKind::Unrestricted => (),
             ast::RestrictionKind::Restricted { path, id, shorthand: _ } => {
                 self.smart_resolve_path(*id, &None, path, PathSource::Module);
@@ -4494,7 +4524,10 @@ impl<'a, 'ast, 'ra, 'tcx> LateResolutionVisitor<'a, 'ast, 'ra, 'tcx> {
                     ) {
                         self.r
                             .dcx()
-                            .create_err(crate::diagnostics::RestrictionAncestorOnly(path.span))
+                            .create_err(crate::diagnostics::RestrictionAncestorOnly {
+                                span: path.span,
+                                kind,
+                            })
                             .emit();
                     }
                 }
@@ -4596,7 +4629,7 @@ impl<'a, 'ast, 'ra, 'tcx> LateResolutionVisitor<'a, 'ast, 'ra, 'tcx> {
                     is_call: source.is_call(),
                 };
 
-                this.r.use_injections.push(ue);
+                this.use_injections.push(ue);
             }
 
             PartialRes::new(Res::Err)
@@ -4700,7 +4733,7 @@ impl<'a, 'ast, 'ra, 'tcx> LateResolutionVisitor<'a, 'ast, 'ra, 'tcx> {
                         }
                     } else {
                         // If there are suggested imports, the error reporting is delayed
-                        this.r.use_injections.push(UseError {
+                        this.use_injections.push(UseError {
                             err,
                             candidates,
                             node_id,
@@ -5262,7 +5295,7 @@ impl<'a, 'ast, 'ra, 'tcx> LateResolutionVisitor<'a, 'ast, 'ra, 'tcx> {
                 });
             }
 
-            ExprKind::ForLoop { ref pat, ref iter, ref body, label, kind: _ } => {
+            ExprKind::ForLoop(ForLoop { ref pat, ref iter, ref body, label, kind: _ }) => {
                 self.visit_expr(iter);
                 self.with_rib(ValueNS, RibKind::Normal, |this| {
                     this.resolve_pattern_top(pat, PatternSource::For);
@@ -5551,12 +5584,7 @@ impl<'a, 'ast, 'ra, 'tcx> LateResolutionVisitor<'a, 'ast, 'ra, 'tcx> {
             // See docs on the `known_eii_macro_resolution` field:
             // if we already know the resolution statically, don't bother resolving it.
             if let Some(target) = known_eii_macro_resolution {
-                self.smart_resolve_path(
-                    *node_id,
-                    &None,
-                    &target.foreign_item,
-                    PathSource::ExternItemImpl,
-                );
+                self.smart_resolve_path(*node_id, &None, target, PathSource::ExternItemImpl);
             } else {
                 self.smart_resolve_path(*node_id, &None, &eii_macro_path, PathSource::Macro);
             }
@@ -5678,7 +5706,10 @@ impl<'ast> Visitor<'ast> for ItemInfoCollector<'_, 'ast, '_, '_> {
 
 impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
     /// Returns the `use` and `extern crate` items of the crate, for use by `check_unused`.
-    pub(crate) fn late_resolve_crate<'ast>(&mut self, krate: &'ast Crate) -> Vec<&'ast Item> {
+    pub(crate) fn late_resolve_crate<'ast>(
+        &mut self,
+        krate: &'ast Crate,
+    ) -> (Vec<&'ast Item>, Vec<UseError<'tcx>>) {
         with_owner(self, CRATE_NODE_ID, |this| {
             let mut info_collector = ItemInfoCollector { r: this, use_items: Vec::new() };
             visit::walk_crate(&mut info_collector, krate);
@@ -5687,7 +5718,9 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
             late_resolution_visitor
                 .resolve_doc_links(&krate.attrs, MaybeExported::Ok(CRATE_NODE_ID));
             visit::walk_crate(&mut late_resolution_visitor, krate);
-            for (id, span) in late_resolution_visitor.diag_metadata.unused_labels.iter() {
+            let LateResolutionVisitor { use_injections, diag_metadata, .. } =
+                late_resolution_visitor;
+            for (id, span) in diag_metadata.unused_labels.iter() {
                 this.lint_buffer.buffer_lint(
                     lint::builtin::UNUSED_LABELS,
                     *id,
@@ -5695,7 +5728,7 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                     crate::diagnostics::UnusedLabel,
                 );
             }
-            use_items
+            (use_items, use_injections)
         })
     }
 }

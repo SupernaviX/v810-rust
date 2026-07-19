@@ -385,7 +385,7 @@ impl<'p, 'tcx> MatchVisitor<'p, 'tcx> {
             tcx: self.tcx,
             typeck_results: self.typeck_results,
             typing_env: self.typing_env,
-            module: self.tcx.parent_module(self.hir_source).to_def_id(),
+            module: self.tcx.parent_module(self.hir_source),
             dropless_arena: self.dropless_arena,
             match_lint_level: self.hir_source,
             whole_match_span,
@@ -1375,9 +1375,11 @@ fn report_non_exhaustive_match<'p, 'tcx>(
             // Arms with a never pattern don't take a body.
             pattern
         } else {
+            // ignore-tidy-todo
             format!("{pattern} => todo!()")
         }
     } else {
+        // ignore-tidy-todo
         format!("_ => todo!()")
     };
     let mut suggestion = None;

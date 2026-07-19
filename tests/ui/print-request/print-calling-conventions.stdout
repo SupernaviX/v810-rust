@@ -33,6 +33,7 @@ tail
 thiscall
 thiscall-unwind
 unadjusted
+v810-interrupt
 vectorcall
 vectorcall-unwind
 win64
