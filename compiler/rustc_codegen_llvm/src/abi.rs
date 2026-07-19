@@ -453,6 +453,9 @@ impl<'ll, 'tcx> FnAbiLlvmExt<'ll, 'tcx> for FnAbi<'tcx, Ty<'tcx>> {
             CanonAbi::Interrupt(InterruptKind::RiscvSupervisor) => {
                 func_attrs.push(llvm::CreateAttrStringValue(cx.llcx, "interrupt", "supervisor"))
             }
+            CanonAbi::Interrupt(InterruptKind::V810) => {
+                func_attrs.push(llvm::CreateAttrString(cx.llcx, "interrupt"))
+            }
             CanonAbi::Arm(ArmCall::CCmseNonSecureEntry) => {
                 func_attrs.push(llvm::CreateAttrString(cx.llcx, "cmse_nonsecure_entry"))
             }
@@ -744,6 +747,7 @@ pub(crate) fn to_llvm_calling_convention(sess: &Session, abi: CanonAbi) -> llvm:
             InterruptKind::AvrNonBlocking => llvm::AvrNonBlockingInterrupt,
             InterruptKind::Msp430 => llvm::Msp430Intr,
             InterruptKind::RiscvMachine | InterruptKind::RiscvSupervisor => llvm::CCallConv,
+            InterruptKind::V810 => llvm::CCallConv,
             InterruptKind::X86 => llvm::X86_Intr,
         },
         CanonAbi::Arm(arm_call) => match arm_call {

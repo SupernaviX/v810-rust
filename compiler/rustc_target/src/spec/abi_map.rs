@@ -194,7 +194,7 @@ impl AbiMap {
             (ExternAbi::RiscvInterruptS, ArchKind::Riscv) => {
                 CanonAbi::Interrupt(InterruptKind::RiscvSupervisor)
             }
-            (ExternAbi::V810Interrupt, ArchKind::V810) => CanonAbi::Interrupt(InterruptKind::V810),
+            (ExternAbi::V810Interrupt, ArchKind::Other) => CanonAbi::Interrupt(InterruptKind::V810),
             (ExternAbi::X86Interrupt, ArchKind::X86 | ArchKind::X86_64) => {
                 CanonAbi::Interrupt(InterruptKind::X86)
             }
