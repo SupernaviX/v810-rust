@@ -275,6 +275,7 @@ pub fn conv_to_fn_attribute<'gcc>(sess: &Session, conv: CanonAbi) -> Option<FnAt
             InterruptKind::Msp430 => FnAttribute::Msp430Interrupt,
             InterruptKind::RiscvMachine => FnAttribute::RiscvInterrupt("machine"),
             InterruptKind::RiscvSupervisor => FnAttribute::RiscvInterrupt("supervisor"),
+            InterruptKind::V810 => FnAttribute::V810Interrupt,
             InterruptKind::X86 => FnAttribute::X86Interrupt,
         },
         CanonAbi::X86(x86_call) => match x86_call {

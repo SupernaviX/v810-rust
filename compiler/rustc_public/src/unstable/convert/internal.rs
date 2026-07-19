@@ -607,6 +607,7 @@ impl RustcInternal for Abi {
             Abi::SysV64 { unwind } => rustc_abi::ExternAbi::SysV64 { unwind },
             Abi::PtxKernel => rustc_abi::ExternAbi::PtxKernel,
             Abi::Msp430Interrupt => rustc_abi::ExternAbi::Msp430Interrupt,
+            Abi::V810Interrupt => rustc_abi::ExternAbi::V810Interrupt,
             Abi::X86Interrupt => rustc_abi::ExternAbi::X86Interrupt,
             Abi::GpuKernel => rustc_abi::ExternAbi::GpuKernel,
             Abi::EfiApi => rustc_abi::ExternAbi::EfiApi,

@@ -119,6 +119,9 @@ pub fn extern_abi_stability(abi: ExternAbi) -> Result<(), UnstableAbi> {
             feature: sym::abi_msp430_interrupt,
             explain: GateReason::Experimental,
         }),
+        ExternAbi::V810Interrupt => {
+            Err(UnstableAbi { abi, feature: sym::interrupt, explain: GateReason::ImplDetail })
+        }
         ExternAbi::X86Interrupt => Err(UnstableAbi {
             abi,
             feature: sym::abi_x86_interrupt,

@@ -100,6 +100,7 @@ impl fmt::Display for CanonAbi {
                 InterruptKind::Msp430 => ExternAbi::Msp430Interrupt,
                 InterruptKind::RiscvMachine => ExternAbi::RiscvInterruptM,
                 InterruptKind::RiscvSupervisor => ExternAbi::RiscvInterruptS,
+                InterruptKind::V810 => ExternAbi::V810Interrupt,
                 InterruptKind::X86 => ExternAbi::X86Interrupt,
             },
             CanonAbi::X86(x86_call) => match x86_call {
@@ -130,6 +131,7 @@ pub enum InterruptKind {
     RiscvMachine,
     RiscvSupervisor,
     X86,
+    V810,
 }
 
 /// ABIs defined for x86-{32,64}
