@@ -215,11 +215,11 @@ abi_impls! {
             Thiscall { unwind: false } =><= "thiscall",
             Thiscall { unwind: true } =><= "thiscall-unwind",
             Unadjusted =><= "unadjusted",
+            V810Interrupt =><= "v810-interrupt",
             Vectorcall { unwind: false } =><= "vectorcall",
             Vectorcall { unwind: true } =><= "vectorcall-unwind",
             Win64 { unwind: false } =><= "win64",
             Win64 { unwind: true } =><= "win64-unwind",
-            V810Interrupt =><= "v810-interrupt",
             X86Interrupt =><= "x86-interrupt",
     }
 }
