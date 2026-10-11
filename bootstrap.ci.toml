@@ -23,7 +23,6 @@ tools = [
     "rust-std",
     "llvm-tools"
 ]
-compiletest-use-stage0-libtest = false
 
 [dist]
 compression-formats = ["xz"]
