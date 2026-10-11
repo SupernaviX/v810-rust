@@ -8,6 +8,7 @@
 //! or constant found within. (This underlying query is what is cached.)
 
 use rustc_macros::{StableHash, TyDecodable, TyEncodable};
+use rustc_span::bug;
 use tracing::{debug, instrument};
 
 use crate::traits::query::NoSolution;
@@ -73,10 +74,14 @@ impl<'tcx> TyCtxt<'tcx> {
     ) {
         let value = self.erase_and_anonymize_regions(value);
         if value.has_aliases() {
-            assert_eq!(
-                value.clone(),
-                value.fold_with(&mut NormalizeAfterErasingRegionsFolder { tcx: self, typing_env })
-            )
+            // We want this check to also detect cases where an alias is incorrectly
+            // rigid in the current `TypingEnv`. This is the case if we use values
+            // which have been normalized in a different `TypingEnv` without
+            // renormalizing them. This was necessary to catch e.g. #163724.
+            let normalized = ty::set_aliases_to_non_rigid(self, value.clone())
+                .skip_normalization()
+                .fold_with(&mut NormalizeAfterErasingRegionsFolder { tcx: self, typing_env });
+            assert_eq!(value, normalized);
         }
     }
 

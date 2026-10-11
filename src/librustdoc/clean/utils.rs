@@ -7,12 +7,11 @@ use rustc_ast as ast;
 use rustc_ast::join_path_idents;
 use rustc_ast::token::{Token, TokenKind};
 use rustc_ast::tokenstream::TokenTree;
+use rustc_attr_ir::{DocAttribute, find_attr};
 use rustc_data_structures::thin_vec::{ThinVec, thin_vec};
 use rustc_hir as hir;
-use rustc_hir::attrs::DocAttribute;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::{DefId, LOCAL_CRATE, LocalDefId};
-use rustc_hir::find_attr;
 use rustc_metadata::rendered_const;
 use rustc_middle::mir;
 use rustc_middle::ty::{self, GenericArgKind, GenericArgsRef, TyCtxt, TypeVisitableExt};
@@ -117,18 +116,22 @@ pub(crate) fn clean_middle_generic_args<'tcx>(
     };
 
     let mut elision_has_failed_once_before = false;
+
+    // Calculates where the parent trait's generic parameters end
+    let index_offset = generics.count() - args.len();
     let clean_arg = |(index, &arg): (usize, &ty::GenericArg<'tcx>)| {
         // Elide the self type.
         if has_self && index == 0 {
             return None;
         }
 
-        let param = generics.param_at(index, cx.tcx);
+        // Skips over the parent trait's generic parameters
+        let param = generics.param_at(index + index_offset, cx.tcx);
         let arg = ty::Binder::bind_with_vars(arg, bound_vars);
 
         // Elide arguments that coincide with their default.
         if !elision_has_failed_once_before && let Some(default) = param.default_value(cx.tcx) {
-            let default = default.instantiate(cx.tcx, args.as_ref()).skip_norm_wip();
+            let default = default.instantiate(cx.tcx, args.as_ref()).skip_normalization();
             if can_elide_generic_arg(arg, arg.rebind(default)) {
                 return None;
             }
@@ -309,7 +312,7 @@ pub(crate) fn name_from_pat(p: &hir::Pat<'_>) -> Symbol {
             return kw::Underscore;
         }
         PatKind::Binding(_, _, ident, _) => return ident.name,
-        PatKind::Box(p) | PatKind::Ref(p, _, _) | PatKind::Guard(p, _) => return name_from_pat(p),
+        PatKind::Ref(p, _, _) | PatKind::Guard(p, _) => return name_from_pat(p),
         PatKind::TupleStruct(p, ..) | PatKind::Expr(PatExpr { kind: PatExprKind::Path(p), .. }) => {
             qpath_to_string(p)
         }
@@ -353,10 +356,11 @@ pub(crate) fn print_const(tcx: TyCtxt<'_>, n: ty::Const<'_>) -> String {
     match n.kind() {
         ty::ConstKind::Alias(_, ty::AliasConst { kind, .. }) => {
             let def_id: DefId = match kind {
-                ty::AliasConstKind::Projection { def_id } => def_id.into(),
-                ty::AliasConstKind::Inherent { def_id } => def_id.into(),
-                ty::AliasConstKind::Free { def_id } => def_id.into(),
-                ty::AliasConstKind::Anon { def_id } => def_id.into(),
+                ty::AliasConstKind::Projection { def_id }
+                | ty::AliasConstKind::InherentSelf { def_id }
+                | ty::AliasConstKind::InherentImpl { def_id }
+                | ty::AliasConstKind::Free { def_id }
+                | ty::AliasConstKind::Anon { def_id } => def_id,
             };
             if let Some(local_def_id) = def_id.as_local()
                 && let Some(body_id) = tcx.hir_maybe_body_owned_by(local_def_id)
@@ -575,7 +579,7 @@ pub(crate) fn find_nearest_parent_module(tcx: TyCtxt<'_>, def_id: DefId) -> Opti
     }
 }
 
-/// This function exists because it runs on `hir::Attributes` whereas the other is a
+/// This function exists because it runs on `rustc_attr_ir::Attributes` whereas the other is a
 /// `clean::Attributes` method.
 pub(crate) fn has_doc_flag<F: Fn(&DocAttribute) -> bool>(
     tcx: TyCtxt<'_>,

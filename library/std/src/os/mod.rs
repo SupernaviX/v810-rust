@@ -16,7 +16,7 @@ pub mod raw;
 #[cfg(doc)]
 cfg_select! {
     any(
-        all(target_arch = "wasm32", not(target_os = "wasi")),
+        all(target_family = "wasm", not(target_os = "wasi")),
         all(target_vendor = "fortanix", target_env = "sgx")
     ) => {
         #[unstable(issue = "none", feature = "std_internals")]
@@ -54,7 +54,7 @@ cfg_select! {
         pub mod linux;
     }
     target_family = "wasm" => {
-        #[cfg(any(target_env = "p1", target_env = "p2"))]
+        #[cfg(any(target_env = "p1", target_env = "p2", target_env = "p3"))]
         pub mod wasi;
         #[cfg(target_env = "p2")]
         pub mod wasip2;

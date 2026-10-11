@@ -162,7 +162,7 @@ pub(crate) fn emit_unescape_error(
                 );
             } else {
                 if mode == Mode::Str || mode == Mode::Char {
-                    diag.span_suggestion(
+                    diag.span_suggestion_verbose(
                         full_lit_span,
                         "if you meant to write a literal backslash (perhaps escaping in a regular expression), consider a raw string literal",
                         format!("r\"{lit}\""),
@@ -177,7 +177,7 @@ pub(crate) fn emit_unescape_error(
 
                 foreign_escape_suggestion(&mut diag, (&ec, span), err_span);
             }
-            diag.emit()
+            diag.emit_err()
         }
         EscapeError::TooShortHexEscape => dcx.emit_err(UnescapeError::TooShortHexEscape(err_span)),
         EscapeError::InvalidCharInHexEscape | EscapeError::InvalidCharInUnicodeEscape => {
@@ -204,7 +204,7 @@ pub(crate) fn emit_unescape_error(
             // Note: the \\xHH suggestions are not given for raw byte string
             // literals, because they are araw and so cannot use any escapes.
             if (c as u32) <= 0xFF && mode != Mode::RawByteStr {
-                err.span_suggestion(
+                err.span_suggestion_verbose(
                     span,
                     format!(
                         "if you meant to use the unicode code point for {c:?}, use a \\xHH escape"
@@ -217,7 +217,7 @@ pub(crate) fn emit_unescape_error(
             } else if mode != Mode::RawByteStr {
                 let mut utf8 = String::new();
                 utf8.push(c);
-                err.span_suggestion(
+                err.span_suggestion_verbose(
                     span,
                     format!("if you meant to use the UTF-8 encoding of {c:?}, use \\xHH escapes"),
                     utf8.as_bytes()
@@ -227,7 +227,7 @@ pub(crate) fn emit_unescape_error(
                     Applicability::MaybeIncorrect,
                 );
             }
-            err.emit()
+            err.emit_err()
         }
         EscapeError::OutOfRangeHexEscape => {
             let mut err = dcx.struct_span_err(err_span, "out of range hex escape");
@@ -247,7 +247,7 @@ pub(crate) fn emit_unescape_error(
                 ));
             }
 
-            err.emit()
+            err.emit_err()
         }
         EscapeError::LeadingUnderscoreUnicodeEscape => {
             let (c, span) = last_char();
@@ -313,7 +313,7 @@ fn foreign_escape_suggestion(
     err_span: Span,
 ) {
     if escaped_char == "?" {
-        diag.span_suggestion(
+        diag.span_suggestion_verbose(
             err_span,
             "if you meant to write a literal question mark, don't escape the character",
             "?",
@@ -336,7 +336,7 @@ fn foreign_escape_suggestion(
         _ => return,
     };
 
-    diag.span_suggestion(
+    diag.span_suggestion_verbose(
         escape_span,
         format!("if you meant to write {name}, use a hex escape"),
         format!("x{hex}"),

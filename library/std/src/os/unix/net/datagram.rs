@@ -46,7 +46,8 @@ const MSG_NOSIGNAL: core::ffi::c_int = 0x0;
 ///
 /// # Examples
 ///
-/// ```no_run
+#[cfg_attr(target_family = "unix", doc = "```no_run")]
+#[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
 /// use std::os::unix::net::UnixDatagram;
 ///
 /// fn main() -> std::io::Result<()> {
@@ -81,7 +82,8 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixDatagram;
     ///
     /// let sock = match UnixDatagram::bind("/path/to/the/socket") {
@@ -108,14 +110,14 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    /// ```no_run
-    /// use std::os::unix::net::{UnixDatagram};
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
+    /// use std::os::unix::net::{SocketAddr, UnixDatagram};
     ///
     /// fn main() -> std::io::Result<()> {
-    ///     let sock1 = UnixDatagram::bind("path/to/socket")?;
-    ///     let addr = sock1.local_addr()?;
+    ///     let addr = SocketAddr::from_pathname("path/to/socket")?;
     ///
-    ///     let sock2 = match UnixDatagram::bind_addr(&addr) {
+    ///     let sock = match UnixDatagram::bind_addr(&addr) {
     ///         Ok(sock) => sock,
     ///         Err(err) => {
     ///             println!("Couldn't bind: {err:?}");
@@ -142,7 +144,8 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixDatagram;
     ///
     /// let sock = match UnixDatagram::unbound() {
@@ -165,7 +168,8 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixDatagram;
     ///
     /// let (sock1, sock2) = match UnixDatagram::pair() {
@@ -193,7 +197,8 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixDatagram;
     ///
     /// fn main() -> std::io::Result<()> {
@@ -222,7 +227,8 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::{UnixDatagram};
     ///
     /// fn main() -> std::io::Result<()> {
@@ -260,12 +266,13 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixDatagram;
     ///
     /// fn main() -> std::io::Result<()> {
     ///     let sock = UnixDatagram::bind("/path/to/the/socket")?;
-    ///     let sock_copy = sock.try_clone().expect("try_clone failed");
+    ///     let sock_copy = sock.try_clone().expect("`UnixDatagram::try_clone` should not fail");
     ///     Ok(())
     /// }
     /// ```
@@ -278,12 +285,13 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixDatagram;
     ///
     /// fn main() -> std::io::Result<()> {
     ///     let sock = UnixDatagram::bind("/path/to/the/socket")?;
-    ///     let addr = sock.local_addr().expect("Couldn't get local address");
+    ///     let addr = sock.local_addr().expect("`UnixDatagram::local_addr` should not fail");
     ///     Ok(())
     /// }
     /// ```
@@ -300,14 +308,15 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixDatagram;
     ///
     /// fn main() -> std::io::Result<()> {
     ///     let sock = UnixDatagram::unbound()?;
     ///     sock.connect("/path/to/the/socket")?;
     ///
-    ///     let addr = sock.peer_addr().expect("Couldn't get peer address");
+    ///     let addr = sock.peer_addr().expect("`UnixDatagram::peer_addr` should not fail");
     ///     Ok(())
     /// }
     /// ```
@@ -350,7 +359,8 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixDatagram;
     ///
     /// fn main() -> std::io::Result<()> {
@@ -372,13 +382,14 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixDatagram;
     ///
     /// fn main() -> std::io::Result<()> {
     ///     let sock = UnixDatagram::bind("/path/to/the/socket")?;
     ///     let mut buf = vec![0; 10];
-    ///     sock.recv(buf.as_mut_slice()).expect("recv function failed");
+    ///     sock.recv(buf.as_mut_slice()).expect("`UnixDatagram::recv` should not fail");
     ///     Ok(())
     /// }
     /// ```
@@ -505,12 +516,13 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixDatagram;
     ///
     /// fn main() -> std::io::Result<()> {
     ///     let sock = UnixDatagram::unbound()?;
-    ///     sock.send_to(b"omelette au fromage", "/some/sock").expect("send_to function failed");
+    ///     sock.send_to(b"omelette au fromage", "/some/sock").expect("`UnixDatagram::send_to` should not fail");
     ///     Ok(())
     /// }
     /// ```
@@ -539,7 +551,8 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::{UnixDatagram};
     ///
     /// fn main() -> std::io::Result<()> {
@@ -547,7 +560,7 @@ impl UnixDatagram {
     ///     let addr = bound.local_addr()?;
     ///
     ///     let sock = UnixDatagram::unbound()?;
-    ///     sock.send_to_addr(b"bacon egg and cheese", &addr).expect("send_to_addr function failed");
+    ///     sock.send_to_addr(b"bacon egg and cheese", &addr).expect("`UnixDatagram::send_to_addr` should not fail");
     ///     Ok(())
     /// }
     /// ```
@@ -575,13 +588,14 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixDatagram;
     ///
     /// fn main() -> std::io::Result<()> {
     ///     let sock = UnixDatagram::unbound()?;
-    ///     sock.connect("/some/sock").expect("Couldn't connect");
-    ///     sock.send(b"omelette au fromage").expect("send_to function failed");
+    ///     sock.connect("/some/sock").expect("`UnixDatagram::connect` should not fail");
+    ///     sock.send(b"omelette au fromage").expect("`UnixDatagram` is not connected");
     ///     Ok(())
     /// }
     /// ```
@@ -623,7 +637,7 @@ impl UnixDatagram {
     ///     let mut ancillary = SocketAncillary::new(&mut ancillary_buffer[..]);
     ///     ancillary.add_fds(&fds[..]);
     ///     sock.send_vectored_with_ancillary_to(bufs, &mut ancillary, "/some/sock")
-    ///         .expect("send_vectored_with_ancillary_to function failed");
+    ///         .expect("`UnixDatagram::send_vectored_with_ancillary_to` should not fail");
     ///     Ok(())
     /// }
     /// ```
@@ -671,7 +685,7 @@ impl UnixDatagram {
     ///     let mut ancillary = SocketAncillary::new(&mut ancillary_buffer[..]);
     ///     ancillary.add_fds(&fds[..]);
     ///     sock.send_vectored_with_ancillary(bufs, &mut ancillary)
-    ///         .expect("send_vectored_with_ancillary function failed");
+    ///         .expect("`UnixDatagram::send_vectored_with_ancillary` should not fail");
     ///     Ok(())
     /// }
     /// ```
@@ -696,14 +710,15 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    /// ```
+    #[cfg_attr(target_family = "unix", doc = "```")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixDatagram;
     /// use std::time::Duration;
     ///
     /// fn main() -> std::io::Result<()> {
     ///     let sock = UnixDatagram::unbound()?;
     ///     sock.set_read_timeout(Some(Duration::new(1, 0)))
-    ///         .expect("set_read_timeout function failed");
+    ///         .expect("`UnixDatagram::set_read_timeout` should not fail");
     ///     Ok(())
     /// }
     /// ```
@@ -711,7 +726,8 @@ impl UnixDatagram {
     /// An [`Err`] is returned if the zero [`Duration`] is passed to this
     /// method:
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::io;
     /// use std::os::unix::net::UnixDatagram;
     /// use std::time::Duration;
@@ -740,14 +756,15 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    /// ```
+    #[cfg_attr(target_family = "unix", doc = "```")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixDatagram;
     /// use std::time::Duration;
     ///
     /// fn main() -> std::io::Result<()> {
     ///     let sock = UnixDatagram::unbound()?;
     ///     sock.set_write_timeout(Some(Duration::new(1, 0)))
-    ///         .expect("set_write_timeout function failed");
+    ///         .expect("`UnixDatagram::set_write_timeout` should not fail");
     ///     Ok(())
     /// }
     /// ```
@@ -755,7 +772,8 @@ impl UnixDatagram {
     /// An [`Err`] is returned if the zero [`Duration`] is passed to this
     /// method:
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::io;
     /// use std::os::unix::net::UnixDatagram;
     /// use std::time::Duration;
@@ -777,14 +795,15 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    /// ```
+    #[cfg_attr(target_family = "unix", doc = "```")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixDatagram;
     /// use std::time::Duration;
     ///
     /// fn main() -> std::io::Result<()> {
     ///     let sock = UnixDatagram::unbound()?;
     ///     sock.set_read_timeout(Some(Duration::new(1, 0)))
-    ///         .expect("set_read_timeout function failed");
+    ///         .expect("`UnixDatagram::set_read_timeout` should not fail");
     ///     assert_eq!(sock.read_timeout()?, Some(Duration::new(1, 0)));
     ///     Ok(())
     /// }
@@ -798,14 +817,15 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    /// ```
+    #[cfg_attr(target_family = "unix", doc = "```")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixDatagram;
     /// use std::time::Duration;
     ///
     /// fn main() -> std::io::Result<()> {
     ///     let sock = UnixDatagram::unbound()?;
     ///     sock.set_write_timeout(Some(Duration::new(1, 0)))
-    ///         .expect("set_write_timeout function failed");
+    ///         .expect("`UnixDatagram::set_write_timeout` should not fail");
     ///     assert_eq!(sock.write_timeout()?, Some(Duration::new(1, 0)));
     ///     Ok(())
     /// }
@@ -819,12 +839,13 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    /// ```
+    #[cfg_attr(target_family = "unix", doc = "```")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixDatagram;
     ///
     /// fn main() -> std::io::Result<()> {
     ///     let sock = UnixDatagram::unbound()?;
-    ///     sock.set_nonblocking(true).expect("set_nonblocking function failed");
+    ///     sock.set_nonblocking(true).expect("`UnixDatagram::set_nonblocking` should not fail");
     ///     Ok(())
     /// }
     /// ```
@@ -862,7 +883,8 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixDatagram;
     ///
     /// fn main() -> std::io::Result<()> {
@@ -884,13 +906,14 @@ impl UnixDatagram {
     /// specified portions to immediately return with an appropriate value
     /// (see the documentation of [`Shutdown`]).
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixDatagram;
     /// use std::net::Shutdown;
     ///
     /// fn main() -> std::io::Result<()> {
     ///     let sock = UnixDatagram::unbound()?;
-    ///     sock.shutdown(Shutdown::Both).expect("shutdown function failed");
+    ///     sock.shutdown(Shutdown::Both).expect("`UnixDatagram::shutdown` should not fail");
     ///     Ok(())
     /// }
     /// ```
@@ -908,7 +931,8 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// #![feature(unix_socket_peek)]
     ///
     /// use std::os::unix::net::UnixDatagram;
@@ -916,7 +940,7 @@ impl UnixDatagram {
     /// fn main() -> std::io::Result<()> {
     ///     let socket = UnixDatagram::bind("/tmp/sock")?;
     ///     let mut buf = [0; 10];
-    ///     let len = socket.peek(&mut buf).expect("peek failed");
+    ///     let len = socket.peek(&mut buf).expect("`UnixDatagram::peek` should not fail");
     ///     Ok(())
     /// }
     /// ```
@@ -940,7 +964,8 @@ impl UnixDatagram {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// #![feature(unix_socket_peek)]
     ///
     /// use std::os::unix::net::UnixDatagram;

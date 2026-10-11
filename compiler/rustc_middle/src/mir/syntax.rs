@@ -5,6 +5,7 @@
 
 use rustc_abi::{FieldIdx, VariantIdx};
 use rustc_ast::{InlineAsmOptions, InlineAsmTemplatePiece, Mutability};
+use rustc_attr_ir::UnrollAttr;
 use rustc_data_structures::packed::Pu128;
 use rustc_hir::CoroutineKind;
 use rustc_hir::def_id::DefId;
@@ -14,6 +15,7 @@ use rustc_span::def_id::LocalDefId;
 use rustc_span::{Span, Spanned, Symbol};
 use rustc_target::asm::InlineAsmRegOrRegClass;
 use smallvec::SmallVec;
+use thin_vec::ThinVec;
 
 use super::{BasicBlock, Const, Local, UserTypeProjection};
 use crate::mir::coverage::CoverageKind;
@@ -104,12 +106,13 @@ pub enum AnalysisPhase {
     /// * [`TerminatorKind::FalseEdge`]
     /// * [`StatementKind::FakeRead`]
     /// * [`StatementKind::AscribeUserType`]
-    /// * [`StatementKind::Coverage`] with [`CoverageKind::BlockMarker`] or
-    ///   [`CoverageKind::SpanMarker`]
+    /// * [`StatementKind::Coverage`] with [`CoverageKind::is_removed_after_analysis`]
     /// * [`Rvalue::Ref`] with `BorrowKind::Fake`
     /// * [`CastKind::PointerCoercion`] with any of the following:
     ///   * [`PointerCoercion::ArrayToPointer`]
     ///   * [`PointerCoercion::MutToConstPointer`]
+    ///
+    /// [`CoverageKind::is_removed_after_analysis`]: crate::mir::coverage::CoverageKind::is_removed_after_analysis
     ///
     /// Furthermore, `Deref` projections must be the first projection within any place (if they
     /// appear at all)
@@ -415,7 +418,7 @@ pub enum StatementKind<'tcx> {
     ///
     /// Coverage statements are used in conjunction with the coverage mappings and other
     /// information stored in the function's
-    /// [`mir::Body::function_coverage_info`](crate::mir::Body::function_coverage_info).
+    /// [`mir::Body::coverage_mir_info`](crate::mir::Body::coverage_mir_info).
     /// (For inlined MIR, take care to look up the *original function's* coverage info.)
     ///
     /// Interpreters and codegen backends that don't support coverage instrumentation
@@ -682,7 +685,7 @@ pub enum InlineAsmMacro {
 #[derive(Clone, TyEncodable, TyDecodable, StableHash, PartialEq, TypeFoldable, TypeVisitable)]
 pub enum TerminatorKind<'tcx> {
     /// Block has one successor; we continue execution there.
-    Goto { target: BasicBlock },
+    Goto { target: BasicBlock, loop_hint_attrs: ThinVec<UnrollAttr> },
 
     /// Switches based on the computed value.
     ///
@@ -1255,6 +1258,26 @@ pub enum ProjectionElem<V, T> {
     /// A transmute from an unsafe binder to the type that it wraps. This is a projection
     /// of a place, so it doesn't necessarily constitute a move out of the binder.
     UnwrapUnsafeBinder(T),
+
+    /// A symbolic dereference of a `Reborrow` type that does not contain any `&mut T` fields.
+    ///
+    /// If a type is `Reborrow` and contains a `&mut T` field then reborrowing it reborrows the `T`,
+    /// producing a borrow on an indirect place, producing a value that can be returned from the
+    /// function since it does not capture any local place. If no such field exists, then
+    /// reborrowing the type must dereference the type itself to find an indirect place, but
+    /// generally such types will not implement `Deref`. Therefore, in borrow checking we instead
+    /// perform a "phantom dereference" (named so because the type will usually contain some
+    /// `PhantomData<&'a ()>` or equivalent that captures the lifetime) to access an indeterminate
+    /// indirect place.
+    ///
+    /// FIXME(reborrow): currently this variant is not considered an indirect place for whatever
+    /// reason. This variant makes no sense if that cannot be fixed.
+    ///
+    /// FIXME(reborrow): if the Reborrow traits experiment is rejected, this variant can be removed:
+    /// see the [PR].
+    ///
+    /// [PR]: https://github.com/rust-lang/rust/pull/159103
+    PhantomDeref,
 }
 
 /// Alias for projections as they appear in places, where the base is a place
@@ -1496,6 +1519,14 @@ pub enum CastKind {
     /// MIR is well-formed if the input and output types have different sizes,
     /// but running a transmute between differently-sized types is UB.
     Transmute,
+    /// A special transmute used by elaborated `box` deref's to turn the inner pointer into a raw
+    /// pointer. This is almost equivalent to a regular transmute except that if the input would not
+    /// be valid as `Box<T>`, the cast is UB. Backends that do not care about UB detection can treat
+    /// this like a regular transmute.
+    ///
+    /// Well-formedness: The input type must be a pointer type or a newtype around one (e.g.
+    /// `NonNull`). The output type must be a raw pointer.
+    BoxDerefTransmute,
 
     /// A `Subtype` cast is applied to any [`StatementKind::Assign`] where
     /// type of lvalue doesn't match the type of rvalue, the primary goal is making subtyping
@@ -1676,12 +1707,14 @@ pub enum BinOp {
     /// The `<=>` operator (three-way comparison, like `Ord::cmp`)
     ///
     /// This is supported only on the integer types and `char`, always returning
-    /// [`rustc_hir::LangItem::OrderingEnum`] (aka [`std::cmp::Ordering`]).
+    /// [`LangItem::OrderingEnum`] (aka [`std::cmp::Ordering`]).
     ///
     /// [`Rvalue::BinaryOp`]`(BinOp::Cmp, A, B)` returns
     /// - `Ordering::Less` (`-1_i8`, as a Scalar) if `A < B`
     /// - `Ordering::Equal` (`0_i8`, as a Scalar) if `A == B`
     /// - `Ordering::Greater` (`+1_i8`, as a Scalar) if `A > B`
+    ///
+    /// [`LangItem::OrderingEnum`]: rustc_attr_ir::lang_items::LangItem
     Cmp,
     /// The `ptr.offset` operator
     Offset,

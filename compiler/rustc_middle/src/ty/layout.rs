@@ -6,15 +6,14 @@ use rustc_abi::{
     PointerKind, Primitive, ReprFlags, ReprOptions, Scalar, Size, TagEncoding, TargetDataLayout,
     TyAbiInterface, VariantIdx, Variants,
 };
-use rustc_errors::{
-    Diag, DiagArgValue, DiagCtxtHandle, Diagnostic, EmissionGuarantee, IntoDiagArg, Level,
-};
+use rustc_attr_ir::lang_items::LangItem;
+use rustc_errors::{Diag, DiagArgValue, DiagCtxtHandle, Diagnostic, IntoDiagArg, Level};
 use rustc_hir as hir;
-use rustc_hir::LangItem;
 use rustc_hir::def_id::DefId;
 use rustc_macros::{StableHash, TyDecodable, TyEncodable, extension};
 use rustc_session::config::OptLevel;
-use rustc_span::{DUMMY_SP, ErrorGuaranteed, Span, Symbol, sym};
+use rustc_span::{DUMMY_SP, ErrorGuaranteed, Span, Spanned, Symbol, bug, span_bug, sym};
+use rustc_structures::Limit;
 use rustc_target::callconv::FnAbi;
 use rustc_target::spec::{HasTargetSpec, HasX86AbiOpt, Target, X86Abi};
 use tracing::debug;
@@ -22,6 +21,7 @@ use tracing::debug;
 use crate::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use crate::query::TyCtxtAt;
 use crate::traits::ObligationCause;
+use crate::ty::consts::ConstExt;
 use crate::ty::normalize_erasing_regions::NormalizationError;
 use crate::ty::{self, CoroutineArgsExt, Ty, TyCtxt, TypeVisitableExt, Unnormalized};
 
@@ -68,9 +68,11 @@ impl abi::Integer {
     }
 
     /// Finds the appropriate Integer type and signedness for the given
-    /// signed discriminant range and `#[repr]` attribute.
-    /// N.B.: `u128` values above `i128::MAX` will be treated as signed, but
-    /// that shouldn't affect anything, other than maybe debuginfo.
+    /// discriminant range and `#[repr]` attribute.
+    ///
+    /// To represent the way the values were written in the rust source, min and max
+    /// are in different types. It's thus possible to pass in an unrepresentable range,
+    /// and the method will panic in those cases.
     ///
     /// This is the basis for computing the type of the *tag* of an enum (which can be smaller than
     /// the type of the *discriminant*, which is determined by [`ReprOptions::discr_type`]).
@@ -78,15 +80,24 @@ impl abi::Integer {
         tcx: TyCtxt<'tcx>,
         ty: Ty<'tcx>,
         repr: &ReprOptions,
-        min: i128,
-        max: i128,
+        min_negative: i128,
+        max_positive: u128,
     ) -> (abi::Integer, bool) {
+        assert!(
+            min_negative >= 0 || max_positive <= i128::MAX.cast_unsigned(),
+            "No type can represent the full range of {min_negative}..={max_positive}",
+        );
+
         // Theoretically, negative values could be larger in unsigned representation
         // than the unsigned representation of the signed minimum. However, if there
         // are any negative values, the only valid unsigned representation is u128
         // which can fit all i128 values, so the result remains unaffected.
-        let unsigned_fit = abi::Integer::fit_unsigned(cmp::max(min as u128, max as u128));
-        let signed_fit = cmp::max(abi::Integer::fit_signed(min), abi::Integer::fit_signed(max));
+        let unsigned_fit =
+            abi::Integer::fit_unsigned(cmp::max(min_negative.cast_unsigned(), max_positive));
+        let signed_fit = cmp::max(
+            abi::Integer::fit_signed(min_negative),
+            abi::Integer::fit_signed(max_positive.cast_signed()),
+        );
 
         if let Some(ity) = repr.int {
             let discr = abi::Integer::from_attr(&tcx, ity);
@@ -127,9 +138,19 @@ impl abi::Float {
         use abi::Float::*;
         match *self {
             F16 => tcx.types.f16,
+            F16B => Ty::new_adt(
+                tcx,
+                tcx.adt_def(tcx.require_lang_item(LangItem::F16B, DUMMY_SP)),
+                ty::List::empty(),
+            ),
             F32 => tcx.types.f32,
             F64 => tcx.types.f64,
             F128 => tcx.types.f128,
+            PpcF128 => Ty::new_adt(
+                tcx,
+                tcx.adt_def(tcx.require_lang_item(LangItem::PpcF128, DUMMY_SP)),
+                ty::List::empty(),
+            ),
         }
     }
 
@@ -184,8 +205,6 @@ pub const WIDE_PTR_ADDR: usize = 0;
 /// - For a slice, this is the length.
 pub const WIDE_PTR_EXTRA: usize = 1;
 
-pub const MAX_SIMD_LANES: u64 = rustc_abi::MAX_SIMD_LANES;
-
 /// Used in `check_validity_requirement` to indicate the kind of initialization
 /// that is checked to be valid
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, StableHash)]
@@ -227,7 +246,7 @@ pub enum SimdLayoutError {
     ZeroLength,
     /// The vector has more lanes than supported or permitted by
     /// #\[rustc_simd_monomorphize_lane_limit\].
-    TooManyLanes(u64),
+    TooManyLanes(Limit),
 }
 
 #[derive(Copy, Clone, Debug, StableHash, TyEncodable, TyDecodable)]
@@ -353,14 +372,15 @@ impl<'tcx> SizeSkeleton<'tcx> {
         let recursion_limit = tcx.recursion_limit();
         if depth >= recursion_limit.0 {
             let suggested_limit = match recursion_limit {
-                hir::limit::Limit(0) => hir::limit::Limit(2),
+                Limit(0) => Limit(2),
                 limit => limit * 2,
             };
-            let reported = tcx.dcx().emit_err(crate::error::RecursionLimitReachedSizeSkeleton {
-                span,
-                ty,
-                suggested_limit,
-            });
+            let reported =
+                tcx.dcx().emit_err(crate::diagnostics::RecursionLimitReachedSizeSkeleton {
+                    span,
+                    ty,
+                    suggested_limit,
+                });
             return Err(tcx.arena.alloc(LayoutError::ReferencesError(reported)));
         }
 
@@ -977,9 +997,10 @@ where
                     ),
                     Variants::Multiple { tag, tag_field, .. } => {
                         if FieldIdx::from_usize(i) == tag_field {
-                            return TyMaybeWithLayout::TyAndLayout(tag_layout(tag));
+                            TyMaybeWithLayout::TyAndLayout(tag_layout(tag))
+                        } else {
+                            TyMaybeWithLayout::Ty(args.as_coroutine().upvar_tys()[i])
                         }
-                        TyMaybeWithLayout::Ty(args.as_coroutine().prefix_tys()[i])
                     }
                 },
 
@@ -1045,19 +1066,40 @@ where
             }
             ty::Ref(_, ty, mt) if offset.bytes() == 0 => {
                 tcx.layout_of(typing_env.as_query_input(ty)).ok().map(|layout| {
-                    let kind = match mt {
+                    let kind;
+                    let size;
+
+                    match mt {
                         hir::Mutability::Not => {
                             let frozen = optimize && ty.is_freeze(tcx, typing_env);
-                            PointerKind::SharedRef { frozen }
+                            kind = PointerKind::SharedRef { frozen };
+
+                            // Set the `size` to zero for non-frozen shared references.
+                            //
+                            // `PointeeInfo::size` is defined to allow adding spurious reads.
+                            // Adding spurious reads is only valid for `&Freeze` and `&mut Unpin`
+                            // references, as otherwise the spurious read can invalidate aliasing
+                            // references.
+                            //
+                            // See discussions in
+                            // - https://github.com/rust-lang/unsafe-code-guidelines/issues/381
+                            // - https://github.com/llvm/llvm-project/pull/218413
+                            // - https://discourse.llvm.org/t/interaction-of-noalias-and-dereferenceable/66979
+                            size = layout.size * frozen as _;
                         }
                         hir::Mutability::Mut => {
                             let unpin = optimize
                                 && ty.is_unpin(tcx, typing_env)
                                 && ty.is_unsafe_unpin(tcx, typing_env);
-                            PointerKind::MutableRef { unpin }
+                            kind = PointerKind::MutableRef { unpin };
+
+                            // Set the `size` to zero for non-unpin unique references.
+                            // See the above comment for reasons to do this.
+                            size = layout.size * unpin as _;
                         }
                     };
-                    PointeeInfo { safe: Some(kind), size: layout.size, align: layout.align.abi }
+
+                    PointeeInfo { safe: Some(kind), size, align: layout.align.abi }
                 })
             }
 
@@ -1065,29 +1107,17 @@ where
                 if offset.bytes() == 0
                     && let Some(pointee) = this.ty.boxed_ty() =>
             {
-                tcx.layout_of(typing_env.as_query_input(pointee)).ok().map(|layout| PointeeInfo {
-                    safe: Some(PointerKind::Box {
-                        // Same logic as for mutable references above.
-                        unpin: optimize
-                            && pointee.is_unpin(tcx, typing_env)
-                            && pointee.is_unsafe_unpin(tcx, typing_env),
-                        global: this.ty.is_box_global(tcx),
-                    }),
-                    size: layout.size,
-                    align: layout.align.abi,
-                })
-            }
+                tcx.layout_of(typing_env.as_query_input(pointee)).ok().map(|layout| {
+                    // Same logic as for mutable references above.
+                    let unpin = optimize
+                        && pointee.is_unpin(tcx, typing_env)
+                        && pointee.is_unsafe_unpin(tcx, typing_env);
+                    let size = layout.size * unpin as _;
 
-            ty::Adt(adt_def, ..) if adt_def.is_maybe_dangling() => {
-                Self::ty_and_layout_pointee_info_at(this.field(cx, 0), cx, offset).map(|info| {
                     PointeeInfo {
-                        // Mark the pointer as raw
-                        // (thus removing noalias/readonly/etc in case of the llvm backend)
-                        safe: None,
-                        // Make sure we don't assert dereferenceability of the pointer.
-                        size: Size::ZERO,
-                        // Preserve the alignment assertion! That is required even inside `MaybeDangling`.
-                        align: info.align,
+                        safe: Some(PointerKind::Box { unpin, global: this.ty.is_box_global(tcx) }),
+                        size,
+                        align: layout.align.abi,
                     }
                 })
             }
@@ -1167,6 +1197,21 @@ where
                     }
                 }
 
+                // Patch result if we are a MaybeDangling-like type.
+                if this.ty.is_like_maybe_dangling()
+                    && let Some(info) = result
+                {
+                    result = Some(PointeeInfo {
+                        // Mark the pointer as raw
+                        // (thus removing noalias/readonly/etc in case of the llvm backend)
+                        safe: None,
+                        // Make sure we don't assert dereferenceability of the pointer.
+                        size: Size::ZERO,
+                        // Preserve the alignment assertion! That is required even inside `MaybeDangling`.
+                        align: info.align,
+                    });
+                }
+
                 result
             }
         };
@@ -1185,6 +1230,10 @@ where
         matches!(this.ty.kind(), ty::Adt(..))
     }
 
+    fn is_enum(this: TyAndLayout<'tcx>) -> bool {
+        matches!(this.ty.kind(), ty::Adt(def, _) if def.is_enum())
+    }
+
     fn is_never(this: TyAndLayout<'tcx>) -> bool {
         matches!(this.ty.kind(), ty::Never)
     }
@@ -1199,6 +1248,12 @@ where
 
     fn is_transparent(this: TyAndLayout<'tcx>) -> bool {
         matches!(this.ty.kind(), ty::Adt(def, _) if def.repr().transparent())
+    }
+
+    /// Is this type `core::num::Complex<T>`?
+    fn is_complex_number_lang_item(this: TyAndLayout<'tcx>, cx: &C) -> bool {
+        let Some(def) = this.ty.ty_adt_def() else { return false };
+        cx.tcx().is_lang_item(def.did(), LangItem::Complex)
     }
 
     fn is_scalable_vector(this: TyAndLayout<'tcx>) -> bool {
@@ -1312,7 +1367,7 @@ pub fn fn_can_unwind(tcx: TyCtxt<'_>, fn_def_id: Option<DefId>, abi: ExternAbi) 
         | RiscvInterruptS
         | RustInvalid
         | Swift
-        | Unadjusted => false,
+        | LlvmIntrinsic => false,
         Rust | RustCall | RustCold | RustPreserveNone | RustTail => {
             tcx.sess.panic_strategy().unwinds()
         }
@@ -1326,8 +1381,8 @@ pub enum FnAbiError<'tcx> {
     Layout(LayoutError<'tcx>),
 }
 
-impl<'a, 'b, G: EmissionGuarantee> Diagnostic<'a, G> for FnAbiError<'b> {
-    fn into_diag(self, dcx: DiagCtxtHandle<'a>, level: Level) -> Diag<'a, G> {
+impl<'a, 'b> Diagnostic<'a> for FnAbiError<'b> {
+    fn into_diag(self, dcx: DiagCtxtHandle<'a>, level: Level) -> Diag<'a> {
         match self {
             Self::Layout(e) => Diag::new(dcx, level, e.to_string()),
         }
@@ -1356,12 +1411,36 @@ pub trait FnAbiOfHelpers<'tcx>: LayoutOfHelpers<'tcx> {
     /// but this hook allows e.g. codegen to return only `&FnAbi` from its
     /// `cx.fn_abi_of_*(...)`, without any `Result<...>` around it to deal with
     /// (and any `FnAbiError`s are turned into fatal errors or ICEs).
+    ///
+    /// Codegen backends should use [`codegen_handle_fn_abi_err`] as implementation.
     fn handle_fn_abi_err(
         &self,
         err: FnAbiError<'tcx>,
         span: Span,
         fn_abi_request: FnAbiRequest<'tcx>,
     ) -> <Self::FnAbiOfResult as MaybeResult<&'tcx FnAbi<'tcx, Ty<'tcx>>>>::Error;
+}
+
+/// Implementation of [`FnAbiOfHelpers::handle_fn_abi_err`] for codegen backends.
+pub fn codegen_handle_fn_abi_err<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    err: FnAbiError<'tcx>,
+    span: Span,
+    fn_abi_request: FnAbiRequest<'tcx>,
+) -> ErrorGuaranteed {
+    match err {
+        FnAbiError::Layout(LayoutError::SizeOverflow(_) | LayoutError::InvalidSimd { .. }) => {
+            tcx.dcx().emit_err(Spanned { span, node: err })
+        }
+        _ => match fn_abi_request {
+            FnAbiRequest::OfFnPtr { sig, extra_args } => {
+                span_bug!(span, "`fn_abi_of_fn_ptr({sig}, {extra_args:?})` failed: {err:?}",);
+            }
+            FnAbiRequest::OfInstance { instance, extra_args } => {
+                span_bug!(span, "`fn_abi_of_instance({instance}, {extra_args:?})` failed: {err:?}",);
+            }
+        },
+    }
 }
 
 /// Blanket extension trait for contexts that can compute `FnAbi`s.

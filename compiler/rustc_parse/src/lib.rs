@@ -1,8 +1,8 @@
 //! The main parser interface.
 
 // tidy-alphabetical-start
+#![cfg_attr(bootstrap, feature(debug_closure_helpers))]
 #![cfg_attr(test, feature(iter_order_by))]
-#![feature(debug_closure_helpers)]
 #![feature(default_field_values)]
 #![feature(deref_patterns)]
 #![feature(iter_intersperse)]
@@ -15,9 +15,9 @@ use std::sync::Arc;
 
 use rustc_ast as ast;
 use rustc_ast::token;
-use rustc_ast::tokenstream::TokenStream;
+use rustc_ast::tokenstream::{DelimSpacing, DelimSpan, Spacing, TokenStream, TokenTree};
 use rustc_ast_pretty::pprust;
-use rustc_errors::{Diag, EmissionGuarantee, FatalError, PResult, pluralize};
+use rustc_errors::{Diag, FatalError, PResult, pluralize};
 pub use rustc_lexer::UNICODE_VERSION;
 use rustc_session::parse::ParseSess;
 use rustc_span::edit_distance::find_best_match_for_name;
@@ -160,16 +160,16 @@ pub fn new_parser_from_file<'a>(
         if let Some(sp) = sp {
             err.span(sp);
         }
-        err.emit()
+        err.emit_fatal()
     });
     new_parser_from_source_file(psess, source_file, strip_tokens)
 }
 
-pub fn utf8_error<E: EmissionGuarantee>(
+pub fn utf8_error(
     sm: &SourceMap,
     path: &str,
     sp: Option<Span>,
-    err: &mut Diag<'_, E>,
+    err: &mut Diag<'_>,
     utf8err: Utf8Error,
     contents: &[u8],
 ) {
@@ -288,10 +288,75 @@ pub fn parse_in<'a, T>(
     Ok(result)
 }
 
-pub fn fake_token_stream_for_item(psess: &ParseSess, item: &ast::Item) -> TokenStream {
+pub fn fake_token_stream_for_item(
+    psess: &ParseSess,
+    item: &ast::Item,
+    attr_to_exclude: Option<&ast::Attribute>,
+) -> TokenStream {
+    if let Some(tokens) = fake_token_stream_for_file_mod(psess, item, attr_to_exclude) {
+        return tokens;
+    }
+
     let source = pprust::item_to_string(item);
     let filename = FileName::macro_expansion_source_code(&source);
     unwrap_or_emit_fatal(source_str_to_stream(psess, filename, source, Some(item.span)))
+}
+
+fn fake_token_stream_for_file_mod(
+    psess: &ParseSess,
+    item: &ast::Item,
+    attr_to_exclude: Option<&ast::Attribute>,
+) -> Option<TokenStream> {
+    let ast::ItemKind::Mod(_, _, ast::ModKind::Loaded(_, ast::Inline::No { .. }, spans)) =
+        &item.kind
+    else {
+        return None;
+    };
+
+    let attr = attr_to_exclude.expect("file modules must have an attribute to exclude");
+    assert_eq!(attr.style, ast::AttrStyle::Inner);
+
+    let mut body_tts = Vec::new();
+    body_tts.extend(lex_token_trees_for_span(psess, spans.inner_span.until(attr.span))?);
+    body_tts.extend(lex_token_trees_for_span(
+        psess,
+        attr.span.between(spans.inner_span.shrink_to_hi()),
+    )?);
+
+    let mut wrapper_tts = Vec::new();
+    for attr in item.attrs.iter().filter(|attr| attr.style == ast::AttrStyle::Outer) {
+        wrapper_tts.extend(attr.token_trees());
+    }
+    wrapper_tts.extend(lex_token_trees_for_span(psess, item.span)?);
+    let Some(TokenTree::Token(semi, _)) = wrapper_tts.pop() else {
+        return None;
+    };
+    if semi.kind != token::Semi {
+        return None;
+    }
+    wrapper_tts.push(TokenTree::Delimited(
+        DelimSpan::from_single(semi.span),
+        DelimSpacing::new(Spacing::Alone, Spacing::Alone),
+        token::Delimiter::Brace,
+        TokenStream::new(body_tts),
+    ));
+
+    Some(TokenStream::new(wrapper_tts))
+}
+
+fn lex_token_trees_for_span(
+    psess: &ParseSess,
+    span: Span,
+) -> Option<impl Iterator<Item = TokenTree>> {
+    let src = psess.source_map().span_to_snippet(span).ok()?;
+    let stream = match lexer::lex_token_trees(psess, &src, span.lo(), None, StripTokens::Nothing) {
+        Ok(stream) => stream,
+        Err(errs) => {
+            errs.into_iter().for_each(|err| err.cancel());
+            return None;
+        }
+    };
+    Some((0..).map_while(move |index| stream.get(index).cloned()))
 }
 
 pub fn fake_token_stream_for_foreign_item(

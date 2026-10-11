@@ -91,8 +91,8 @@ pub(super) fn check_iterator_reduction<'tcx>(
     recv: &'tcx Expr<'tcx>,
     closure: &'tcx Closure<'tcx>,
 ) {
-    let closure_body = cx.tcx.hir_body(closure.body).value;
-    let body_ty = cx.typeck_results().expr_ty(closure_body);
+    let closure_body = &cx.tcx.hir_body(closure.body).value;
+    let body_ty = cx.typeck_results().expr_ty(&closure_body);
     if body_ty.is_never() && !contains_return(closure_body) {
         span_lint_and_then(
             cx,
@@ -130,8 +130,7 @@ fn contains_label(asm: &InlineAsm<'_>) -> bool {
 ///
 /// * Has any (reachable) code path hit a `continue` of the main loop?
 /// * Is the current code path diverging (that is, the next expression is not reachable)
-/// * For each block label `'a` inside the main loop, has any (reachable) code path encountered a
-///   `break 'a`?
+/// * For each block label `'a` inside the main loop, has any (reachable) code path encountered a `break 'a`?
 ///
 /// The first two bits of information are in this enum, and the last part is in the
 /// `local_labels` variable, which contains a list of `(block_id, reachable)` pairs ordered by

@@ -1,6 +1,6 @@
 //@ check-fail
 //@ normalize-stderr: "randomization_seed: \d+" -> "randomization_seed: $$SEED"
-//@ normalize-stderr: "valid_range: 0\.\.=\d+" -> "valid_range: 0..=$$MAX"
+//@ normalize-stderr: "pointer is 0\.\.=\d+" -> "pointer is 0..=$$MAX"
 //@ normalize-stderr: "in_memory_order: \[[^\]]+\]" -> "in_memory_order: $$MEMORY_INDEX"
 //@ normalize-stderr: "offsets: \[[^\]]+\]" -> "offsets: $$OFFSETS"
 //@ revisions: x86_64 aarch64 win
@@ -17,7 +17,7 @@
 //@ [win] only-windows
 //@ [win] only-x86_64
 
-#![feature(rustc_attrs, c_variadic)]
+#![feature(rustc_attrs)]
 #![crate_type = "lib"]
 
 // Can't use `minicore` here as this is testing the implementation in `core::ffi` specifically.
@@ -27,9 +27,9 @@ use std::ffi::VaList;
 pub extern "C" fn take_va_list(_: VaList<'_>) {}
 //~^ ERROR fn_abi_of(take_va_list) = FnAbi {
 //[x86_64]~^^ ERROR mode: Indirect {
-//[x86_64]~^^^ ERROR on_stack: false,
+//[x86_64]~^^^ ERROR mode: Pointer,
 //[aarch64]~^^^^ ERROR mode: Indirect {
-//[aarch64]~^^^^^ ERROR on_stack: false,
+//[aarch64]~^^^^^ ERROR mode: Pointer,
 //[win]~^^^^^^ ERROR mode: Direct(
 
 #[cfg(all(target_arch = "x86_64", not(windows)))]
@@ -37,11 +37,11 @@ pub extern "C" fn take_va_list(_: VaList<'_>) {}
 pub extern "sysv64" fn take_va_list_sysv64(_: VaList<'_>) {}
 //[x86_64]~^ ERROR fn_abi_of(take_va_list_sysv64) = FnAbi {
 //[x86_64]~^^ ERROR mode: Indirect {
-//[x86_64]~^^^ ERROR on_stack: false,
+//[x86_64]~^^^ ERROR mode: Pointer,
 
 #[cfg(all(target_arch = "x86_64", not(windows)))]
 #[rustc_abi(debug)]
 pub extern "win64" fn take_va_list_win64(_: VaList<'_>) {}
 //[x86_64]~^ ERROR: fn_abi_of(take_va_list_win64) = FnAbi {
 //[x86_64]~^^ ERROR mode: Indirect {
-//[x86_64]~^^^ ERROR on_stack: false,
+//[x86_64]~^^^ ERROR mode: Pointer,

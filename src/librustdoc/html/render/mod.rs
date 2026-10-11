@@ -41,7 +41,7 @@ mod write_shared;
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt::{self, Display as _, Write};
 use std::iter::Peekable;
 use std::path::PathBuf;
@@ -51,12 +51,14 @@ use askama::Template;
 use indexmap::IndexMap;
 use itertools::Either;
 use rustc_ast::join_path_syms;
+use rustc_attr_ir::{
+    AttributeKind, ConstStability, DeprecatedSince, Deprecation, RustcVersion, StabilityLevel,
+    StableSince, find_attr,
+};
 use rustc_data_structures::fx::{FxHashSet, FxIndexMap, FxIndexSet};
-use rustc_hir as hir;
-use rustc_hir::attrs::{AttributeKind, DeprecatedSince, Deprecation};
+use rustc_hir::Mutability;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, DefIdSet};
-use rustc_hir::{ConstStability, Mutability, RustcVersion, StabilityLevel, StableSince};
 use rustc_middle::ty::print::PrintTraitRefExt;
 use rustc_middle::ty::{self, TyCtxt};
 use rustc_span::DUMMY_SP;
@@ -98,14 +100,23 @@ pub(crate) fn ensure_trailing_slash(v: &str) -> impl fmt::Display {
 #[derive(Copy, Clone, Debug)]
 enum AssocItemRender<'a> {
     All,
-    DerefFor { trait_: &'a clean::Path, type_: &'a clean::Type, deref_mut_: bool },
+    DerefFor {
+        trait_: &'a clean::Path,
+        type_: &'a clean::Type,
+        deref_mut_: bool,
+        deref_impl_def_id: DefId,
+    },
 }
 
 impl AssocItemRender<'_> {
-    fn render_mode(&self) -> RenderMode {
+    fn render_mode(&self, tcx: TyCtxt<'_>) -> RenderMode {
         match self {
             Self::All => RenderMode::Normal,
-            &Self::DerefFor { deref_mut_, .. } => RenderMode::ForDeref { mut_: deref_mut_ },
+            &Self::DerefFor { deref_mut_, deref_impl_def_id, .. } => {
+                let is_deref_target_copy =
+                    compute_if_deref_target_implements_copy(tcx, deref_impl_def_id);
+                RenderMode::ForDeref { mut_: deref_mut_, is_deref_target_copy }
+            }
         }
     }
 
@@ -119,7 +130,7 @@ impl AssocItemRender<'_> {
 #[derive(Copy, Clone, PartialEq)]
 enum RenderMode {
     Normal,
-    ForDeref { mut_: bool },
+    ForDeref { mut_: bool, is_deref_target_copy: bool },
 }
 
 // Helper structs for rendering items/sidebars and carrying along contextual
@@ -663,7 +674,7 @@ impl AllTypes {
     }
 }
 
-fn scrape_examples_help(shared: &SharedContext<'_>) -> String {
+fn scrape_examples_help() -> String {
     let mut content = SCRAPE_EXAMPLES_HELP_MD.to_owned();
     content.push_str(&format!(
         "## More information\n\n\
@@ -680,9 +691,10 @@ fn scrape_examples_help(shared: &SharedContext<'_>) -> String {
             content: &content,
             links: &[],
             ids: &mut IdMap::default(),
-            error_codes: shared.codes,
-            edition: shared.edition(),
-            playground: &shared.playground,
+            // code snippets come from Rust itself, not the crate
+            error_codes: crate::html::markdown::ErrorCodes::No,
+            edition: rustc_span::edition::LATEST_STABLE_EDITION,
+            playground: &Default::default(),
             heading_offset: HeadingOffset::H1,
         }
         .write_into(f))
@@ -947,7 +959,7 @@ fn short_item_info(
 fn impl_trait_key(cx: &Context<'_>, i: &Impl) -> Option<String> {
     let trait_ = i.inner_impl().trait_.as_ref()?;
     let prefix = match i.inner_impl().polarity {
-        ty::ImplPolarity::Positive | ty::ImplPolarity::Reservation => "",
+        ty::ImplPolarity::Positive => "",
         ty::ImplPolarity::Negative => "!",
     };
     Some(format!("{prefix}{:#}", print_path(trait_, cx)))
@@ -963,7 +975,7 @@ fn render_impls<'a, 'cx>(
 ) -> impl fmt::Display + use<'a, 'cx> {
     impls.sort_by_cached_key(|imp| {
         let prefix = match imp.inner_impl().polarity {
-            ty::ImplPolarity::Positive | ty::ImplPolarity::Reservation => Ordering::Greater,
+            ty::ImplPolarity::Positive => Ordering::Greater,
             ty::ImplPolarity::Negative => Ordering::Less,
         };
         (prefix, ImplString::new_path(imp, cx))
@@ -1482,7 +1494,7 @@ fn render_assoc_items_inner(
     let (mut inherent_impls, trait_impls): (Vec<_>, _) =
         impls.iter().partition(|i| i.inner_impl().trait_.is_none());
     if !inherent_impls.is_empty() {
-        let render_mode = what.render_mode();
+        let render_mode = what.render_mode(cx.tcx());
         let class_html = what
             .class()
             .map(|class| fmt::from_fn(move |f| write!(f, r#" class="{class}""#)))
@@ -1620,8 +1632,12 @@ fn render_deref_methods(
         "Render deref methods for {for_:#?}, target {target:#?}",
         for_ = impl_.inner_impl().for_
     );
-    let what =
-        AssocItemRender::DerefFor { trait_: deref_type, type_: real_target, deref_mut_: deref_mut };
+    let what = AssocItemRender::DerefFor {
+        trait_: deref_type,
+        type_: real_target,
+        deref_mut_: deref_mut,
+        deref_impl_def_id: impl_.def_id(),
+    };
     if let Some(did) = target.def_id(cache) {
         if let Some(type_did) = impl_.inner_impl().for_.def_id(cache) {
             // `impl Deref<Target = S> for S`
@@ -1639,29 +1655,40 @@ fn render_deref_methods(
     Ok(())
 }
 
-fn should_render_item(item: &clean::Item, deref_mut_: bool, tcx: TyCtxt<'_>) -> bool {
+fn should_render_item(
+    item: &clean::Item,
+    deref_mut_: bool,
+    tcx: TyCtxt<'_>,
+    target_is_copy: bool,
+) -> bool {
     let self_type_opt = match item.kind {
         clean::MethodItem(ref method, _) => method.decl.receiver_type(),
         clean::RequiredMethodItem(ref method, _) => method.decl.receiver_type(),
         _ => None,
     };
 
-    if let Some(self_ty) = self_type_opt {
-        let (by_mut_ref, by_box, by_value) = match *self_ty {
-            clean::Type::BorrowedRef { mutability, .. } => {
-                (mutability == Mutability::Mut, false, false)
-            }
-            clean::Type::Path { ref path } => {
-                (false, Some(path.def_id()) == tcx.lang_items().owned_box(), false)
-            }
-            clean::Type::SelfTy => (false, false, true),
-            _ => (false, false, false),
-        };
+    let Some(self_ty) = self_type_opt else { return false };
+    let (by_mut_ref, by_box, by_value) = match *self_ty {
+        clean::Type::BorrowedRef { mutability, .. } => {
+            (mutability == Mutability::Mut, false, false)
+        }
+        clean::Type::Path { ref path } => {
+            (false, Some(path.def_id()) == tcx.lang_items().owned_box(), false)
+        }
+        clean::Type::SelfTy => (false, false, true),
+        _ => (false, false, false),
+    };
 
-        (deref_mut_ || !by_mut_ref) && !by_box && !by_value
-    } else {
-        false
-    }
+    (deref_mut_ || !by_mut_ref) && !by_box && (!by_value || target_is_copy)
+}
+
+/// `Box` has pass-through impls for `Read`, `Write`, `Iterator`, and `Future` when the
+/// boxed type implements one of those. We don't want to treat every `Box` return
+/// as being notably an `Iterator` (etc), though, so we exempt it. `Pin` has the same
+/// issue, with a pass-through impl for `Future`.
+fn is_notable_trait_passthrough(did: DefId, cx: &Context<'_>) -> bool {
+    let lang_items = cx.tcx().lang_items();
+    Some(did) == lang_items.owned_box() || Some(did) == lang_items.pin_type()
 }
 
 fn notable_traits_button(ty: &clean::Type, cx: &Context<'_>) -> Option<impl fmt::Display> {
@@ -1672,13 +1699,7 @@ fn notable_traits_button(ty: &clean::Type, cx: &Context<'_>) -> Option<impl fmt:
 
     let did = ty.def_id(cx.cache())?;
 
-    // Box has pass-through impls for Read, Write, Iterator, and Future when the
-    // boxed type implements one of those. We don't want to treat every Box return
-    // as being notably an Iterator (etc), though, so we exempt it. Pin has the same
-    // issue, with a pass-through impl for Future.
-    if Some(did) == cx.tcx().lang_items().owned_box()
-        || Some(did) == cx.tcx().lang_items().pin_type()
-    {
+    if is_notable_trait_passthrough(did, cx) {
         return None;
     }
 
@@ -1790,6 +1811,49 @@ fn notable_traits_json<'a>(tys: impl Iterator<Item = &'a clean::Type>, cx: &Cont
     serde_json::to_string(&mp).expect("serialize (string, string) -> json object cannot fail")
 }
 
+pub(crate) struct NotableTraitBadge {
+    pub name: String,
+    pub full_path: String,
+    /// Relative URL to the trait page, or `None` if it cannot be linked.
+    pub href: Option<String>,
+}
+
+/// Returns all `#[doc(notable_trait)]` traits that `item` implements, to be
+/// rendered as badges at the top of the item's page.
+pub(crate) fn notable_trait_badges(item: &clean::Item, cx: &Context<'_>) -> Vec<NotableTraitBadge> {
+    let tcx = cx.tcx();
+    if let Some(def_id) = item.def_id()
+        && !is_notable_trait_passthrough(def_id, cx)
+        && let Some(impls) = cx.cache().impls.get(&def_id)
+    {
+        impls
+            .iter()
+            .map(Impl::inner_impl)
+            .filter(|impl_| impl_.polarity == ty::ImplPolarity::Positive)
+            .filter_map(|impl_| {
+                if let Some(trait_) = &impl_.trait_
+                    && let trait_did = trait_.def_id()
+                    && let Some(trait_) = cx.cache().traits.get(&trait_did)
+                    && trait_.is_notable_trait(tcx)
+                {
+                    let name = tcx.item_name(trait_did).to_string();
+                    let (full_path, href) = match href(trait_did, cx) {
+                        Ok(info) => (join_path_syms(&info.rust_path), Some(info.url)),
+                        Err(_) => (tcx.def_path_str(trait_did), None),
+                    };
+                    Some((name.clone(), NotableTraitBadge { name, full_path, href }))
+                } else {
+                    None
+                }
+            })
+            .collect::<BTreeMap<String, NotableTraitBadge>>()
+            .into_values()
+            .collect()
+    } else {
+        Vec::new()
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct ImplRenderingParameters {
     show_def_docs: bool,
@@ -1838,8 +1902,8 @@ fn render_impl(
             let render_method_item = rendering_params.show_non_assoc_items
                 && match render_mode {
                     RenderMode::Normal => true,
-                    RenderMode::ForDeref { mut_: deref_mut_ } => {
-                        should_render_item(item, deref_mut_, cx.tcx())
+                    RenderMode::ForDeref { mut_: deref_mut_, is_deref_target_copy } => {
+                        should_render_item(item, deref_mut_, cx.tcx(), is_deref_target_copy)
                     }
                 };
 
@@ -1948,117 +2012,125 @@ fn render_impl(
                     }
                 }
                 clean::RequiredAssocConstItem(generics, ty) => {
-                    let source_id = format!("{item_type}.{name}");
-                    let id = cx.derive_id(&source_id);
-                    write!(
-                        w,
-                        "<section id=\"{id}\" class=\"{item_type}{in_trait_class}{deprecation_class}\">\
-                            {}",
-                        render_rightside(cx, item, render_mode)
-                    )?;
-                    if trait_.is_some() {
-                        // Anchors are only used on trait impls.
-                        write!(w, "<a href=\"#{id}\" class=\"anchor\">§</a>")?;
+                    if !matches!(render_mode, RenderMode::ForDeref { .. }) {
+                        let source_id = format!("{item_type}.{name}");
+                        let id = cx.derive_id(&source_id);
+                        write!(
+                            w,
+                            "<section id=\"{id}\" class=\"{item_type}{in_trait_class}{deprecation_class}\">\
+                                {}",
+                            render_rightside(cx, item, render_mode)
+                        )?;
+                        if trait_.is_some() {
+                            // Anchors are only used on trait impls.
+                            write!(w, "<a href=\"#{id}\" class=\"anchor\">§</a>")?;
+                        }
+                        write!(
+                            w,
+                            "<h4 class=\"code-header\">{}</h4></section>",
+                            assoc_const(
+                                item,
+                                generics,
+                                ty,
+                                AssocConstValue::None,
+                                link.anchor(if trait_.is_some() { &source_id } else { &id }),
+                                0,
+                                cx,
+                            ),
+                        )?;
                     }
-                    write!(
-                        w,
-                        "<h4 class=\"code-header\">{}</h4></section>",
-                        assoc_const(
-                            item,
-                            generics,
-                            ty,
-                            AssocConstValue::None,
-                            link.anchor(if trait_.is_some() { &source_id } else { &id }),
-                            0,
-                            cx,
-                        ),
-                    )?;
                 }
                 clean::ProvidedAssocConstItem(ci) | clean::ImplAssocConstItem(ci) => {
-                    let source_id = format!("{item_type}.{name}");
-                    let id = cx.derive_id(&source_id);
-                    write!(
-                        w,
-                        "<section id=\"{id}\" class=\"{item_type}{in_trait_class}{deprecation_class}\">\
-                            {}",
-                        render_rightside(cx, item, render_mode),
-                    )?;
-                    if trait_.is_some() {
-                        // Anchors are only used on trait impls.
-                        write!(w, "<a href=\"#{id}\" class=\"anchor\">§</a>")?;
+                    if !matches!(render_mode, RenderMode::ForDeref { .. }) {
+                        let source_id = format!("{item_type}.{name}");
+                        let id = cx.derive_id(&source_id);
+                        write!(
+                            w,
+                            "<section id=\"{id}\" class=\"{item_type}{in_trait_class}{deprecation_class}\">\
+                                {}",
+                            render_rightside(cx, item, render_mode),
+                        )?;
+                        if trait_.is_some() {
+                            // Anchors are only used on trait impls.
+                            write!(w, "<a href=\"#{id}\" class=\"anchor\">§</a>")?;
+                        }
+                        write!(
+                            w,
+                            "<h4 class=\"code-header\">{}</h4></section>",
+                            assoc_const(
+                                item,
+                                &ci.generics,
+                                &ci.type_,
+                                match item.kind {
+                                    clean::ProvidedAssocConstItem(_) =>
+                                        AssocConstValue::TraitDefault(&ci.kind),
+                                    clean::ImplAssocConstItem(_) => AssocConstValue::Impl(&ci.kind),
+                                    _ => unreachable!(),
+                                },
+                                link.anchor(if trait_.is_some() { &source_id } else { &id }),
+                                0,
+                                cx,
+                            ),
+                        )?;
                     }
-                    write!(
-                        w,
-                        "<h4 class=\"code-header\">{}</h4></section>",
-                        assoc_const(
-                            item,
-                            &ci.generics,
-                            &ci.type_,
-                            match item.kind {
-                                clean::ProvidedAssocConstItem(_) =>
-                                    AssocConstValue::TraitDefault(&ci.kind),
-                                clean::ImplAssocConstItem(_) => AssocConstValue::Impl(&ci.kind),
-                                _ => unreachable!(),
-                            },
-                            link.anchor(if trait_.is_some() { &source_id } else { &id }),
-                            0,
-                            cx,
-                        ),
-                    )?;
                 }
                 clean::RequiredAssocTypeItem(generics, bounds) => {
-                    let source_id = format!("{item_type}.{name}");
-                    let id = cx.derive_id(&source_id);
-                    write!(
-                        w,
-                        "<section id=\"{id}\" class=\"{item_type}{in_trait_class}{deprecation_class}\">\
-                            {}",
-                        render_rightside(cx, item, render_mode),
-                    )?;
-                    if trait_.is_some() {
-                        // Anchors are only used on trait impls.
-                        write!(w, "<a href=\"#{id}\" class=\"anchor\">§</a>")?;
+                    if !matches!(render_mode, RenderMode::ForDeref { .. }) {
+                        let source_id = format!("{item_type}.{name}");
+                        let id = cx.derive_id(&source_id);
+                        write!(
+                            w,
+                            "<section id=\"{id}\" class=\"{item_type}{in_trait_class}{deprecation_class}\">\
+                                {}",
+                            render_rightside(cx, item, render_mode),
+                        )?;
+                        if trait_.is_some() {
+                            // Anchors are only used on trait impls.
+                            write!(w, "<a href=\"#{id}\" class=\"anchor\">§</a>")?;
+                        }
+                        write!(
+                            w,
+                            "<h4 class=\"code-header\">{}</h4></section>",
+                            assoc_type(
+                                item,
+                                generics,
+                                bounds,
+                                None,
+                                link.anchor(if trait_.is_some() { &source_id } else { &id }),
+                                0,
+                                cx,
+                            ),
+                        )?;
                     }
-                    write!(
-                        w,
-                        "<h4 class=\"code-header\">{}</h4></section>",
-                        assoc_type(
-                            item,
-                            generics,
-                            bounds,
-                            None,
-                            link.anchor(if trait_.is_some() { &source_id } else { &id }),
-                            0,
-                            cx,
-                        ),
-                    )?;
                 }
                 clean::AssocTypeItem(tydef, _bounds) => {
-                    let source_id = format!("{item_type}.{name}");
-                    let id = cx.derive_id(&source_id);
-                    write!(
-                        w,
-                        "<section id=\"{id}\" class=\"{item_type}{in_trait_class}{deprecation_class}\">\
-                            {}",
-                        render_rightside(cx, item, render_mode),
-                    )?;
-                    if trait_.is_some() {
-                        // Anchors are only used on trait impls.
-                        write!(w, "<a href=\"#{id}\" class=\"anchor\">§</a>")?;
+                    if !matches!(render_mode, RenderMode::ForDeref { .. }) {
+                        let source_id = format!("{item_type}.{name}");
+                        let id = cx.derive_id(&source_id);
+                        write!(
+                            w,
+                            "<section id=\"{id}\" class=\"{item_type}{in_trait_class}{deprecation_class}\">\
+                                {}",
+                            render_rightside(cx, item, render_mode),
+                        )?;
+                        if trait_.is_some() {
+                            // Anchors are only used on trait impls.
+                            write!(w, "<a href=\"#{id}\" class=\"anchor\">§</a>")?;
+                        }
+                        write!(
+                            w,
+                            "<h4 class=\"code-header\">{}</h4></section>",
+                            assoc_type(
+                                item,
+                                &tydef.generics,
+                                &[], // intentionally leaving out bounds
+                                Some(tydef.item_type.as_ref().unwrap_or(&tydef.type_)),
+                                link.anchor(if trait_.is_some() { &source_id } else { &id }),
+                                0,
+                                cx,
+                            ),
+                        )?;
                     }
-                    write!(
-                        w,
-                        "<h4 class=\"code-header\">{}</h4></section>",
-                        assoc_type(
-                            item,
-                            &tydef.generics,
-                            &[], // intentionally leaving out bounds
-                            Some(tydef.item_type.as_ref().unwrap_or(&tydef.type_)),
-                            link.anchor(if trait_.is_some() { &source_id } else { &id }),
-                            0,
-                            cx,
-                        ),
-                    )?;
                 }
                 clean::StrippedItem(..) => return Ok(()),
                 _ => panic!("can't make docs for trait item with name {:?}", item.name),
@@ -2854,7 +2926,7 @@ fn render_call_locations<W: fmt::Write>(
             contents_subset,
             file_span,
             cx,
-            &cx.root_path(),
+            cx.current.len(),
             &highlight::DecorationInfo(decoration_info),
             &sources::SourceContext::Embedded(sources::ScrapedInfo {
                 needs_expansion,
@@ -2974,7 +3046,7 @@ pub(super) fn render_attributes_in_code_with_options(
         render_code_attribute(&prefix, "#[doc(hidden)]", w)?;
     }
     for attr in &item.attrs.other_attrs {
-        let hir::Attribute::Parsed(kind) = attr else { continue };
+        let rustc_attr_ir::Attribute::Parsed(kind) = attr else { continue };
         let attr = match kind {
             AttributeKind::LinkSection { name, .. } => {
                 Cow::Owned(format!("#[unsafe(link_section = {})]", Escape(&format!("{name:?}"))))
@@ -3036,10 +3108,16 @@ fn repr_attribute<'tcx>(
         (cache.document_private || field.vis.is_public()) && is_visible(field.did)
     };
 
+    // The transparent repr is public if
+    // - the non-1-ZST field is public and visible or
+    // - at least one field is public and visible if *all* fields are 1-ZSTs or
+    // - the item is annotated with internal attribute `#[rustc_pub_transparent]`
     if repr.transparent() {
-        // The transparent repr is public iff the non-1-ZST field is public and visible or
-        // – in case all fields are 1-ZST fields — at least one field is public and visible.
         let is_public = 'is_public: {
+            if find_attr!(tcx, def_id, RustcPubTransparent(_)) {
+                break 'is_public true;
+            }
+
             // `#[repr(transparent)]` can only be applied to structs and single-variant enums.
             let var = adt.variant(rustc_abi::FIRST_VARIANT); // the first and only variant
 
@@ -3102,4 +3180,22 @@ fn repr_attribute<'tcx>(
     }
 
     (!result.is_empty()).then(|| format!("#[repr({})]", result.join(", ")).into())
+}
+
+pub(crate) fn compute_if_deref_target_implements_copy(tcx: TyCtxt<'_>, impl_def_id: DefId) -> bool {
+    if let Some(impl_def_id) = impl_def_id.as_local()
+        && let item = tcx.hir_expect_item(impl_def_id)
+        && let rustc_hir::ItemKind::Impl(impl_item) = item.kind
+    {
+        for item in impl_item.items {
+            let item = tcx.hir_impl_item(*item);
+            if matches!(item.kind, rustc_hir::ImplItemKind::Type(_)) {
+                let item_def_id = item.owner_id.to_def_id();
+                let ty = tcx.type_of(item_def_id).instantiate_identity().skip_norm_wip();
+                let typing_env = ty::TypingEnv::non_body_analysis(tcx, item_def_id);
+                return tcx.type_is_copy_modulo_regions(typing_env, ty);
+            }
+        }
+    }
+    false
 }

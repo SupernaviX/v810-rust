@@ -9,31 +9,32 @@ use rustc_ast::expand::allocator::{
     ALLOC_ERROR_HANDLER, ALLOCATOR_METHODS, AllocatorKind, AllocatorMethod, AllocatorMethodInput,
     AllocatorTy,
 };
+use rustc_attr_ir::lang_items::LangItem;
+use rustc_attr_ir::target::Target;
+use rustc_attr_ir::{DebuggerVisualizerType, EiiDecl, EiiImpl, OptimizeAttr, find_attr};
 use rustc_data_structures::fx::{FxHashMap, FxIndexMap, FxIndexSet};
 use rustc_data_structures::profiling::{get_resident_set_size, print_time_passes_entry};
 use rustc_data_structures::sync::{IntoDynSyncSend, par_map};
 use rustc_data_structures::unord::UnordMap;
-use rustc_hir::attrs::{DebuggerVisualizerType, EiiDecl, EiiImpl, OptimizeAttr};
+use rustc_hir as hir;
 use rustc_hir::def_id::{CrateNum, DefId, LOCAL_CRATE};
-use rustc_hir::lang_items::LangItem;
-use rustc_hir::{ItemId, Target, find_attr};
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrs;
 use rustc_middle::middle::debugger_visualizer::DebuggerVisualizerFile;
 use rustc_middle::middle::dependency_format::{Dependencies, Linkage};
 use rustc_middle::middle::exported_symbols::{self, SymbolExportKind};
 use rustc_middle::middle::lang_items;
-use rustc_middle::mir::BinOp;
-use rustc_middle::mir::interpret::ErrorHandled;
+use rustc_middle::mir::interpret::{CTFE_ALLOC_SALT, ErrorHandled, Scalar};
+use rustc_middle::mir::{BinOp, ConstValue};
 use rustc_middle::mono::{CodegenUnit, CodegenUnitNameBuilder, MonoItem, MonoItemPartitions};
 use rustc_middle::query::Providers;
+use rustc_middle::ty::consts::ConstExt;
 use rustc_middle::ty::layout::{HasTyCtxt, HasTypingEnv, LayoutOf, TyAndLayout};
-use rustc_middle::ty::{self, Instance, PatternKind, Ty, TyCtxt, Unnormalized};
-use rustc_middle::{bug, span_bug};
-use rustc_session::Session;
-use rustc_session::config::{self, CrateType, EntryFnType};
-use rustc_span::{DUMMY_SP, Symbol};
+use rustc_middle::ty::{self, Instance, PatternKind, Ty, TyCtxt, UintTy, Unnormalized};
+use rustc_session::config::{self, EntryFnType};
+use rustc_span::{DUMMY_SP, Symbol, bug, span_bug};
+use rustc_structures::CrateType;
 use rustc_symbol_mangling::mangle_internal_symbol;
-use rustc_target::spec::{Arch, Os};
+use rustc_target::spec::{Arch, Os, Target as TargetSpec};
 use rustc_trait_selection::infer::{BoundRegionConversionTime, TyCtxtInferExt};
 use rustc_trait_selection::traits::{ObligationCause, ObligationCtxt};
 use tracing::{debug, info};
@@ -41,7 +42,7 @@ use tracing::{debug, info};
 use crate::assert_module_sources::CguReuse;
 use crate::back::link::are_upstream_rust_objects_already_included;
 use crate::back::write::{
-    ComputedLtoType, OngoingCodegen, compute_per_cgu_lto_type, start_async_codegen,
+    ComputedLtoType, ModuleConfig, OngoingCodegen, compute_per_cgu_lto_type, start_async_codegen,
     submit_codegened_module_to_llvm, submit_post_lto_module_to_llvm, submit_pre_lto_module_to_llvm,
 };
 use crate::common::{self, IntPredicate, RealPredicate, TypeKind};
@@ -51,7 +52,7 @@ use crate::mir::place::PlaceRef;
 use crate::traits::*;
 use crate::{
     CachedModuleCodegen, CodegenLintLevelSpecs, CrateInfo, EiiLinkageImplInfo, EiiLinkageInfo,
-    ModuleCodegen, diagnostics, meth, mir,
+    ModuleCodegen, ModuleKind, diagnostics, meth, mir,
 };
 
 pub(crate) fn bin_op_to_icmp_predicate(op: BinOp, signed: bool) -> IntPredicate {
@@ -143,7 +144,7 @@ pub fn validate_trivial_unsize<'tcx>(
                 ) else {
                     return false;
                 };
-                if !ocx.evaluate_obligations_error_on_ambiguity().is_empty() {
+                if !ocx.evaluate_obligations_error_on_ambiguity().no_errors() {
                     return false;
                 }
                 infcx.leak_check(universe, None).is_ok()
@@ -372,8 +373,8 @@ pub(crate) fn build_shift_expr_rhs<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
 // Returns `true` if this session's target will use native wasm
 // exceptions. This means that the VM does the unwinding for
 // us
-pub fn wants_wasm_eh(sess: &Session) -> bool {
-    sess.target.is_like_wasm
+pub fn wants_wasm_eh(target: &TargetSpec) -> bool {
+    target.is_like_wasm
 }
 
 /// Returns `true` if this session's target will use SEH-based unwinding.
@@ -381,15 +382,15 @@ pub fn wants_wasm_eh(sess: &Session) -> bool {
 /// This is only true for MSVC targets, and even then the 64-bit MSVC target
 /// currently uses SEH-ish unwinding with DWARF info tables to the side (same as
 /// 64-bit MinGW) instead of "full SEH".
-pub fn wants_msvc_seh(sess: &Session) -> bool {
-    sess.target.is_like_msvc
+pub fn wants_msvc_seh(target: &TargetSpec) -> bool {
+    target.is_like_msvc
 }
 
 /// Returns `true` if this session's target requires the new exception
 /// handling LLVM IR instructions (catchpad / cleanuppad / ... instead
 /// of landingpad)
-pub(crate) fn wants_new_eh_instructions(sess: &Session) -> bool {
-    wants_wasm_eh(sess) || wants_msvc_seh(sess)
+pub(crate) fn wants_new_eh_instructions(target: &TargetSpec) -> bool {
+    wants_wasm_eh(target) || wants_msvc_seh(target)
 }
 
 pub(crate) fn codegen_instance<'a, 'tcx: 'a, Bx: BuilderMethods<'a, 'tcx>>(
@@ -404,7 +405,7 @@ pub(crate) fn codegen_instance<'a, 'tcx: 'a, Bx: BuilderMethods<'a, 'tcx>>(
     mir::codegen_mir::<Bx>(cx, instance);
 }
 
-pub fn codegen_global_asm<'tcx, Cx>(cx: &mut Cx, item_id: ItemId)
+pub fn codegen_global_asm<'tcx, Cx>(cx: &mut Cx, item_id: hir::ItemId)
 where
     Cx: LayoutOf<'tcx, LayoutOfResult = TyAndLayout<'tcx>> + AsmCodegenMethods<'tcx>,
 {
@@ -419,20 +420,26 @@ where
                         Ok(const_value) => {
                             let ty =
                                 cx.tcx().typeck_body(anon_const.body).node_type(anon_const.hir_id);
-                            let string = common::asm_const_to_str(
-                                cx.tcx(),
-                                *op_sp,
-                                const_value,
-                                cx.layout_of(ty),
-                            );
-                            GlobalAsmOperandRef::Const { string }
+                            let ConstValue::Scalar(scalar) = const_value else {
+                                span_bug!(
+                                    *op_sp,
+                                    "expected Scalar for promoted asm const, but got {:#?}",
+                                    const_value
+                                )
+                            };
+                            GlobalAsmOperandRef::Const {
+                                value: common::asm_const_ptr_clean(cx.tcx(), scalar),
+                                ty,
+                            }
                         }
                         Err(ErrorHandled::Reported { .. }) => {
                             // An error has already been reported and
                             // compilation is guaranteed to fail if execution
-                            // hits this path. So an empty string instead of
-                            // a stringified constant value will suffice.
-                            GlobalAsmOperandRef::Const { string: String::new() }
+                            // hits this path. So anything will suffice.
+                            GlobalAsmOperandRef::Const {
+                                value: Scalar::from_u32(0),
+                                ty: Ty::new_uint(cx.tcx(), UintTy::U32),
+                            }
                         }
                         Err(ErrorHandled::TooGeneric(_)) => {
                             span_bug!(*op_sp, "asm const cannot be resolved; too generic")
@@ -444,7 +451,7 @@ where
                     let instance = match ty.kind() {
                         &ty::FnDef(def_id, args) => Instance::expect_resolve(
                             cx.tcx(),
-                            ty::TypingEnv::fully_monomorphized(),
+                            cx.typing_env(),
                             def_id,
                             args.no_bound_vars().unwrap(),
                             expr.span,
@@ -452,10 +459,26 @@ where
                         _ => span_bug!(*op_sp, "asm sym is not a function"),
                     };
 
-                    GlobalAsmOperandRef::SymFn { instance }
+                    GlobalAsmOperandRef::Const {
+                        value: Scalar::from_pointer(
+                            cx.tcx().reserve_and_set_fn_alloc(instance, CTFE_ALLOC_SALT).into(),
+                            cx,
+                        ),
+                        ty: Ty::new_fn_ptr(cx.tcx(), ty.fn_sig(cx.tcx())),
+                    }
                 }
                 rustc_hir::InlineAsmOperand::SymStatic { path: _, def_id } => {
-                    GlobalAsmOperandRef::SymStatic { def_id }
+                    if cx.tcx().is_thread_local_static(def_id) {
+                        GlobalAsmOperandRef::SymThreadLocalStatic { def_id }
+                    } else {
+                        GlobalAsmOperandRef::Const {
+                            value: Scalar::from_pointer(
+                                cx.tcx().reserve_and_set_static_alloc(def_id).into(),
+                                cx,
+                            ),
+                            ty: cx.tcx().static_ptr_ty(def_id, cx.typing_env()),
+                        }
+                    }
                 }
                 rustc_hir::InlineAsmOperand::In { .. }
                 | rustc_hir::InlineAsmOperand::Out { .. }
@@ -467,7 +490,7 @@ where
             })
             .collect();
 
-        cx.codegen_global_asm(asm.template, &operands, asm.options, asm.line_spans);
+        cx.codegen_global_asm(asm.template, &operands, asm.options, asm.line_spans, &[]);
     } else {
         span_bug!(item.span, "Mismatch between hir::Item type and MonoItem type")
     }
@@ -570,7 +593,8 @@ pub fn maybe_create_entry_wrapper<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
             )
         };
 
-        let result = bx.call(start_ty, None, None, start_fn, &args, None, instance);
+        let result =
+            bx.call(start_ty, None, None, start_fn, ReturnSlot::Direct, &args, None, instance);
         if cx.sess().target.os == Os::Uefi {
             bx.ret(result);
         } else {
@@ -739,7 +763,18 @@ pub fn codegen_crate<
         None
     };
 
-    let ongoing_codegen = start_async_codegen(backend.clone(), tcx, allocator_module);
+    let no_builtins = find_attr!(tcx, crate, NoBuiltins);
+    let regular_module_config = ModuleConfig::new(ModuleKind::Regular, tcx, no_builtins);
+    let bitcode_needed = regular_module_config.bitcode_needed();
+    let allocator_module_config = ModuleConfig::new(ModuleKind::Allocator, tcx, no_builtins);
+
+    let ongoing_codegen = start_async_codegen(
+        backend.clone(),
+        tcx,
+        Arc::new(regular_module_config),
+        Arc::new(allocator_module_config),
+        allocator_module,
+    );
 
     // For better throughput during parallel processing by LLVM, we used to sort
     // CGUs largest to smallest. This would lead to better thread utilization
@@ -785,21 +820,22 @@ pub fn codegen_crate<
     // This likely is a temporary measure. Once we don't have to support the
     // non-parallel compiler anymore, we can compile CGUs end-to-end in
     // parallel and get rid of the complicated scheduling logic.
-    let mut pre_compiled_cgus = if let Some(threads) = tcx.sess.threads() {
+    let mut pre_compiled_cgus = if let Some(threads) = tcx.sess.opts.jobs.frontend {
         tcx.sess.time("compile_first_CGU_batch", || {
             // Try to find one CGU to compile per thread.
             let cgus: Vec<_> = cgu_reuse
                 .iter()
                 .enumerate()
                 .filter(|&(_, reuse)| reuse == &CguReuse::No)
-                .take(threads)
+                .take(threads.get())
                 .collect();
 
             // Compile the found CGUs in parallel.
             let start_time = Instant::now();
 
             let pre_compiled_cgus = par_map(cgus, |(i, _)| {
-                let module = backend.compile_codegen_unit(tcx, codegen_units[i].name());
+                let module =
+                    backend.compile_codegen_unit(tcx, codegen_units[i].name(), bitcode_needed);
                 (i, IntoDynSyncSend(module))
             });
 
@@ -823,7 +859,7 @@ pub fn codegen_crate<
                     cgu.0
                 } else {
                     let start_time = Instant::now();
-                    let module = backend.compile_codegen_unit(tcx, cgu.name());
+                    let module = backend.compile_codegen_unit(tcx, cgu.name(), bitcode_needed);
                     total_codegen_time += start_time.elapsed();
                     module
                 };
@@ -843,6 +879,10 @@ pub fn codegen_crate<
                         source: cgu.previous_work_product(tcx),
                     },
                 );
+                // This will unwind if there are errors, which triggers our `AbortCodegenOnDrop`
+                // guard. Unfortunately, just skipping the `submit_pre_lto_module_to_llvm` makes
+                // compilation hang on post-monomorphization errors.
+                tcx.dcx().abort_if_errors();
             }
             CguReuse::PostLto => {
                 submit_post_lto_module_to_llvm(
@@ -1024,7 +1064,7 @@ impl CrateInfo {
         let n_crates = crates.len();
         let mut info = CrateInfo {
             target_cpu,
-            target_features: tcx.global_backend_features(()).clone(),
+            target_features: tcx.sess.global_backend_features.clone(),
             crate_types,
             exported_symbols,
             linked_symbols,

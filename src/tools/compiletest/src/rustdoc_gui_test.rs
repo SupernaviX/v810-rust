@@ -33,7 +33,10 @@ impl RustdocGuiTestProps {
 
         let props = TestProps::from_file(test_file_path, None, &config);
 
-        let TestProps { compile_flags, run_flags, .. } = props;
+        let TestProps { mut compile_flags, run_flags, .. } = props;
+        // We don't want to pass `--edition=2015` in, which is being set by default by
+        // `TestProps::from_file`.
+        compile_flags.remove(0);
         Self { compile_flags, run_flags }
     }
 }
@@ -63,7 +66,10 @@ fn incomplete_config_for_rustdoc_gui_test() -> Config {
         rustc_path: Utf8PathBuf::default(),
         cargo_path: Default::default(),
         stage0_rustc_path: Default::default(),
+        run_make_support_rlib: Default::default(),
+        run_make_support_rmeta: Default::default(),
         query_rustc_path: Default::default(),
+        query_rustc_lib_path: Default::default(),
         rustdoc_path: Default::default(),
         coverage_dump_path: Default::default(),
         python: Default::default(),
@@ -79,7 +85,6 @@ fn incomplete_config_for_rustdoc_gui_test() -> Config {
         sysroot_base: Utf8PathBuf::default(),
         stage: Default::default(),
         stage_id: String::default(),
-        debugger: Default::default(),
         run_ignored: Default::default(),
         with_rustc_debug_assertions: Default::default(),
         with_std_debug_assertions: Default::default(),
@@ -94,6 +99,7 @@ fn incomplete_config_for_rustdoc_gui_test() -> Config {
         target_rustcflags: Default::default(),
         rust_randomized_layout: Default::default(),
         optimize_tests: Default::default(),
+        disable_minification: Default::default(),
         target: Default::default(),
         host: Default::default(),
         cdb: Default::default(),
@@ -143,5 +149,6 @@ fn incomplete_config_for_rustdoc_gui_test() -> Config {
         jobs: Default::default(),
         parallel_frontend_threads: Config::DEFAULT_PARALLEL_FRONTEND_THREADS,
         iteration_count: Config::DEFAULT_ITERATION_COUNT,
+        wasm_proc_macros: false,
     }
 }

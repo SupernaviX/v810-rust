@@ -3,7 +3,7 @@ use rustc_abi::ExternAbi;
 use rustc_type_ir_macros::{GenericTypeVisitable, TypeFoldable_Generic, TypeVisitable_Generic};
 
 use crate::solve::{NoSolution, NoSolutionOrRerunNonErased};
-use crate::{self as ty, Interner};
+use crate::{self as ty, Const, Interner, Region};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[derive(TypeFoldable_Generic, TypeVisitable_Generic, GenericTypeVisitable)]
@@ -24,17 +24,17 @@ impl<T> ExpectedFound<T> {
 #[cfg_attr(feature = "nightly", rustc_pass_by_value)]
 pub enum TypeError<I: Interner> {
     Mismatch,
-    PolarityMismatch(#[type_visitable(ignore)] ExpectedFound<ty::PredicatePolarity>),
+    PolarityMismatch(#[type_visitable(ignore)] ExpectedFound<ty::ClausePolarity>),
     SafetyMismatch(#[type_visitable(ignore)] ExpectedFound<I::Safety>),
     AbiMismatch(#[type_visitable(ignore)] ExpectedFound<ExternAbi>),
     Mutability,
     ArgumentMutability(usize),
     TupleSize(ExpectedFound<usize>),
-    ArraySize(ExpectedFound<I::Const>),
+    ArraySize(ExpectedFound<Const<I>>),
     ArgCount,
 
-    RegionsDoesNotOutlive(I::Region, I::Region),
-    RegionsInsufficientlyPolymorphic(ty::BoundRegion<I>, I::Region),
+    RegionsDoesNotOutlive(Region<I>, Region<I>),
+    RegionsInsufficientlyPolymorphic(ty::BoundRegion<I>, Region<I>),
     RegionsPlaceholderMismatch,
 
     Sorts(ExpectedFound<I::Ty>),
@@ -47,10 +47,10 @@ pub enum TypeError<I: Interner> {
     /// created a cycle (because it appears somewhere within that
     /// type).
     CyclicTy(I::Ty),
-    CyclicConst(I::Const),
+    CyclicConst(Const<I>),
     ProjectionMismatched(ExpectedFound<ty::AliasTermKind<I>>),
     ExistentialMismatch(ExpectedFound<I::BoundExistentialPredicates>),
-    ConstMismatch(ExpectedFound<I::Const>),
+    ConstMismatch(ExpectedFound<Const<I>>),
 
     IntrinsicCast,
     /// `#[rustc_force_inline]` functions must be inlined and must not be codegened independently,

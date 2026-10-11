@@ -1,17 +1,18 @@
-use hir::def_id::DefId;
+use std::range::{RangeFrom, RangeToInclusive};
+
 use rustc_abi as abi;
 use rustc_abi::Integer::{I8, I32};
 use rustc_abi::Primitive::{self, Float, Int, Pointer};
 use rustc_abi::{
     AddressSpace, BackendRepr, FIRST_VARIANT, FieldIdx, FieldsShape, HasDataLayout, Layout,
-    LayoutCalculatorError, LayoutData, Niche, ReprOptions, Scalar, Size, StructKind, TagEncoding,
-    VariantIdx, Variants, WrappingRange,
+    LayoutCalculatorError, LayoutData, Niche, NicheOptimizations, ReprOptions, Scalar, Size,
+    StructKind, TagEncoding, VariantIdx, Variants, WrappingRange,
 };
+use rustc_attr_ir::find_attr;
+use rustc_attr_ir::lang_items::LangItem;
 use rustc_hashes::Hash64;
-use rustc_hir as hir;
-use rustc_hir::find_attr;
+use rustc_hir::def_id::DefId;
 use rustc_index::{Idx as _, IndexVec};
-use rustc_middle::bug;
 use rustc_middle::query::Providers;
 use rustc_middle::traits::ObligationCause;
 use rustc_middle::ty::layout::{
@@ -23,7 +24,8 @@ use rustc_middle::ty::{
     TypeVisitableExt, Unnormalized,
 };
 use rustc_session::{DataTypeKind, FieldInfo, FieldKind, SizeKind, VariantInfo};
-use rustc_span::{Symbol, sym};
+use rustc_span::{Symbol, bug, sym};
+use rustc_structures::Limit;
 use tracing::{debug, instrument};
 
 use crate::diagnostics::NonPrimitiveSimdType;
@@ -87,6 +89,7 @@ fn layout_of<'tcx>(
         | ty::TypingMode::Typeck { .. }
         | ty::TypingMode::PostTypeckUntilBorrowck { .. }
         | ty::TypingMode::PostBorrowck { .. }
+        | ty::TypingMode::Reflection
         | ty::TypingMode::ErasedNotCoherence(_)
         | ty::TypingMode::PostAnalysis => {}
     }
@@ -126,7 +129,7 @@ fn map_error<'tcx>(
             // This is sometimes not a compile error if there are trivially false where clauses.
             // See `tests/ui/layout/trivial-bounds-sized.rs` for an example.
             assert!(field.layout.is_unsized(), "invalid layout error {err:#?}");
-            if cx.typing_env.param_env.caller_bounds().is_empty() {
+            if cx.typing_env.param_env.is_empty() {
                 cx.tcx().dcx().delayed_bug(format!(
                     "encountered unexpected unsized field in layout of {ty:?}: {field:#?}"
                 ));
@@ -153,7 +156,7 @@ fn map_error<'tcx>(
         }
         LayoutCalculatorError::OversizedSimdType { max_lanes } => {
             // Can't be caught in typeck if the array length is generic.
-            LayoutError::InvalidSimd { ty, kind: SimdLayoutError::TooManyLanes(max_lanes) }
+            LayoutError::InvalidSimd { ty, kind: SimdLayoutError::TooManyLanes(Limit(max_lanes)) }
         }
         LayoutCalculatorError::NonPrimitiveSimdType(field) => {
             // This error isn't caught in typeck, e.g., if
@@ -232,7 +235,7 @@ fn layout_of_uncached<'tcx>(
     let univariant = |tys: &[Ty<'tcx>], kind| {
         let fields = tys.iter().map(|ty| cx.layout_of(*ty)).try_collect::<IndexVec<_, _>>()?;
         let repr = ReprOptions::default();
-        map_layout(cx.calc.univariant(&fields, &repr, kind))
+        map_layout(cx.calc.layout_of_univariant(&fields, &repr, kind))
     };
     debug_assert!(!ty.has_non_region_infer());
 
@@ -520,11 +523,11 @@ fn layout_of_uncached<'tcx>(
                 .ok_or_else(|| error(cx, LayoutError::Unknown(ty)))?;
 
             let element = cx.layout_of(element)?;
-            map_layout(cx.calc.array_like(&element, Some(count)))?
+            map_layout(cx.calc.layout_of_array_like(&element, Some(count)))?
         }
         ty::Slice(element) => {
             let element = cx.layout_of(element)?;
-            map_layout(cx.calc.array_like(&element, None).map(|mut layout| {
+            map_layout(cx.calc.layout_of_array_like(&element, None).map(|mut layout| {
                 // a randomly chosen value to distinguish slices
                 layout.randomization_seed = Hash64::new(0x2dcba99c39784102);
                 layout
@@ -532,7 +535,7 @@ fn layout_of_uncached<'tcx>(
         }
         ty::Str => {
             let element = scalar(Int(I8, false));
-            map_layout(cx.calc.array_like(&element, None).map(|mut layout| {
+            map_layout(cx.calc.layout_of_array_like(&element, None).map(|mut layout| {
                 // another random value
                 layout.randomization_seed = Hash64::new(0xc1325f37d127be22);
                 layout
@@ -552,6 +555,7 @@ fn layout_of_uncached<'tcx>(
                 | ty::TypingMode::Typeck { .. }
                 | ty::TypingMode::PostTypeckUntilBorrowck { .. }
                 | ty::TypingMode::PostBorrowck { .. }
+                | ty::TypingMode::Reflection
                 | ty::TypingMode::ErasedNotCoherence(_)
                 | ty::TypingMode::PostAnalysis => {
                     return Err(error(cx, LayoutError::TooGeneric(ty)));
@@ -575,14 +579,14 @@ fn layout_of_uncached<'tcx>(
 
             let prefix_layouts = args
                 .as_coroutine()
-                .prefix_tys()
+                .upvar_tys()
                 .iter()
                 .map(|ty| cx.layout_of(ty))
                 .try_collect::<IndexVec<_, _>>()?;
 
             let layout = cx
                 .calc
-                .coroutine(
+                .layout_of_coroutine(
                     &local_layouts,
                     prefix_layouts,
                     &info.variant_fields,
@@ -634,7 +638,7 @@ fn layout_of_uncached<'tcx>(
             };
 
             let element_layout = cx.layout_of(element_ty)?;
-            map_layout(cx.calc.scalable_vector_type(
+            map_layout(cx.calc.layout_of_scalable_vector_type(
                 element_layout,
                 element_count as u64,
                 number_of_vectors,
@@ -674,14 +678,12 @@ fn layout_of_uncached<'tcx>(
                     return Err(map_error(
                         &cx,
                         ty,
-                        rustc_abi::LayoutCalculatorError::OversizedSimdType {
-                            max_lanes: limit.0 as u64,
-                        },
+                        rustc_abi::LayoutCalculatorError::OversizedSimdType { max_lanes: limit.0 },
                     ));
                 }
             }
 
-            map_layout(cx.calc.simd_type(e_ly, e_len, def.repr().packed()))?
+            map_layout(cx.calc.layout_of_simd_type(e_ly, e_len, def.repr().packed()))?
         }
 
         // ADTs.
@@ -711,14 +713,30 @@ fn layout_of_uncached<'tcx>(
             }
 
             // UnsafeCell and UnsafePinned both disable niche optimizations
-            let is_special_no_niche = def.is_unsafe_cell() || def.is_unsafe_pinned();
+            let niche_optimizations = match def.is_unsafe_cell() || def.is_unsafe_pinned() {
+                true => NicheOptimizations::Disabled,
+                false => NicheOptimizations::Enabled,
+            };
 
-            let discr_range_of_repr =
-                |min, max| abi::Integer::discr_range_of_repr(tcx, ty, &def.repr(), min, max);
+            let discr_range_of_repr = |min: RangeFrom<i128>, max: RangeToInclusive<u128>| {
+                abi::Integer::discr_range_of_repr(tcx, ty, &def.repr(), min.start, max.last)
+            };
+
+            // We shouldn't be computing the layout of discrs that fail typeck
+            if def.is_enum() {
+                for v in def.variants() {
+                    if let ty::VariantDiscr::Explicit(def_id) = v.discr
+                        && let Some(local_did) = def_id.as_local()
+                        && let Some(guar) = tcx.typeck(local_did).tainted_by_errors
+                    {
+                        return Err(error(cx, LayoutError::ReferencesError(guar)));
+                    }
+                }
+            }
 
             let discriminants_iter = || {
                 def.is_enum()
-                    .then(|| def.discriminants(tcx).map(|(v, d)| (v, d.val as i128)))
+                    .then(|| def.discriminants(tcx).map(|(v, d)| (v, d.val)))
                     .into_flat_iter()
             };
 
@@ -734,13 +752,13 @@ fn layout_of_uncached<'tcx>(
                         .is_sized(tcx, typing_env)
                 });
 
-            let layout = cx
+            let mut layout = cx
                 .calc
                 .layout_of_struct_or_enum(
                     &def.repr(),
                     &variants,
                     def.is_enum(),
-                    is_special_no_niche,
+                    niche_optimizations,
                     discr_range_of_repr,
                     discriminants_iter(),
                     !maybe_unsized,
@@ -769,7 +787,7 @@ fn layout_of_uncached<'tcx>(
                     &def.repr(),
                     &variants,
                     def.is_enum(),
-                    is_special_no_niche,
+                    niche_optimizations,
                     discr_range_of_repr,
                     discriminants_iter(),
                     !maybe_unsized,
@@ -801,6 +819,20 @@ fn layout_of_uncached<'tcx>(
                 }
             }
 
+            if tcx.is_lang_item(def.did(), LangItem::F16B) {
+                let bfloat = scalar_unit(Primitive::Float(abi::Float::F16B));
+                assert_eq!(layout.size, abi::Float::F16B.size());
+                layout.align = abi::Float::F16B.align(cx);
+                layout.backend_repr = BackendRepr::Scalar(bfloat);
+            }
+
+            if tcx.is_lang_item(def.did(), LangItem::PpcF128) {
+                let ppcf128 = scalar_unit(Primitive::Float(abi::Float::PpcF128));
+                assert_eq!(layout.size, abi::Float::PpcF128.size());
+                layout.align = abi::Float::PpcF128.align(cx);
+                layout.backend_repr = BackendRepr::Scalar(ppcf128);
+            }
+
             tcx.mk_layout(layout)
         }
 
@@ -825,7 +857,7 @@ fn layout_of_uncached<'tcx>(
             // Due to trivial bounds, this can even be the case if the alias does not reference
             // any generic parameters, e.g. a `for<'a> u32: Trait<'a>` where-bound means that
             // `<u32 as Trait<'static>>::Assoc` is rigid.
-            let err = if ty.has_param() || !cx.typing_env.param_env.caller_bounds().is_empty() {
+            let err = if ty.has_param() || !cx.typing_env.param_env.is_empty() {
                 LayoutError::TooGeneric(ty)
             } else {
                 LayoutError::ReferencesError(cx.tcx().dcx().delayed_bug(format!(
@@ -846,7 +878,7 @@ fn record_layout_for_printing<'tcx>(cx: &LayoutCx<'tcx>, layout: TyAndLayout<'tc
     // Ignore layouts that are done with non-empty environments or
     // non-monomorphic layouts, as the user only wants to see the stuff
     // resulting from the final codegen session.
-    if layout.ty.has_non_region_param() || !cx.typing_env.param_env.caller_bounds().is_empty() {
+    if layout.ty.has_non_region_param() || !cx.typing_env.param_env.is_empty() {
         return;
     }
 

@@ -9,14 +9,7 @@ error: fn_abi_of(take_va_list) = FnAbi {
                                abi: Align(8 bytes),
                            },
                            backend_repr: Scalar(
-                               Initialized {
-                                   value: Pointer(
-                                       AddressSpace(
-                                           0,
-                                       ),
-                                   ),
-                                   valid_range: 0..=$MAX,
-                               },
+                               pointer is 0..=$MAX,
                            ),
                            fields: Arbitrary {
                                offsets: $OFFSETS,
@@ -29,6 +22,7 @@ error: fn_abi_of(take_va_list) = FnAbi {
                            },
                            max_repr_align: None,
                            unadjusted_abi_align: Align(8 bytes),
+                           repr_c: false,
                            randomization_seed: $SEED,
                        },
                    },
@@ -64,6 +58,7 @@ error: fn_abi_of(take_va_list) = FnAbi {
                        },
                        max_repr_align: None,
                        unadjusted_abi_align: Align(1 bytes),
+                       repr_c: false,
                        randomization_seed: $SEED,
                    },
                },

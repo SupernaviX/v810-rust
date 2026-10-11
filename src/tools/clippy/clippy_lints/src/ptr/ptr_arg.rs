@@ -1,18 +1,17 @@
 use super::PTR_ARG;
 use clippy_utils::diagnostics::span_lint_hir_and_then;
-use clippy_utils::res::MaybeResPath;
-use clippy_utils::source::SpanExt;
+use clippy_utils::res::MaybeResPath as _;
+use clippy_utils::source::SpanExt as _;
 use clippy_utils::{VEC_METHODS_SHADOWING_SLICE_METHODS, get_expr_use_or_unification_node, is_lint_allowed, sym};
 use hir::LifetimeKind;
 use rustc_abi::ExternAbi;
 use rustc_errors::Applicability;
-use rustc_hir::hir_id::{HirId, HirIdMap};
 use rustc_hir::intravisit::{Visitor, walk_expr};
 use rustc_hir::{
-    self as hir, AnonConst, BindingMode, Body, Expr, ExprKind, FnSig, GenericArg, Lifetime, Mutability, Node, OwnerId,
-    Param, PatKind, QPath, TyKind,
+    self as hir, AnonConst, BindingMode, Body, Expr, ExprKind, FnSig, GenericArg, HirId, HirIdMap, Lifetime,
+    Mutability, Node, OwnerId, Param, PatKind, QPath, TyKind,
 };
-use rustc_infer::infer::TyCtxtInferExt;
+use rustc_infer::infer::TyCtxtInferExt as _;
 use rustc_infer::traits::{Obligation, ObligationCause};
 use rustc_lint::LateContext;
 use rustc_middle::hir::nested_filter;
@@ -25,7 +24,7 @@ use std::{fmt, iter};
 
 pub(super) fn check_body<'tcx>(
     cx: &LateContext<'tcx>,
-    body: &Body<'tcx>,
+    body: &'tcx Body<'tcx>,
     item_id: OwnerId,
     sig: &FnSig<'tcx>,
     is_trait_item: bool,
@@ -137,7 +136,7 @@ struct RefPrefix {
 }
 impl fmt::Display for RefPrefix {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        use fmt::Write;
+        use fmt::Write as _;
         f.write_char('&')?;
         if !self.lt.is_anonymous() {
             self.lt.ident.fmt(f)?;
@@ -150,7 +149,7 @@ impl fmt::Display for RefPrefix {
 struct DerefTyDisplay<'a, 'tcx>(&'a LateContext<'tcx>, &'a DerefTy<'tcx>);
 impl fmt::Display for DerefTyDisplay<'_, '_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        use std::fmt::Write;
+        use std::fmt::Write as _;
         match self.1 {
             DerefTy::Str => f.write_str("str"),
             DerefTy::Path => f.write_str("Path"),
@@ -208,8 +207,8 @@ fn check_fn_args<'cx, 'tcx: 'cx>(
         .filter_map(move |(i, (ty, hir_ty))| {
             if let ty::Ref(_, ty, mutability) = *ty.kind()
                 && let  ty::Adt(adt, args) = *ty.kind()
-                && let TyKind::Ref(lt, ref ty) = hir_ty.kind
-                && let TyKind::Path(QPath::Resolved(None, path)) = ty.ty.kind
+                && let TyKind::Ref(lt, inner_ty, _) = hir_ty.kind
+                && let TyKind::Path(QPath::Resolved(None, path)) = inner_ty.kind
                 // Check that the name as typed matches the actual name of the type.
                 // e.g. `fn foo(_: &Foo)` shouldn't trigger the lint when `Foo` is an alias for `Vec`
                 && let [.., name] = path.segments
@@ -307,7 +306,7 @@ fn check_fn_args<'cx, 'tcx: 'cx>(
 }
 
 #[expect(clippy::too_many_lines)]
-fn check_ptr_arg_usage<'tcx>(cx: &LateContext<'tcx>, body: &Body<'tcx>, args: &[PtrArg<'tcx>]) -> Vec<PtrArgResult> {
+fn check_ptr_arg_usage<'tcx>(cx: &LateContext<'tcx>, body: &'tcx Body<'tcx>, args: &[PtrArg<'tcx>]) -> Vec<PtrArgResult> {
     struct V<'cx, 'tcx> {
         cx: &'cx LateContext<'tcx>,
         /// Map from a local id to which argument it came from (index into `Self::args` and
@@ -450,7 +449,7 @@ fn check_ptr_arg_usage<'tcx>(cx: &LateContext<'tcx>, body: &Body<'tcx>, args: &[
         results,
         skip_count,
     };
-    v.visit_expr(body.value);
+    v.visit_expr(&body.value);
     v.results
 }
 

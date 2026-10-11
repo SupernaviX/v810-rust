@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::fmt;
 use std::hash::Hash;
 
+use rustc_attr_ir::{InlineAttr, Linkage};
 use rustc_data_structures::base_n::{BaseNString, CASE_INSENSITIVE, ToBaseN};
 use rustc_data_structures::fingerprint::Fingerprint;
 use rustc_data_structures::fx::FxIndexMap;
@@ -11,11 +12,10 @@ use rustc_data_structures::stable_hash::{
 use rustc_data_structures::unord::UnordMap;
 use rustc_hashes::Hash128;
 use rustc_hir::ItemId;
-use rustc_hir::attrs::{InlineAttr, Linkage};
 use rustc_hir::def_id::{CrateNum, DefId, DefIdSet, LOCAL_CRATE};
 use rustc_macros::{StableHash, TyDecodable, TyEncodable};
 use rustc_session::config::OptLevel;
-use rustc_span::{Span, Symbol};
+use rustc_span::{OrdSpan, Span, Symbol};
 use rustc_target::spec::SymbolVisibility;
 use tracing::debug;
 
@@ -124,7 +124,7 @@ impl<'tcx> MonoItem<'tcx> {
             MonoItem::Fn(instance) => tcx.symbol_name(instance),
             MonoItem::Static(def_id) => tcx.symbol_name(Instance::mono(tcx, def_id)),
             MonoItem::GlobalAsm(item_id) => {
-                SymbolName::new(tcx, &format!("global_asm_{:?}", item_id.owner_id))
+                tcx.symbol_name(Instance::mono(tcx, item_id.owner_id.to_def_id()))
             }
         }
     }
@@ -278,7 +278,7 @@ impl<'tcx> MonoItem<'tcx> {
             MonoItem::GlobalAsm(..) => return true,
         };
 
-        !tcx.instantiate_and_check_impossible_predicates((def_id, &args))
+        !tcx.instantiate_and_check_impossible_clauses((def_id, &args))
     }
 
     pub fn local_span(&self, tcx: TyCtxt<'tcx>) -> Option<Span> {
@@ -349,6 +349,11 @@ pub struct CodegenUnit<'tcx> {
     /// contain something unique to this crate (e.g., a module path)
     /// as well as the crate name and disambiguator.
     name: Symbol,
+
+    /// Symbol name for this CGU. Backend may emit symbols prefixed with this name
+    /// and assume uniqueness.
+    symbol_name: Option<Symbol>,
+
     items: FxIndexMap<MonoItem<'tcx>, MonoItemData>,
     size_estimate: usize,
     primary: bool,
@@ -405,6 +410,7 @@ impl<'tcx> CodegenUnit<'tcx> {
     pub fn new(name: Symbol) -> CodegenUnit<'tcx> {
         CodegenUnit {
             name,
+            symbol_name: None,
             items: Default::default(),
             size_estimate: 0,
             primary: false,
@@ -443,6 +449,14 @@ impl<'tcx> CodegenUnit<'tcx> {
     /// Marks this CGU as the one used to contain code coverage information for dead code.
     pub fn make_code_coverage_dead_code_cgu(&mut self) {
         self.is_code_coverage_dead_code_cgu = true;
+    }
+
+    pub fn symbol_name(&self) -> Symbol {
+        self.symbol_name.expect("CGU symbol name accessed before setting")
+    }
+
+    pub fn set_symbol_name(&mut self, name: Symbol) {
+        self.symbol_name = Some(name);
     }
 
     pub fn mangle_name(human_readable_name: &str) -> BaseNString {
@@ -514,7 +528,7 @@ impl<'tcx> CodegenUnit<'tcx> {
         // The codegen tests rely on items being process in the same order as
         // they appear in the file, so for local items, we sort by span first
         #[derive(PartialEq, Eq, PartialOrd, Ord)]
-        struct ItemSortKey<'tcx>(Option<Span>, SymbolName<'tcx>);
+        struct ItemSortKey<'tcx>(Option<OrdSpan>, SymbolName<'tcx>);
 
         // We only want to take HirIds of user-defines instances into account.
         // The others don't matter for the codegen tests and can even make item
@@ -534,7 +548,8 @@ impl<'tcx> CodegenUnit<'tcx> {
                     | InstanceKind::Shim(ShimKind::DropGlue(..))
                     | InstanceKind::Shim(ShimKind::Clone(..))
                     | InstanceKind::Shim(ShimKind::ThreadLocal(..))
-                    | InstanceKind::Shim(ShimKind::FnPtrAddr(..))
+                    | InstanceKind::Shim(ShimKind::FnPtrAsPtr(..))
+                    | InstanceKind::Shim(ShimKind::FnPtrFromPtr(..))
                     | InstanceKind::Shim(ShimKind::AsyncDropGlue(..))
                     | InstanceKind::Shim(ShimKind::FutureDropPoll(..))
                     | InstanceKind::Shim(ShimKind::AsyncDropGlueCtor(..)) => None,
@@ -545,9 +560,9 @@ impl<'tcx> CodegenUnit<'tcx> {
         }
         fn item_sort_key<'tcx>(tcx: TyCtxt<'tcx>, item: MonoItem<'tcx>) -> ItemSortKey<'tcx> {
             ItemSortKey(
-                local_item_id(item)
-                    .map(|def_id| tcx.def_span(def_id).find_ancestor_not_from_macro())
-                    .flatten(),
+                local_item_id(item).and_then(|def_id| {
+                    tcx.def_span(def_id).find_ancestor_not_from_macro().map(OrdSpan)
+                }),
                 item.symbol_name(tcx),
             )
         }

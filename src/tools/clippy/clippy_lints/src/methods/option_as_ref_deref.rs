@@ -1,6 +1,6 @@
 use clippy_utils::diagnostics::span_lint_and_sugg;
 use clippy_utils::msrvs::{self, Msrv};
-use clippy_utils::res::{MaybeDef, MaybeResPath};
+use clippy_utils::res::{MaybeDef as _, MaybeResPath as _};
 use clippy_utils::source::snippet;
 use clippy_utils::{peel_blocks, sym};
 use rustc_errors::Applicability;
@@ -47,7 +47,7 @@ pub(super) fn check(
             }),
         hir::ExprKind::Closure(&hir::Closure { body, .. }) => {
             let closure_body = cx.tcx.hir_body(body);
-            let closure_expr = peel_blocks(closure_body.value);
+            let closure_expr = peel_blocks(&closure_body.value);
 
             match &closure_expr.kind {
                 hir::ExprKind::MethodCall(_, receiver, [], _) => {

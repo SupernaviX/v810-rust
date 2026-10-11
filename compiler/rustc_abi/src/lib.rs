@@ -40,8 +40,8 @@ use std::cmp::min;
 use std::fmt;
 #[cfg(feature = "nightly")]
 use std::iter::Step;
-use std::num::{NonZeroUsize, ParseIntError};
-use std::ops::{Add, AddAssign, Deref, Mul, RangeFull, Sub};
+use std::num::{NonZero, ParseIntError};
+use std::ops::{Add, AddAssign, Deref, Mul, Sub};
 use std::range::RangeInclusive;
 use std::str::FromStr;
 
@@ -51,7 +51,7 @@ use rustc_data_structures::stable_hash::StableOrd;
 #[cfg(feature = "nightly")]
 use rustc_error_messages::{DiagArgValue, IntoDiagArg};
 #[cfg(feature = "nightly")]
-use rustc_errors::{Diag, DiagCtxtHandle, Diagnostic, EmissionGuarantee, Level, msg};
+use rustc_errors::{Diag, DiagCtxtHandle, Diagnostic, Level, msg};
 use rustc_hashes::Hash64;
 use rustc_index::{Idx, IndexSlice, IndexVec};
 #[cfg(feature = "nightly")]
@@ -65,6 +65,7 @@ mod extern_abi;
 mod layout;
 #[cfg(test)]
 mod tests;
+mod wrapping_range;
 
 pub use callconv::{Heterogeneous, HomogeneousAggregate, Reg, RegKind};
 pub use canon_abi::{ArmCall, CanonAbi, InterruptKind, X86Call};
@@ -74,6 +75,7 @@ pub use extern_abi::{ExternAbi, all_names};
 pub use layout::{FIRST_VARIANT, FieldIdx, LayoutCalculator, LayoutCalculatorError, VariantIdx};
 #[cfg(feature = "nightly")]
 pub use layout::{Layout, TyAbiInterface, TyAndLayout};
+pub use wrapping_range::WrappingRange;
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "nightly", derive(Encodable_NoContext, Decodable_NoContext, StableHash))]
@@ -90,6 +92,10 @@ bitflags! {
         /// If true, the type's crate has opted into layout randomization.
         /// Other flags can still inhibit reordering and thus randomization.
         /// The seed stored in `ReprOptions.field_shuffle_seed`.
+        ///
+        /// `repr(Rust)` structs with only zero-sized fields, single-variant `repr(Rust)` enums with only
+        /// zero-sized fields, and zero-variant `repr(Rust)` enums must remain zero-sized as per
+        /// T-lang decisions in https://github.com/rust-lang/reference/pull/2262 and https://github.com/rust-lang/reference/pull/2293
         const RANDOMIZE_LAYOUT   = 1 << 4;
         /// If true, the type is always passed indirectly by non-Rustic ABIs.
         /// See [`TyAndLayout::pass_indirectly_in_non_rustic_abis`] for details.
@@ -178,6 +184,14 @@ impl ReprOptions {
         self.flags.contains(ReprFlags::IS_C)
     }
 
+    /// Returns whether this is (implicitly or explicitly) `repr(Rust)`, i.e., its layout
+    /// is defined by Rust and we make no stable commitments.
+    #[inline]
+    pub fn rust(&self) -> bool {
+        // `linear` is currently just an internal flag we set on Box; that's still `repr(Rust)`.
+        !self.c() & !self.simd() & !self.scalable() & !self.transparent()
+    }
+
     #[inline]
     pub fn packed(&self) -> bool {
         self.pack.is_some()
@@ -231,6 +245,16 @@ impl ReprOptions {
     pub fn inhibits_union_abi_opt(&self) -> bool {
         self.c()
     }
+
+    /// Ensures two `repr` are equal up to the seed.
+    pub fn equal_up_to_seed(&self, other: &Self) -> bool {
+        let ReprOptions { int, align, pack, flags, scalable, field_shuffle_seed: _ } = *self;
+        int == other.int
+            && align == other.align
+            && pack == other.pack
+            && flags == other.flags
+            && scalable == other.scalable
+    }
 }
 
 /// The maximum supported number of lanes in a SIMD vector.
@@ -238,7 +262,42 @@ impl ReprOptions {
 /// This value is selected based on backend support:
 /// * LLVM does not appear to have a vector width limit.
 /// * Cranelift stores the base-2 log of the lane count in a 4 bit integer.
-pub const MAX_SIMD_LANES: u64 = 1 << 0xF;
+pub const MAX_SIMD_LANES: u16 = 1 << 0xF;
+
+/// The number of lanes in a [`BackendRepr::SimdVector`], `1..=`[`MAX_SIMD_LANES`].
+#[derive(Debug, Copy, Clone, Hash, Eq, PartialEq, Ord, PartialOrd)]
+#[cfg_attr(feature = "nightly", derive(Encodable_NoContext, Decodable_NoContext, StableHash))]
+pub struct BackendLaneCount(NonZero<u16>);
+
+impl BackendLaneCount {
+    pub fn new<N>(count: u64) -> Result<Self, LayoutCalculatorError<N>> {
+        let Ok(count @ ..=MAX_SIMD_LANES) = u16::try_from(count) else {
+            return Err(LayoutCalculatorError::OversizedSimdType {
+                max_lanes: crate::MAX_SIMD_LANES.into(),
+            });
+        };
+        if let Some(count) = NonZero::new(count) {
+            Ok(BackendLaneCount(count))
+        } else {
+            Err(LayoutCalculatorError::ZeroLengthSimdType)
+        }
+    }
+
+    #[inline]
+    pub fn is_power_of_two(self) -> bool {
+        self.0.is_power_of_two()
+    }
+
+    #[inline]
+    pub fn as_u64(self) -> u64 {
+        self.0.get().into()
+    }
+
+    #[inline]
+    pub fn as_u32(self) -> u32 {
+        self.0.get().into()
+    }
+}
 
 /// How pointers are represented in a given address space
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -340,8 +399,8 @@ pub enum TargetDataLayoutError<'a> {
 }
 
 #[cfg(feature = "nightly")]
-impl<G: EmissionGuarantee> Diagnostic<'_, G> for TargetDataLayoutError<'_> {
-    fn into_diag(self, dcx: DiagCtxtHandle<'_>, level: Level) -> Diag<'_, G> {
+impl Diagnostic<'_> for TargetDataLayoutError<'_> {
+    fn into_diag(self, dcx: DiagCtxtHandle<'_>, level: Level) -> Diag<'_> {
         match self {
             TargetDataLayoutError::InvalidAddressSpace { addr_space, err, cause } => {
                 Diag::new(dcx, level, msg!("invalid address space `{$addr_space}` for `{$cause}` in \"data-layout\": {$err}"))
@@ -1000,7 +1059,6 @@ impl Step for Size {
     }
 
     #[inline]
-    #[cfg(not(bootstrap))]
     fn forward_overflowing(start: Self, count: usize) -> (Self, bool) {
         let (s, o) = u64::forward_overflowing(start.bytes(), count);
         (Self::from_bytes(s), o)
@@ -1022,7 +1080,6 @@ impl Step for Size {
     }
 
     #[inline]
-    #[cfg(not(bootstrap))]
     fn backward_overflowing(start: Self, count: usize) -> (Self, bool) {
         let (s, o) = u64::backward_overflowing(start.bytes(), count);
         (Self::from_bytes(s), o)
@@ -1363,9 +1420,17 @@ impl Integer {
 #[cfg_attr(feature = "nightly", derive(StableHash))]
 pub enum Float {
     F16,
+    /// `f16b`. This is not a builtin type in Rust (it is exposed as a lang item),
+    /// but it is a builtin type in LLVM so needs to be explicitly represented
+    /// in the backend.
+    F16B,
     F32,
     F64,
     F128,
+    /// `ppcf128`. This is not a builtin type in Rust (it is exposed as a lang item),
+    /// but it is a builtin type in LLVM so needs to be explicitly represented
+    /// in the backend.
+    PpcF128,
 }
 
 impl Float {
@@ -1374,9 +1439,11 @@ impl Float {
 
         match self {
             F16 => Size::from_bits(16),
+            F16B => Size::from_bits(16),
             F32 => Size::from_bits(32),
             F64 => Size::from_bits(64),
             F128 => Size::from_bits(128),
+            PpcF128 => Size::from_bits(128),
         }
     }
 
@@ -1385,16 +1452,58 @@ impl Float {
         let dl = cx.data_layout();
 
         AbiAlign::new(match self {
-            F16 => dl.f16_align,
+            F16 | F16B => dl.f16_align,
             F32 => dl.f32_align,
             F64 => dl.f64_align,
             F128 => dl.f128_align,
+            PpcF128 => dl.f128_align,
         })
+    }
+
+    pub fn ty_str(self) -> &'static str {
+        use Float::*;
+
+        match self {
+            F16 => "f16",
+            F16B => "f16b",
+            F32 => "f32",
+            F64 => "f64",
+            F128 => "f128",
+            PpcF128 => "ppcf128",
+        }
+    }
+}
+
+/// Numeric primitives.
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "nightly", derive(StableHash))]
+pub enum Numeric {
+    /// The `bool` is the signedness of the `Integer` type.
+    Int(Integer, bool),
+    Float(Float),
+}
+
+impl Numeric {
+    pub fn size(self) -> Size {
+        match self {
+            Numeric::Int(integer, _) => integer.size(),
+            Numeric::Float(float) => float.size(),
+        }
+    }
+
+    pub fn reg_kind(self) -> RegKind {
+        match self {
+            Numeric::Int(_, _) => RegKind::Integer,
+            Numeric::Float(Float::PpcF128) => RegKind::PpcF128,
+            Numeric::Float(Float::F16 | Float::F16B | Float::F32 | Float::F64 | Float::F128) => {
+                RegKind::Float
+            }
+        }
     }
 }
 
 /// Fundamental unit of memory access and layout.
-#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "nightly", derive(StableHash))]
 pub enum Primitive {
     /// The `bool` is the signedness of the `Integer` type.
@@ -1407,6 +1516,29 @@ pub enum Primitive {
     Int(Integer, bool),
     Float(Float),
     Pointer(AddressSpace),
+}
+
+impl fmt::Debug for Primitive {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match *self {
+            Primitive::Int(integer, is_signed) => {
+                if is_signed {
+                    integer.int_ty_str()
+                } else {
+                    integer.uint_ty_str()
+                }
+            }
+            Primitive::Float(float) => float.ty_str(),
+            Primitive::Pointer(addr_space) => {
+                if addr_space == AddressSpace::ZERO {
+                    "pointer"
+                } else {
+                    return write!(f, "pointer({addr_space:?})");
+                }
+            }
+        };
+        f.write_str(name)
+    }
 }
 
 impl Primitive {
@@ -1437,128 +1569,8 @@ impl Primitive {
     }
 }
 
-/// Inclusive wrap-around range of valid values, that is, if
-/// start > end, it represents `start..=MAX`, followed by `0..=end`.
-///
-/// That is, for an i8 primitive, a range of `254..=2` means following
-/// sequence:
-///
-///    254 (-2), 255 (-1), 0, 1, 2
-///
-/// This is intended specifically to mirror LLVM’s `!range` metadata semantics.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "nightly", derive(StableHash))]
-pub struct WrappingRange {
-    pub start: u128,
-    pub end: u128,
-}
-
-impl WrappingRange {
-    pub fn full(size: Size) -> Self {
-        Self { start: 0, end: size.unsigned_int_max() }
-    }
-
-    /// Returns `true` if `v` is contained in the range.
-    #[inline(always)]
-    pub fn contains(&self, v: u128) -> bool {
-        if self.start <= self.end {
-            self.start <= v && v <= self.end
-        } else {
-            self.start <= v || v <= self.end
-        }
-    }
-
-    /// Returns `true` if all the values in `other` are contained in this range,
-    /// when the values are considered as having width `size`.
-    #[inline(always)]
-    pub fn contains_range(&self, other: Self, size: Size) -> bool {
-        if self.is_full_for(size) {
-            true
-        } else {
-            let trunc = |x| size.truncate(x);
-
-            let delta = self.start;
-            let max = trunc(self.end.wrapping_sub(delta));
-
-            let other_start = trunc(other.start.wrapping_sub(delta));
-            let other_end = trunc(other.end.wrapping_sub(delta));
-
-            // Having shifted both input ranges by `delta`, now we only need to check
-            // whether `0..=max` contains `other_start..=other_end`, which can only
-            // happen if the other doesn't wrap since `self` isn't everything.
-            (other_start <= other_end) && (other_end <= max)
-        }
-    }
-
-    /// Returns `self` with replaced `start`
-    #[inline(always)]
-    fn with_start(mut self, start: u128) -> Self {
-        self.start = start;
-        self
-    }
-
-    /// Returns `self` with replaced `end`
-    #[inline(always)]
-    fn with_end(mut self, end: u128) -> Self {
-        self.end = end;
-        self
-    }
-
-    /// Returns `true` if `size` completely fills the range.
-    ///
-    /// Note that this is *not* the same as `self == WrappingRange::full(size)`.
-    /// Niche calculations can produce full ranges which are not the canonical one;
-    /// for example `Option<NonZero<u16>>` gets `valid_range: (..=0) | (1..)`.
-    #[inline]
-    fn is_full_for(&self, size: Size) -> bool {
-        let max_value = size.unsigned_int_max();
-        debug_assert!(self.start <= max_value && self.end <= max_value);
-        self.start == (self.end.wrapping_add(1) & max_value)
-    }
-
-    /// Checks whether this range is considered non-wrapping when the values are
-    /// interpreted as *unsigned* numbers of width `size`.
-    ///
-    /// Returns `Ok(true)` if there's no wrap-around, `Ok(false)` if there is,
-    /// and `Err(..)` if the range is full so it depends how you think about it.
-    #[inline]
-    pub fn no_unsigned_wraparound(&self, size: Size) -> Result<bool, RangeFull> {
-        if self.is_full_for(size) { Err(..) } else { Ok(self.start <= self.end) }
-    }
-
-    /// Checks whether this range is considered non-wrapping when the values are
-    /// interpreted as *signed* numbers of width `size`.
-    ///
-    /// This is heavily dependent on the `size`, as `100..=200` does wrap when
-    /// interpreted as `i8`, but doesn't when interpreted as `i16`.
-    ///
-    /// Returns `Ok(true)` if there's no wrap-around, `Ok(false)` if there is,
-    /// and `Err(..)` if the range is full so it depends how you think about it.
-    #[inline]
-    pub fn no_signed_wraparound(&self, size: Size) -> Result<bool, RangeFull> {
-        if self.is_full_for(size) {
-            Err(..)
-        } else {
-            let start: i128 = size.sign_extend(self.start);
-            let end: i128 = size.sign_extend(self.end);
-            Ok(start <= end)
-        }
-    }
-}
-
-impl fmt::Debug for WrappingRange {
-    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.start > self.end {
-            write!(fmt, "(..={}) | ({}..)", self.end, self.start)?;
-        } else {
-            write!(fmt, "{}..={}", self.start, self.end)?;
-        }
-        Ok(())
-    }
-}
-
 /// Information about one scalar component of a Rust type.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "nightly", derive(StableHash))]
 pub enum Scalar {
     Initialized {
@@ -1577,6 +1589,24 @@ pub enum Scalar {
         /// so there is no `valid_range`.
         value: Primitive,
     },
+}
+
+impl fmt::Debug for Scalar {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Scalar::Initialized { value, valid_range } => {
+                let (size, is_signed) = match *value {
+                    Primitive::Int(integer, is_signed) => (integer.size(), is_signed),
+                    Primitive::Float(float) => (float.size(), false),
+                    Primitive::Pointer(_) => (Size::from_bits(128), false),
+                };
+                write!(f, "{value:?} is {:?}", valid_range.debug_as(size, is_signed))
+            }
+            Scalar::Union { value } => {
+                write!(f, "union {value:?}")
+            }
+        }
+    }
 }
 
 impl Scalar {
@@ -1673,7 +1703,7 @@ pub enum FieldsShape<FieldIdx: Idx> {
     Primitive,
 
     /// All fields start at no offset. The `usize` is the field count.
-    Union(NonZeroUsize),
+    Union(NonZero<usize>),
 
     /// Array/vector-like placement, with all fields of identical types.
     Array { stride: Size, count: u64 },
@@ -1758,6 +1788,10 @@ pub struct AddressSpace(pub u32);
 impl AddressSpace {
     /// LLVM's `0` address space.
     pub const ZERO: Self = AddressSpace(0);
+    /// The address space for constant memory on nvptx and amdgpu.
+    /// This address space is used e.g. for kernel arguments that are constant throughout the
+    /// execution.
+    pub const GPU_CONSTANT: Self = AddressSpace(4);
     /// The address space for workgroup memory on nvptx and amdgpu.
     /// See e.g. the `gpu_launch_sized_workgroup_mem` intrinsic for details.
     pub const GPU_WORKGROUP: Self = AddressSpace(3);
@@ -1832,12 +1866,12 @@ pub enum BackendRepr {
     },
     SimdScalableVector {
         element: Scalar,
-        count: u64,
+        count: BackendLaneCount,
         number_of_vectors: NumScalableVectors,
     },
     SimdVector {
         element: Scalar,
-        count: u64,
+        count: BackendLaneCount,
     },
     // FIXME: I sometimes use memory, sometimes use an IR aggregate!
     Memory {
@@ -1991,24 +2025,40 @@ impl BackendRepr {
     }
 }
 
+/// Describes the variants of a type.
 // NOTE: This struct is generic over the FieldIdx and VariantIdx for rust-analyzer usage.
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]
 #[cfg_attr(feature = "nightly", derive(StableHash))]
 pub enum Variants<FieldIdx: Idx, VariantIdx: Idx> {
-    /// A type with no valid variants. Must be uninhabited.
+    /// The type has no valid variants. Must be uninhabited.
+    ///
+    /// This is the case for:
+    /// 1. enums with no inhabited variants
+    /// 2. the never type
     Empty,
 
-    /// Single enum variants, structs/tuples, unions, and all non-ADTs.
+    /// The type has a single valid variant. Such types are called "univariant".
+    ///
+    /// This is the case for:
+    /// 1. enums with a single inhabited variant, aka. "univariant enums"
+    /// 2. structs, unions, and non-ADTs (except coroutines; see below),
+    ///    as those can't have multiple variants
     Single {
-        /// Always `0` for types that cannot have multiple variants.
+        /// - for case 1, this is the index of the inhabited variant
+        /// - for case 2, this is always `0` (a dummy value)
         index: VariantIdx,
     },
 
-    /// Enum-likes with more than one variant: each variant comes with
-    /// a *discriminant* (usually the same as the variant index but the user can
-    /// assign explicit discriminant values). That discriminant is encoded
-    /// as a *tag* on the machine. The layout of each variant is
-    /// a struct, and they all have space reserved for the tag.
+    /// The type has multiple valid variants.
+    ///
+    /// This is the case for:
+    /// 1. enums with multiple inhabited variants
+    /// 2. coroutines
+    ///
+    /// Each variant comes with a *discriminant* (usually the same as the
+    /// variant index but the user can assign explicit discriminant values).
+    /// That discriminant is encoded as a *tag* on the machine. The layout of
+    /// each variant is a struct, and they all have space reserved for the tag.
     /// For enums, the tag is the sole field of the layout.
     Multiple {
         tag: Scalar,
@@ -2155,6 +2205,18 @@ impl Niche {
     }
 }
 
+/// Whether niche optimizations should be performed during layout calculation.
+///
+/// [`UnsafeCell`] and [`UnsafePinned`] both disable niche optimizations.
+///
+/// [`UnsafeCell`]: std::cell::UnsafeCell
+/// [`UnsafePinned`]: std::pin::UnsafePinned
+#[derive(PartialEq, Eq, Clone, Copy)]
+pub enum NicheOptimizations {
+    Enabled,
+    Disabled,
+}
+
 // NOTE: This struct is generic over the FieldIdx and VariantIdx for rust-analyzer usage.
 #[derive(PartialEq, Eq, Hash, Clone)]
 #[cfg_attr(feature = "nightly", derive(StableHash))]
@@ -2198,9 +2260,16 @@ pub struct LayoutData<FieldIdx: Idx, VariantIdx: Idx> {
     pub max_repr_align: Option<Align>,
 
     /// The alignment the type would have, ignoring any `repr(align)` but including `repr(packed)`.
-    /// Only used on aarch64-linux, where the argument passing ABI ignores the requested alignment
-    /// in some cases.
+    /// Only used on aarch64-linux and arm, where the argument passing ABI ignores the requested
+    /// alignment in some cases.
     pub unadjusted_abi_align: Align,
+
+    /// Whether this type is `repr(C)`, or a `repr(transparent)` wrapper around such,
+    /// or an array of such.
+    /// This matters because we must follow the C ABI for these types.
+    /// Some C ABIs pass `repr(C)` ZSTs by pointer, but `repr(Rust)` ZSTs should always
+    /// be ignored.
+    pub repr_c: bool,
 
     /// The randomization seed based on this type's own repr and its fields.
     ///
@@ -2230,6 +2299,23 @@ impl<FieldIdx: Idx, VariantIdx: Idx> LayoutData<FieldIdx, VariantIdx> {
     pub fn is_uninhabited(&self) -> bool {
         self.uninhabited
     }
+
+    /// Returns `true` if the given variant is uninhabited.
+    pub fn is_variant_uninhabited(&self, variant: VariantIdx) -> bool {
+        match self.variants {
+            Variants::Empty => true,
+            Variants::Single { index } => variant != index || self.uninhabited,
+            Variants::Multiple { ref variants, .. } => {
+                variants.get(variant).map(|v| v.uninhabited).unwrap_or(true)
+            }
+        }
+    }
+
+    /// Returns `true` if this is a `repr(C)` type,
+    /// or an array of such, or a `repr(transparent)` wrapper around such
+    pub fn is_repr_c(&self) -> bool {
+        self.repr_c
+    }
 }
 
 impl<FieldIdx: Idx, VariantIdx: Idx> fmt::Debug for LayoutData<FieldIdx, VariantIdx>
@@ -2251,6 +2337,7 @@ where
             variants,
             max_repr_align,
             unadjusted_abi_align,
+            repr_c,
             randomization_seed,
         } = self;
         f.debug_struct("Layout")
@@ -2263,6 +2350,7 @@ where
             .field("variants", variants)
             .field("max_repr_align", max_repr_align)
             .field("unadjusted_abi_align", unadjusted_abi_align)
+            .field("repr_c", repr_c)
             .field("randomization_seed", randomization_seed)
             .finish()
     }
@@ -2291,9 +2379,12 @@ pub struct PointeeInfo {
     /// If `size` is not zero, then the pointer is either null or dereferenceable for this many bytes
     /// (independent of `safe`).
     ///
-    /// On a function argument, "dereferenceable" here means "dereferenceable for the entire duration
-    /// of this function call", i.e. it is UB for the memory that this pointer points to be freed
-    /// while this function is still running.
+    /// "Dereferenceable" means that it's sound to add a speculative (spurious) read of the pointer.
+    /// The backend is free to add such reads at will. (This is useful to hoist pointer reads out of
+    /// loops without proving that the loop executes at least once, for example.)
+    ///
+    /// This can be used in both argument and return position, in both cases it means
+    /// "dereferenceable right now" (function entry/return) (but could be freed any time later).
     pub size: Size,
     /// The pointer is guaranteed to be aligned this much (independent of `safe`).
     pub align: Align,
@@ -2322,7 +2413,7 @@ impl<FieldIdx: Idx, VariantIdx: Idx> LayoutData<FieldIdx, VariantIdx> {
     }
 
     /// Returns the elements count of a scalable vector.
-    pub fn scalable_vector_element_count(&self) -> Option<u64> {
+    pub fn scalable_vector_element_count(&self) -> Option<BackendLaneCount> {
         match self.backend_repr {
             BackendRepr::SimdScalableVector { count, .. } => Some(count),
             _ => None,
@@ -2365,8 +2456,8 @@ impl<FieldIdx: Idx, VariantIdx: Idx> LayoutData<FieldIdx, VariantIdx> {
     /// Checks if these two `Layout` are equal enough to be considered "the same for all function
     /// call ABIs". Note however that real ABIs depend on more details that are not reflected in the
     /// `Layout`; the `PassMode` need to be compared as well. Also note that we assume
-    /// aggregates are passed via `PassMode::Indirect` or `PassMode::Cast`; more strict
-    /// checks would otherwise be required.
+    /// aggregates are passed via `PassMode::Indirect`, `PassMode::IndirectUnsized` or
+    /// `PassMode::Cast`; more strict checks would otherwise be required.
     pub fn eq_abi(&self, other: &Self) -> bool {
         // The one thing that we are not capturing here is that for unsized types, the metadata must
         // also have the same ABI, and moreover that the same metadata leads to the same size. The
@@ -2399,12 +2490,22 @@ pub enum AbiFromStrErr {
     NoExplicitUnwind,
 }
 
-// NOTE: This struct is generic over the FieldIdx and VariantIdx for rust-analyzer usage.
+/// The layout information for a variant.
+///
+/// For items with multiple variants ([`Variants::Multiple`]), the layout information of each
+/// variant largely matches that of the overall item. So, instead of giving each one a new [`LayoutData`],
+/// we use this struct, which stores only the information that differs between the variants.
+///
+/// See <https://github.com/rust-lang/rust/issues/113988> for more context.
+// NOTE: This struct is generic over the FieldIdx for rust-analyzer usage.
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]
 #[cfg_attr(feature = "nightly", derive(StableHash))]
 pub struct VariantLayout<FieldIdx: Idx> {
+    // FIXME: ideally we'd remove these as variants should not have their own
+    // size or backend_repr.
     pub size: Size,
     pub backend_repr: BackendRepr,
+
     pub field_offsets: IndexVec<FieldIdx, Size>,
     fields_in_memory_order: IndexVec<u32, FieldIdx>,
     largest_niche: Option<Niche>,

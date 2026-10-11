@@ -118,6 +118,14 @@ impl<'b, 'a: 'b> FmtVisitor<'a> {
     fn visit_stmt(&mut self, stmt: &Stmt<'_>, include_empty_semi: bool) {
         debug!("visit_stmt: {}", self.psess.span_to_debug_info(stmt.span()));
 
+        // Preserve original source snippet if the statement isn't in the selected file lines.
+        if out_of_file_lines_range!(self, stmt.span()) {
+            let stmt_span = source!(self, stmt.span());
+            self.push_str(self.snippet(mk_sp(self.last_pos, stmt_span.hi())));
+            self.last_pos = stmt_span.hi();
+            return;
+        }
+
         if stmt.is_empty() {
             // If the statement is empty, just skip over it. Before that, make sure any comment
             // snippet preceding the semicolon is picked up.
@@ -269,7 +277,8 @@ impl<'b, 'a: 'b> FmtVisitor<'a> {
 
         let align_to_right = if unindent_comment && contains_comment(comment_snippet) {
             let first_lines = comment_snippet.splitn(2, '/').next().unwrap_or("");
-            last_line_width(first_lines) > last_line_width(comment_snippet)
+            last_line_width(first_lines, config.tab_spaces())
+                > last_line_width(comment_snippet, config.tab_spaces())
         } else {
             false
         };
@@ -322,7 +331,7 @@ impl<'b, 'a: 'b> FmtVisitor<'a> {
                     } else {
                         if comment_on_same_line {
                             // 1 = a space before `//`
-                            let offset_len = 1 + last_line_width(&self.buffer)
+                            let offset_len = 1 + last_line_width(&self.buffer, config.tab_spaces())
                                 .saturating_sub(self.block_indent.width());
                             match comment_shape
                                 .visual_indent(offset_len)
@@ -518,9 +527,7 @@ impl<'b, 'a: 'b> FmtVisitor<'a> {
                     self.visit_struct(&StructParts::from_item(item));
                 }
                 ast::ItemKind::Enum(ident, ref generics, ref def) => {
-                    self.format_missing_with_indent(source!(self, item.span).lo());
                     self.visit_enum(ident, &item.vis, def, generics, item.span);
-                    self.last_pos = source!(self, item.span).hi();
                 }
                 ast::ItemKind::Mod(safety, ident, ref mod_kind) => {
                     self.format_missing_with_indent(source!(self, item.span).lo());
@@ -623,6 +630,7 @@ impl<'b, 'a: 'b> FmtVisitor<'a> {
                     // For now, leave the contents of the Span unformatted.
                     self.push_rewrite(item.span, None)
                 }
+                ast::ItemKind::TestBinderConstraints(..) => self.push_rewrite(item.span, None),
             };
         }
         self.skip_context = skip_context_saved;
@@ -899,8 +907,12 @@ impl<'b, 'a: 'b> FmtVisitor<'a> {
             return false;
         }
 
-        let rewrite = attrs.rewrite(&self.get_context(), self.shape());
         let span = mk_sp(attrs[0].span.lo(), attrs[attrs.len() - 1].span.hi());
+        if out_of_file_lines_range!(self, span) {
+            return false;
+        }
+
+        let rewrite = attrs.rewrite(&self.get_context(), self.shape());
         self.push_rewrite(span, rewrite);
 
         false
@@ -1032,12 +1044,16 @@ impl<'b, 'a: 'b> FmtVisitor<'a> {
             .snippet_provider
             .opt_span_after(self.next_span(end_pos), "\n")
         {
+            let span = self.next_span(pos);
             if let Some(snippet) = self.opt_snippet(self.next_span(pos)) {
-                if snippet.trim().is_empty() {
-                    self.last_pos = pos;
-                } else {
+                if !snippet.trim().is_empty() {
                     return;
                 }
+
+                if out_of_file_lines_range!(self, span) {
+                    return;
+                }
+                self.last_pos = pos;
             }
         }
     }

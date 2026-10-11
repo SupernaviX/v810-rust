@@ -1,6 +1,8 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
+#[cfg(feature = "master")]
+use gccjit::Region;
 use gccjit::{Block, CType, Context, Function, FunctionType, LValue, Location, RValue, Type};
 use rustc_abi::{Align, HasDataLayout, PointeeInfo, Size, TargetDataLayout, VariantIdx};
 use rustc_codegen_ssa::base::wants_msvc_seh;
@@ -10,22 +12,28 @@ use rustc_data_structures::base_n::{ALPHANUMERIC_ONLY, ToBaseN};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_middle::mir::interpret::Allocation;
 use rustc_middle::mono::CodegenUnit;
-use rustc_middle::span_bug;
 use rustc_middle::ty::layout::{
     FnAbiError, FnAbiOf, FnAbiOfHelpers, FnAbiRequest, HasTyCtxt, HasTypingEnv, LayoutError,
-    LayoutOfHelpers,
+    LayoutOfHelpers, codegen_handle_fn_abi_err,
 };
 use rustc_middle::ty::{self, ExistentialTraitRef, Instance, Ty, TyCtxt};
 #[cfg(feature = "master")]
 use rustc_session::config::DebugInfo;
 use rustc_session::{PointerAuthSchema, Session};
-use rustc_span::{DUMMY_SP, Span, Symbol, respan};
+use rustc_span::{DUMMY_SP, Span, Symbol};
 use rustc_target::spec::{HasTargetSpec, HasX86AbiOpt, Target, TlsModel, X86Abi};
 
 #[cfg(feature = "master")]
 use crate::abi::conv_to_fn_attribute;
 use crate::callee::get_fn;
 use crate::common::SignType;
+use crate::type_::StructTypeKey;
+
+#[cfg(feature = "master")]
+pub struct PendingCleanup<'gcc> {
+    pub region: Region<'gcc>,
+    pub landing_pad: Block<'gcc>,
+}
 
 #[cfg_attr(not(feature = "master"), expect(dead_code))]
 pub struct CodegenCx<'gcc, 'tcx> {
@@ -73,6 +81,7 @@ pub struct CodegenCx<'gcc, 'tcx> {
 
     pub supports_128bit_integers: bool,
     pub supports_f16_type: bool,
+    pub supports_f16b_type: bool,
     pub supports_f32_type: bool,
     pub supports_f64_type: bool,
     pub supports_f128_type: bool,
@@ -85,7 +94,14 @@ pub struct CodegenCx<'gcc, 'tcx> {
     pub types: RefCell<FxHashMap<(Ty<'tcx>, Option<VariantIdx>), Type<'gcc>>>,
     pub tcx: TyCtxt<'tcx>,
 
-    pub struct_types: RefCell<FxHashMap<Vec<Type<'gcc>>, Type<'gcc>>>,
+    /// Cache of the anonymous struct types.
+    pub struct_types: RefCell<FxHashMap<StructTypeKey<'gcc>, Type<'gcc>>>,
+
+    /// Cache of the array types used for runs of constant bytes, keyed by element type and count.
+    ///
+    /// libgccjit mints a fresh type on every `new_array_type`, and struct types are keyed on their
+    /// field types, so without this two equal byte runs would yield two distinct anonymous structs.
+    pub byte_array_types: RefCell<FxHashMap<(Type<'gcc>, u64), Type<'gcc>>>,
 
     /// Cache instances of monomorphic and polymorphic items
     pub instances: RefCell<FxHashMap<Instance<'tcx>, LValue<'gcc>>>,
@@ -100,6 +116,9 @@ pub struct CodegenCx<'gcc, 'tcx> {
     // FIXME(antoyo): improve the SSA API to not require those.
     /// Mapping from function to indexes of on stack parameters.
     pub on_stack_function_params: RefCell<FxHashMap<Function<'gcc>, FxHashSet<usize>>>,
+
+    /// Local holding the return value of the defined functions returning it in memory.
+    pub functions_with_indirect_return: RefCell<FxHashMap<Function<'gcc>, LValue<'gcc>>>,
 
     /// Cache of emitted const globals (value -> global)
     pub const_globals: RefCell<FxHashMap<RValue<'gcc>, RValue<'gcc>>>,
@@ -117,14 +136,23 @@ pub struct CodegenCx<'gcc, 'tcx> {
     /// A counter that is used for generating local symbol names
     local_gen_sym_counter: Cell<usize>,
 
+    /// A counter that is used for generating global symbol names
+    global_gen_sym_counter: Cell<usize>,
+
     eh_personality: Cell<Option<Function<'gcc>>>,
     #[cfg(feature = "master")]
     pub rust_try_fn: Cell<Option<(Type<'gcc>, Function<'gcc>)>>,
 
     pub pointee_infos: RefCell<FxHashMap<(Ty<'tcx>, Size), Option<PointeeInfo>>>,
 
+    /// Blocks that are cleanup landing pads, so `invoke` can tell an unwind
+    /// edge into a cleanup from a catch/terminate.
     #[cfg(feature = "master")]
-    pub cleanup_blocks: RefCell<FxHashSet<Block<'gcc>>>,
+    pub landing_pads: RefCell<FxHashSet<Block<'gcc>>>,
+    /// Cleanup regions to be filled in once the function is fully codegened
+    /// (done in `populate_cleanup_regions`).
+    #[cfg(feature = "master")]
+    pub pending_cleanups: RefCell<Vec<PendingCleanup<'gcc>>>,
     /// The alignment of a u128/i128 type.
     // We cache this, since it is needed for alignment checks during loads.
     pub int128_align: Align,
@@ -138,6 +166,7 @@ impl<'gcc, 'tcx> CodegenCx<'gcc, 'tcx> {
         tcx: TyCtxt<'tcx>,
         supports_128bit_integers: bool,
         supports_f16_type: bool,
+        supports_f16b_type: bool,
         supports_f32_type: bool,
         supports_f64_type: bool,
         supports_f128_type: bool,
@@ -223,12 +252,7 @@ impl<'gcc, 'tcx> CodegenCx<'gcc, 'tcx> {
         let isize_type = usize_type;
         let bool_type = context.new_type::<bool>();
 
-        let mut functions = FxHashMap::default();
-        let builtins = ["abort"];
-
-        for builtin in builtins.iter() {
-            functions.insert(builtin.to_string(), context.get_builtin_function(builtin));
-        }
+        let functions = FxHashMap::default();
 
         let mut cx = Self {
             int128_align: tcx
@@ -274,6 +298,7 @@ impl<'gcc, 'tcx> CodegenCx<'gcc, 'tcx> {
 
             supports_128bit_integers,
             supports_f16_type,
+            supports_f16b_type,
             supports_f32_type,
             supports_f64_type,
             supports_f128_type,
@@ -286,6 +311,7 @@ impl<'gcc, 'tcx> CodegenCx<'gcc, 'tcx> {
             function_instances: Default::default(),
             intrinsic_instances: Default::default(),
             on_stack_function_params: Default::default(),
+            functions_with_indirect_return: Default::default(),
             vtables: Default::default(),
             const_globals: Default::default(),
             global_lvalues: Default::default(),
@@ -295,17 +321,49 @@ impl<'gcc, 'tcx> CodegenCx<'gcc, 'tcx> {
             types: Default::default(),
             tcx,
             struct_types: Default::default(),
+            byte_array_types: Default::default(),
             local_gen_sym_counter: Cell::new(0),
+            global_gen_sym_counter: Cell::new(0),
             eh_personality: Cell::new(None),
             #[cfg(feature = "master")]
             rust_try_fn: Cell::new(None),
             pointee_infos: Default::default(),
             #[cfg(feature = "master")]
-            cleanup_blocks: Default::default(),
+            landing_pads: Default::default(),
+            #[cfg(feature = "master")]
+            pending_cleanups: Default::default(),
         };
         // FIXME(antoyo): instead of doing this, add SsizeT to libgccjit.
         cx.isize_type = usize_type.to_signed(&cx);
         cx
+    }
+
+    /// Fill in the member blocks of every pending cleanup region.
+    ///
+    /// Clone all blocks reachable from a cleanup block into the cleanup region.
+    #[cfg(feature = "master")]
+    pub fn populate_cleanup_regions(&self) {
+        let pending = std::mem::take(&mut *self.pending_cleanups.borrow_mut());
+
+        for cleanup in pending {
+            // The landing pad is the region's entry, so it must come first.
+            let mut blocks = vec![];
+            let mut visited = FxHashSet::default();
+            let mut stack = vec![cleanup.landing_pad];
+            while let Some(block) = stack.pop() {
+                if !visited.insert(block) {
+                    continue;
+                }
+                blocks.push(block);
+                stack.extend(block.get_successors());
+            }
+
+            for clone in gccjit::clone_blocks(&blocks) {
+                cleanup.region.add_block(clone);
+            }
+        }
+
+        self.landing_pads.borrow_mut().clear();
     }
 
     pub fn rvalue_as_function(&self, value: RValue<'gcc>) -> Function<'gcc> {
@@ -447,7 +505,7 @@ impl<'gcc, 'tcx> MiscCodegenMethods<'tcx> for CodegenCx<'gcc, 'tcx> {
         }
         let tcx = self.tcx;
         let func = match tcx.lang_items().eh_personality() {
-            Some(def_id) if !wants_msvc_seh(self.sess()) => {
+            Some(def_id) if !wants_msvc_seh(&self.sess().target) => {
                 let instance = ty::Instance::expect_resolve(
                     tcx,
                     self.typing_env(),
@@ -462,7 +520,7 @@ impl<'gcc, 'tcx> MiscCodegenMethods<'tcx> for CodegenCx<'gcc, 'tcx> {
                 self.declare_fn(symbol_name, fn_abi)
             }
             _ => {
-                let name = if wants_msvc_seh(self.sess()) {
+                let name = if wants_msvc_seh(&self.sess().target) {
                     "__CxxFrameHandler3"
                 } else {
                     "rust_eh_personality"
@@ -491,7 +549,9 @@ impl<'gcc, 'tcx> MiscCodegenMethods<'tcx> for CodegenCx<'gcc, 'tcx> {
         let entry_name = self.sess().target.entry_name.as_ref();
         if !self.functions.borrow().contains_key(entry_name) {
             let conv = cfg_select! {
-                feature = "master" => conv_to_fn_attribute(self.sess(), self.sess().target.entry_abi),
+                feature = "master" => {
+                    conv_to_fn_attribute(self.sess(), self.sess().target.entry_abi)
+                }
                 _ => None,
             };
             Some(self.declare_entry_fn(entry_name, fn_type, conv))
@@ -556,23 +616,7 @@ impl<'gcc, 'tcx> FnAbiOfHelpers<'tcx> for CodegenCx<'gcc, 'tcx> {
         span: Span,
         fn_abi_request: FnAbiRequest<'tcx>,
     ) -> ! {
-        if let FnAbiError::Layout(LayoutError::SizeOverflow(_) | LayoutError::InvalidSimd { .. }) =
-            err
-        {
-            self.tcx.dcx().emit_fatal(respan(span, err))
-        } else {
-            match fn_abi_request {
-                FnAbiRequest::OfFnPtr { sig, extra_args } => {
-                    span_bug!(span, "`fn_abi_of_fn_ptr({sig}, {extra_args:?})` failed: {err:?}");
-                }
-                FnAbiRequest::OfInstance { instance, extra_args } => {
-                    span_bug!(
-                        span,
-                        "`fn_abi_of_instance({instance}, {extra_args:?})` failed: {err:?}"
-                    );
-                }
-            }
-        }
+        codegen_handle_fn_abi_err(self.tcx, err, span, fn_abi_request).raise_fatal()
     }
 }
 
@@ -590,6 +634,24 @@ impl<'b, 'tcx> CodegenCx<'b, 'tcx> {
         self.local_gen_sym_counter.set(idx + 1);
         // Include a '.' character, so there can be no accidental conflicts with
         // user defined names
+        let mut name = String::with_capacity(prefix.len() + 6);
+        name.push_str(prefix);
+        name.push('.');
+        // Offset the index by the base so that always at least two characters
+        // are generated. This avoids cases where the suffix is interpreted as
+        // size by the assembler (for m68k: .b, .w, .l).
+        name.push_str(&(idx as u64 + ALPHANUMERIC_ONLY as u64).to_base(ALPHANUMERIC_ONLY));
+        name
+    }
+
+    /// Generates a new global symbol name with the given prefix. This symbol name must
+    /// only be used for definitions with `internal` or `private` linkage.
+    pub fn generate_global_symbol_name(&self) -> String {
+        let idx = self.global_gen_sym_counter.get();
+        self.global_gen_sym_counter.set(idx + 1);
+
+        let sym = self.codegen_unit.symbol_name();
+        let prefix = sym.as_str();
         let mut name = String::with_capacity(prefix.len() + 6);
         name.push_str(prefix);
         name.push('.');

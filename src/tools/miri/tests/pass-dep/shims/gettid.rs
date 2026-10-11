@@ -1,26 +1,18 @@
 //! Test for `gettid` and similar functions for retrieving an OS thread ID.
-//@ revisions: with_isolation without_isolation
-//@ [without_isolation] compile-flags: -Zmiri-disable-isolation
+//@revisions: with_isolation without_isolation
+//@[without_isolation] compile-flags: -Zmiri-disable-isolation
+//@run-native
 
 #![feature(linkage)]
+#![allow(unused_features)] // only used on some targets
 
 fn gettid() -> u64 {
     cfg_select! {
-        any(target_os = "android", target_os = "linux") => {
-            gettid_linux_like()
-        }
-        any(target_os = "nto", target_os = "qnx") => {
-            unsafe { libc::gettid() as u64 }
-        }
-        target_os = "openbsd" => {
-            unsafe { libc::getthrid() as u64 }
-        }
-        target_os = "freebsd" => {
-            unsafe { libc::pthread_getthreadid_np() as u64 }
-        }
-        target_os = "netbsd" => {
-            unsafe { libc::_lwp_self() as u64 }
-        }
+        any(target_os = "android", target_os = "linux") => gettid_linux_like(),
+        any(target_os = "nto", target_os = "qnx") => unsafe { libc::gettid() as u64 },
+        target_os = "openbsd" => unsafe { libc::getthrid() as u64 },
+        target_os = "freebsd" => unsafe { libc::pthread_getthreadid_np() as u64 },
+        target_os = "netbsd" => unsafe { libc::_lwp_self() as u64 },
         any(target_os = "solaris", target_os = "illumos") => {
             // On Solaris and Illumos, the `pthread_t` is the OS TID.
             unsafe { libc::pthread_self() as u64 }
@@ -107,6 +99,8 @@ mod queried {
             // Apple also has two documented return values for invalid threads and null pointers
             let res = libc::pthread_threadid_np(libc::pthread_t::MAX, &mut 0);
             assert_eq!(res, libc::ESRCH, "expected ESRCH for invalid TID");
+            let res = libc::pthread_threadid_np(0xdeadbeef, &mut 0);
+            assert_eq!(res, libc::ESRCH, "expected ESRCH for invalid TID");
             let res = libc::pthread_threadid_np(0, ptr::null_mut());
             assert_eq!(res, libc::EINVAL, "invalid EINVAL for a null pointer");
         }
@@ -169,10 +163,10 @@ fn main() {
         assert_ne!(gettid(), tid);
     });
 
-    // Test that in isolation mode a deterministic value will be returned.
+    // Test that in Miri's isolation mode a deterministic value will be returned.
     // The value is not important, we only care that whatever the value is,
     // won't change from execution to execution.
-    if cfg!(with_isolation) {
+    if cfg!(miri) && cfg!(with_isolation) {
         if cfg!(any(
             target_os = "linux",
             target_os = "android",

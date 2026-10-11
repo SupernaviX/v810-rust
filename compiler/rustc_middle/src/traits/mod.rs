@@ -13,7 +13,7 @@ use std::borrow::Cow;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use rustc_errors::{Applicability, Diag, EmissionGuarantee, ErrorGuaranteed};
+use rustc_errors::{Applicability, Diag, ErrorGuaranteed};
 use rustc_hir as hir;
 use rustc_hir::HirId;
 use rustc_hir::def_id::DefId;
@@ -21,7 +21,7 @@ use rustc_macros::{
     Decodable, Encodable, StableHash, TyDecodable, TyEncodable, TypeFoldable, TypeVisitable,
 };
 use rustc_span::def_id::{CRATE_DEF_ID, LocalDefId};
-use rustc_span::{DUMMY_SP, Span, Symbol};
+use rustc_span::{DUMMY_SP, OrdSpan, Span, Symbol, sym};
 use smallvec::{SmallVec, smallvec};
 use thin_vec::ThinVec;
 
@@ -105,7 +105,7 @@ impl<'tcx> ObligationCause<'tcx> {
 
     pub fn derived_cause(
         mut self,
-        parent_trait_pred: ty::PolyTraitPredicate<'tcx>,
+        parent_trait_pred: ty::PolyTraitClause<'tcx>,
         variant: impl FnOnce(DerivedCause<'tcx>) -> ObligationCauseCode<'tcx>,
     ) -> ObligationCause<'tcx> {
         /*!
@@ -127,18 +127,18 @@ impl<'tcx> ObligationCause<'tcx> {
 
     pub fn derived_host_cause(
         mut self,
-        parent_host_pred: ty::Binder<'tcx, ty::HostEffectPredicate<'tcx>>,
+        parent_host_clause: ty::Binder<'tcx, ty::HostEffectClause<'tcx>>,
         variant: impl FnOnce(DerivedHostCause<'tcx>) -> ObligationCauseCode<'tcx>,
     ) -> ObligationCause<'tcx> {
-        self.code = variant(DerivedHostCause { parent_host_pred, parent_code: self.code }).into();
+        self.code = variant(DerivedHostCause { parent_host_clause, parent_code: self.code }).into();
         self
     }
 
     pub fn to_constraint_category(&self) -> ConstraintCategory<'tcx> {
         match self.code() {
             ObligationCauseCode::MatchImpl(cause, _) => cause.to_constraint_category(),
-            ObligationCauseCode::AscribeUserTypeProvePredicate(predicate_span) => {
-                ConstraintCategory::Predicate(*predicate_span)
+            ObligationCauseCode::AscribeUserTypeProvePredicate(predicate_span, def_id) => {
+                ConstraintCategory::Predicate(*predicate_span, *def_id)
             }
             _ => ConstraintCategory::BoringNoLocation,
         }
@@ -204,12 +204,12 @@ pub enum ObligationCauseCode<'tcx> {
 
     /// Like `WhereClause`, but also identifies the expression
     /// which requires the `where` clause to be proven, and also
-    /// identifies the index of the predicate in the `predicates_of`
+    /// identifies the index of the clause in the `clauses_of`
     /// list of the item.
     WhereClauseInExpr(DefId, Span, HirId, usize),
 
     /// Like `WhereClauseinExpr`, but indexes into the `const_conditions`
-    /// rather than the `predicates_of`.
+    /// rather than the `clauses_of`.
     HostEffectInExpr(DefId, Span, HirId, usize),
 
     /// A type like `&'a T` is WF only if `T: 'a`.
@@ -238,7 +238,7 @@ pub enum ObligationCauseCode<'tcx> {
     /// Return type must be `Sized`.
     SizedReturnType,
     /// Return type of a call expression must be `Sized`.
-    SizedCallReturnType,
+    SizedCallReturnType(HirId),
     /// Yield type must be `Sized`.
     SizedYieldType,
     /// Inline asm operand type must be `Sized`.
@@ -374,7 +374,7 @@ pub enum ObligationCauseCode<'tcx> {
 
     AwaitableExpr(HirId),
 
-    ForLoopIterator,
+    ForLoopIterator(HirId),
 
     QuestionMark,
 
@@ -384,7 +384,7 @@ pub enum ObligationCauseCode<'tcx> {
     /// This is purely for diagnostic purposes - it is always
     /// correct to use `Misc` instead, or to specify
     /// `WellFormed(None)`.
-    WellFormed(Option<WellFormedLoc>),
+    WellFormed(WellFormedLoc),
 
     /// From `match_impl`. The cause for us having to match an impl, and the DefId we are matching
     /// against.
@@ -402,7 +402,7 @@ pub enum ObligationCauseCode<'tcx> {
         output_ty: Option<Ty<'tcx>>,
     },
 
-    AscribeUserTypeProvePredicate(Span),
+    AscribeUserTypeProvePredicate(Span, DefId),
 
     RustCall,
 
@@ -461,6 +461,8 @@ pub enum WellFormedLoc {
         /// being the last 'parameter'
         param_idx: usize,
     },
+    HirId(HirId),
+    None,
 }
 
 impl<'tcx> ObligationCauseCode<'tcx> {
@@ -491,7 +493,7 @@ impl<'tcx> ObligationCauseCode<'tcx> {
 
     /// Returns the base obligation and the base trait predicate, if any, ignoring
     /// derived obligations.
-    pub fn peel_derives_with_predicate(&self) -> (&Self, Option<ty::PolyTraitPredicate<'tcx>>) {
+    pub fn peel_derives_with_predicate(&self) -> (&Self, Option<ty::PolyTraitClause<'tcx>>) {
         let mut base_cause = self;
         let mut base_trait_pred = None;
         while let Some((parent_code, parent_pred)) = base_cause.parent_with_predicate() {
@@ -504,7 +506,7 @@ impl<'tcx> ObligationCauseCode<'tcx> {
         (base_cause, base_trait_pred)
     }
 
-    pub fn parent_with_predicate(&self) -> Option<(&Self, Option<ty::PolyTraitPredicate<'tcx>>)> {
+    pub fn parent_with_predicate(&self) -> Option<(&Self, Option<ty::PolyTraitClause<'tcx>>)> {
         match self {
             ObligationCauseCode::FunctionArg { parent_code, .. } => Some((parent_code, None)),
             ObligationCauseCode::BuiltinDerived(derived)
@@ -577,7 +579,7 @@ pub struct DerivedCause<'tcx> {
     /// current obligation. Note that only trait obligations lead to
     /// derived obligations, so we just store the trait predicate here
     /// directly.
-    pub parent_trait_pred: ty::PolyTraitPredicate<'tcx>,
+    pub parent_trait_pred: ty::PolyTraitClause<'tcx>,
 
     /// The parent trait had this cause.
     pub parent_code: ObligationCauseCodeHandle<'tcx>,
@@ -592,19 +594,19 @@ pub struct ImplDerivedCause<'tcx> {
     /// impl, then this will be the `DefId` of that trait alias. Care should therefore be taken to
     /// handle that exceptional case where appropriate.
     pub impl_or_alias_def_id: DefId,
-    /// The index of the derived predicate in the parent impl's predicates.
-    pub impl_def_predicate_index: Option<usize>,
+    /// The index of the derived clause in the parent impl's clauses.
+    pub impl_def_clause_index: Option<usize>,
     pub span: Span,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, StableHash, TyEncodable, TyDecodable)]
 #[derive(TypeVisitable, TypeFoldable)]
 pub struct DerivedHostCause<'tcx> {
-    /// The trait predicate of the parent obligation that led to the
+    /// The trait clause of the parent obligation that led to the
     /// current obligation. Note that only trait obligations lead to
-    /// derived obligations, so we just store the trait predicate here
+    /// derived obligations, so we just store the trait clause here
     /// directly.
-    pub parent_host_pred: ty::Binder<'tcx, ty::HostEffectPredicate<'tcx>>,
+    pub parent_host_clause: ty::Binder<'tcx, ty::HostEffectClause<'tcx>>,
 
     /// The parent trait had this cause.
     pub parent_code: ObligationCauseCodeHandle<'tcx>,
@@ -837,12 +839,12 @@ impl DynCompatibilityViolation {
             Self::AssocConst(name, AssocConstViolation::FeatureNotEnabled, _) => {
                 format!("it contains associated const `{name}`").into()
             }
+            Self::AssocConst(name, AssocConstViolation::NonType, _) => format!(
+                "it contains associated const `{name}` that's not defined as `#[rustc_always_gca]`"
+            )
+            .into(),
             Self::AssocConst(name, AssocConstViolation::Generic, _) => {
                 format!("it contains generic associated const `{name}`").into()
-            }
-            Self::AssocConst(name, AssocConstViolation::NonType, _) => {
-                format!("it contains associated const `{name}` that's not defined as `type const`")
-                    .into()
             }
             Self::AssocConst(name, AssocConstViolation::TypeReferencesSelf, _) => format!(
                 "it contains associated const `{name}` whose type references the `Self` type"
@@ -863,15 +865,15 @@ impl DynCompatibilityViolation {
             | Self::SupertraitConst(_) => DynCompatibilityViolationSolution::None,
             Self::Method(
                 name,
-                MethodViolation::StaticMethod(Some((add_self_sugg, make_sized_sugg))),
+                MethodViolation::StaticMethod(Some(((add_s, add_sp), (make_s, make_sp)))),
                 _,
             ) => DynCompatibilityViolationSolution::AddSelfOrMakeSized {
                 name: *name,
-                add_self_sugg: add_self_sugg.clone(),
-                make_sized_sugg: make_sized_sugg.clone(),
+                add_self_sugg: (add_s.clone(), OrdSpan(*add_sp)),
+                make_sized_sugg: (make_s.clone(), OrdSpan(*make_sp)),
             },
-            Self::Method(name, MethodViolation::UndispatchableReceiver(Some(span)), _) => {
-                DynCompatibilityViolationSolution::ChangeToRefSelf(*name, *span)
+            Self::Method(name, MethodViolation::UndispatchableReceiver(Some((span, lt))), _) => {
+                DynCompatibilityViolationSolution::ChangeToRefSelf(*name, OrdSpan(*span), *lt)
             }
             Self::Method(name, ..) | Self::AssocConst(name, ..) | Self::GenericAssocTy(name, _) => {
                 DynCompatibilityViolationSolution::MoveToAnotherTrait(*name)
@@ -901,20 +903,20 @@ impl DynCompatibilityViolation {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DynCompatibilityViolationSolution {
     None,
     AddSelfOrMakeSized {
         name: Symbol,
-        add_self_sugg: (String, Span),
-        make_sized_sugg: (String, Span),
+        add_self_sugg: (String, OrdSpan),
+        make_sized_sugg: (String, OrdSpan),
     },
-    ChangeToRefSelf(Symbol, Span),
+    ChangeToRefSelf(Symbol, OrdSpan, Symbol),
     MoveToAnotherTrait(Symbol),
 }
 
 impl DynCompatibilityViolationSolution {
-    pub fn add_to<G: EmissionGuarantee>(self, err: &mut Diag<'_, G>) {
+    pub fn add_to(self, err: &mut Diag<'_>) {
         match self {
             DynCompatibilityViolationSolution::None => {}
             DynCompatibilityViolationSolution::AddSelfOrMakeSized {
@@ -922,29 +924,30 @@ impl DynCompatibilityViolationSolution {
                 add_self_sugg,
                 make_sized_sugg,
             } => {
-                err.span_suggestion(
-                    add_self_sugg.1,
+                err.span_suggestion_verbose(
+                    add_self_sugg.1.0,
                     format!(
-                        "consider turning `{name}` into a method by giving it a `&self` argument"
+                        "consider turning `{name}` into a method by giving it a `&self` argument, \
+                         so that it is accessible through the trait object's vtable",
                     ),
                     add_self_sugg.0,
                     Applicability::MaybeIncorrect,
                 );
-                err.span_suggestion(
-                    make_sized_sugg.1,
+                err.span_suggestion_verbose(
+                    make_sized_sugg.1.0,
                     format!(
-                        "alternatively, consider constraining `{name}` so it does not apply to \
-                             trait objects"
+                        "alternatively, consider constraining `{name}` so it is explicitly marked \
+                         as not applying to trait objects",
                     ),
                     make_sized_sugg.0,
                     Applicability::MaybeIncorrect,
                 );
             }
-            DynCompatibilityViolationSolution::ChangeToRefSelf(name, span) => {
-                err.span_suggestion(
-                    span,
+            DynCompatibilityViolationSolution::ChangeToRefSelf(name, span, lt) => {
+                err.span_suggestion_verbose(
+                    span.0,
                     format!("consider changing method `{name}`'s `self` parameter to be `&self`"),
-                    "&Self",
+                    format!("&{lt}{}self", if lt != sym::empty { " " } else { "" }),
                     Applicability::MachineApplicable,
                 );
             }
@@ -982,21 +985,24 @@ pub enum MethodViolation {
     /// e.g., `fn (mut ap: ...)`
     CVariadic,
 
-    /// the method's receiver (`self` argument) can't be dispatched on
-    UndispatchableReceiver(Option<Span>),
+    /// The method's receiver (`self` argument) can't be dispatched on
+    ///
+    /// The `Span` points at the receiver. The `Symbol` is the lifetime's name `'a` when we have
+    /// Arbitrary Self Types like `self: &'a ()`.
+    UndispatchableReceiver(Option<(Span, Symbol)>),
 }
 
 /// Reasons an associated const might not be dyn compatible.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, StableHash)]
 pub enum AssocConstViolation {
-    /// Unstable feature `min_generic_const_args` wasn't enabled.
+    /// Unstable feature `gca_min_const_items` wasn't enabled.
     FeatureNotEnabled,
+
+    /// Not defined as a type-level associated const.
+    NonType,
 
     /// Has own generic parameters (GAC).
     Generic,
-
-    /// Isn't defined as `type const`.
-    NonType,
 
     /// Its type mentions the `Self` type parameter.
     TypeReferencesSelf,

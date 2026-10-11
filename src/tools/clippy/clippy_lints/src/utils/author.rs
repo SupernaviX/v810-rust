@@ -1,6 +1,6 @@
 use clippy_utils::res::MaybeQPath;
 use clippy_utils::{get_builtin_attr, higher, sym};
-use itertools::Itertools;
+use itertools::Itertools as _;
 use rustc_ast::LitIntType;
 use rustc_ast::ast::{LitFloatType, LitKind};
 use rustc_data_structures::fx::FxHashMap;
@@ -9,9 +9,8 @@ use rustc_hir::{
     self as hir, BindingMode, Body, CaptureBy, Closure, ClosureKind, ConstArg, ConstArgKind, CoroutineKind, ExprKind,
     FnRetTy, HirId, Lit, PatExprKind, PatKind, QPath, StmtKind, StructTailExpr,
 };
-use rustc_lint::{LateContext, LateLintPass};
+use rustc_lint::{LateContext, LateLintPass, declare_lint_pass};
 use rustc_middle::ty::{FloatTy, IntTy, TypeckResults, UintTy};
-use rustc_session::declare_lint_pass;
 use rustc_span::symbol::{Ident, Symbol};
 use std::cell::Cell;
 use std::fmt::{Display, Formatter};
@@ -141,7 +140,7 @@ fn check_item(cx: &LateContext<'_>, hir_id: HirId) {
             cx,
             hir_id,
             |v| {
-                v.expr(&v.bind("expr", body.value));
+                v.expr(&v.bind("expr", &body.value));
             },
             Some(body),
         );
@@ -728,7 +727,7 @@ impl<'a, 'tcx> PrintVisitor<'a, 'tcx> {
     }
 
     fn body(&self, body_id: &Binding<hir::BodyId>) {
-        let expr = self.cx.tcx.hir_body(body_id.value).value;
+        let expr = &self.cx.tcx.hir_body(body_id.value).value;
         bind!(self, expr);
         chain!(self, "{expr} = &cx.tcx.hir_body({body_id}).value");
         self.expr(expr);
@@ -804,11 +803,6 @@ impl<'a, 'tcx> PrintVisitor<'a, 'tcx> {
                 bind!(self, fields);
                 kind!("Tuple({fields}, {skip_pos:?})");
                 self.slice(fields, |field| self.pat(field));
-            },
-            PatKind::Box(pat) => {
-                bind!(self, pat);
-                kind!("Box({pat})");
-                self.pat(pat);
             },
             PatKind::Deref(pat) => {
                 bind!(self, pat);

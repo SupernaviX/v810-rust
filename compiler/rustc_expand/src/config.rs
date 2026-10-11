@@ -2,14 +2,14 @@
 
 use std::iter;
 
+use rustc_ast::attr::data_structures::CfgEntry;
 use rustc_ast::token::{Delimiter, Token, TokenKind};
 use rustc_ast::tokenstream::{
     AttrTokenStream, AttrTokenTree, LazyAttrTokenStream, Spacing, TokenTree, WithTokens,
 };
-use rustc_ast::{
-    self as ast, AttrStyle, Attribute, HasAttrs, HasTokens, MetaItem, MetaItemInner, NodeId,
-    SyntheticAttr,
-};
+use rustc_ast::{self as ast, AttrStyle, Attribute, HasAttrs, HasTokens, NodeId, SyntheticAttr};
+use rustc_attr_ir::target::Target;
+use rustc_attr_ir::{self as attrs, AttributeKind};
 use rustc_attr_parsing::parser::AllowExprMetavar;
 use rustc_attr_parsing::{
     self as attr, AttributeParser, AttributeSafety, CFG_TEMPLATE, EvalConfigResult, ShouldEmit,
@@ -21,10 +21,7 @@ use rustc_feature::{
     ACCEPTED_LANG_FEATURES, EnabledLangFeature, EnabledLibFeature, Features, REMOVED_LANG_FEATURES,
     UNSTABLE_LANG_FEATURES,
 };
-use rustc_hir::attrs::AttributeKind;
-use rustc_hir::{
-    Target, {self as hir},
-};
+use rustc_lint_defs::builtin::UNUSED_ATTRIBUTES;
 use rustc_parse::parser::Recovery;
 use rustc_session::Session;
 use rustc_session::diagnostics::feature_err;
@@ -33,7 +30,7 @@ use tracing::instrument;
 
 use crate::diagnostics::{
     CrateNameInCfgAttr, CrateTypeInCfgAttr, FeatureNotAllowed, FeatureRemoved,
-    FeatureRemovedReason, InvalidCfg, RemoveExprNotSupported,
+    FeatureRemovedReason, RemoveExprNotSupported,
 };
 
 /// A folder that strips out items that do not belong in the current configuration.
@@ -50,8 +47,8 @@ pub struct StripUnconfigured<'a> {
 pub fn features(sess: &Session, krate_attrs: &[Attribute], crate_name: Symbol) -> Features {
     let mut features = Features::default();
 
-    if let Some(hir::Attribute::Parsed(AttributeKind::Feature(feature_idents, _))) =
-        AttributeParser::parse_limited(sess, krate_attrs, &[sym::feature])
+    if let Some(attrs::Attribute::Parsed(AttributeKind::Feature(feature_idents, _))) =
+        AttributeParser::parse_limited_sym(sess, krate_attrs, &[sym::feature])
     {
         for feature_ident in feature_idents {
             // If the enabled feature has been removed, issue an error.
@@ -248,30 +245,37 @@ impl<'a> StripUnconfigured<'a> {
     /// is in the original source file. Gives a compiler error if the syntax of
     /// the attribute is incorrect.
     pub(crate) fn expand_cfg_attr(&self, cfg_attr: &Attribute, recursive: bool) -> Vec<Attribute> {
-        // A synthetic trace attribute left in AST in place of the original `cfg_attr` attribute.
-        // It can later be used by lints or other diagnostics.
-        let trace_attr = cfg_attr.clone().convert_normal_to_synthetic(SyntheticAttr::CfgAttrTrace);
-
         let Some((cfg_predicate, expanded_attrs)) = rustc_attr_parsing::parse_cfg_attr(
             cfg_attr,
             self.sess,
             self.features,
             self.lint_node_id,
         ) else {
+            let trace_attr = cfg_attr.clone().convert_normal_to_synthetic(
+                SyntheticAttr::CfgAttrTrace(CfgEntry::Bool(true, cfg_attr.span)),
+            );
             return vec![trace_attr];
         };
 
         // Lint on zero attributes in source.
         if expanded_attrs.is_empty() {
             self.sess.psess.buffer_lint(
-                rustc_lint_defs::builtin::UNUSED_ATTRIBUTES,
+                UNUSED_ATTRIBUTES,
                 cfg_attr.span,
                 ast::CRATE_NODE_ID,
                 crate::diagnostics::CfgAttrNoAttributes,
             );
         }
 
-        if !attr::eval_config_entry(self.sess, &cfg_predicate).as_bool() {
+        let cfg_eval = attr::eval_config_entry(self.sess, &cfg_predicate).as_bool();
+
+        // A synthetic trace attribute left in AST in place of the original `cfg_attr` attribute.
+        // It can later be used by lints or other diagnostics.
+        let trace_attr = cfg_attr
+            .clone()
+            .convert_normal_to_synthetic(SyntheticAttr::CfgAttrTrace(cfg_predicate));
+
+        if !cfg_eval {
             return vec![trace_attr];
         }
 
@@ -337,6 +341,7 @@ impl<'a> StripUnconfigured<'a> {
                 .to_attr_token_stream(),
         ));
 
+        let attr_item_path_span = attr_item.node.path.span;
         let attr_tokens = Some(LazyAttrTokenStream::new_direct(AttrTokenStream::new(trees)));
         let attr = ast::attr::mk_attr_from_item(
             &self.sess.psess.attr_id_generator,
@@ -346,10 +351,10 @@ impl<'a> StripUnconfigured<'a> {
             attr_item_span,
         );
         if attr.has_name(sym::crate_type) {
-            self.sess.dcx().emit_err(CrateTypeInCfgAttr { span: attr.span });
+            self.sess.dcx().emit_err(CrateTypeInCfgAttr { span: attr_item_path_span });
         }
         if attr.has_name(sym::crate_name) {
-            self.sess.dcx().emit_err(CrateNameInCfgAttr { span: attr.span });
+            self.sess.dcx().emit_err(CrateNameInCfgAttr { span: attr_item_path_span });
         }
         attr
     }
@@ -432,32 +437,6 @@ impl<'a> StripUnconfigured<'a> {
 
         self.process_cfg_attrs(expr);
         self.try_configure_tokens(&mut *expr);
-    }
-}
-
-/// FIXME: Still used by Rustdoc, should be removed after
-pub fn parse_cfg_old<'a>(meta_item: &'a MetaItem, sess: &Session) -> Option<&'a MetaItemInner> {
-    let span = meta_item.span;
-    match meta_item.meta_item_list() {
-        None => {
-            sess.dcx().emit_err(InvalidCfg::NotFollowedByParens { span });
-            None
-        }
-        Some([]) => {
-            sess.dcx().emit_err(InvalidCfg::NoPredicate { span });
-            None
-        }
-        Some([_, .., l]) => {
-            sess.dcx().emit_err(InvalidCfg::MultiplePredicates { span: l.span() });
-            None
-        }
-        Some([single]) => match single.meta_item_or_bool() {
-            Some(meta_item) => Some(meta_item),
-            None => {
-                sess.dcx().emit_err(InvalidCfg::PredicateLiteral { span: single.span() });
-                None
-            }
-        },
     }
 }
 

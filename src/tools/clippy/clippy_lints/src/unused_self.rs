@@ -3,8 +3,7 @@ use clippy_utils::diagnostics::span_lint_and_help;
 use clippy_utils::usage::is_todo_unimplemented_stub;
 use clippy_utils::visitors::is_local_used;
 use rustc_hir::{Impl, ImplItem, ImplItemKind, ItemKind};
-use rustc_lint::{LateContext, LateLintPass};
-use rustc_session::impl_lint_pass;
+use rustc_lint::{LateContext, LateLintPass, impl_lint_pass};
 
 declare_clippy_lint! {
     /// ### What it does
@@ -65,7 +64,7 @@ impl<'tcx> LateLintPass<'tcx> for UnusedSelf {
             && let body = cx.tcx.hir_body(*body_id)
             && let [self_param, ..] = body.params
             && !is_local_used(cx, body, self_param.pat.hir_id)
-            && !is_todo_unimplemented_stub(cx, body.value)
+            && !is_todo_unimplemented_stub(cx, &body.value)
         {
             span_lint_and_help(
                 cx,

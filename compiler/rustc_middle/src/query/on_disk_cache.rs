@@ -1,4 +1,6 @@
+use std::cell::RefCell;
 use std::collections::hash_map::Entry;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::{fmt, mem};
 
@@ -19,14 +21,15 @@ use rustc_span::hygiene::{
 };
 use rustc_span::{
     BlobDecoder, BytePos, ByteSymbol, CachingSourceMapView, ExpnData, ExpnHash, RelativeBytePos,
-    SourceFile, Span, SpanDecoder, SpanEncoder, Spanned, StableSourceFileId, Symbol,
+    SourceFile, Span, SpanDecoder, SpanEncoder, Spanned, StableSourceFileId, Symbol, bug,
 };
 
 use crate::dep_graph::{DepNodeIndex, QuerySideEffect, SerializedDepNodeIndex};
+use crate::ich::SourceSpanCache;
 use crate::mir::interpret::{AllocDecodingSession, AllocDecodingState};
 use crate::mir::{self, interpret};
 use crate::mono::MonoItem;
-use crate::ty::codec::{RefDecodable, TyDecoder, TyEncoder};
+use crate::ty::codec::{RefDecodable, TyDecoder, TyEncoder, forward_all_decoder_methods_to};
 use crate::ty::{self, Ty, TyCtxt};
 
 const TAG_FILE_FOOTER: u128 = 0xC0FFEE_C0FFEE_C0FFEE_C0FFEE_C0FFEE;
@@ -114,11 +117,11 @@ struct Footer {
 struct SourceFileIndex(u32);
 
 #[derive(Copy, Clone, Debug, Hash, Eq, PartialEq, Encodable, Decodable)]
-pub struct AbsoluteBytePos(u64);
+struct AbsoluteBytePos(u64);
 
 impl AbsoluteBytePos {
     #[inline]
-    pub fn new(pos: usize) -> AbsoluteBytePos {
+    fn new(pos: usize) -> AbsoluteBytePos {
         AbsoluteBytePos(pos.try_into().expect("Incremental cache file size overflowed u64."))
     }
 
@@ -223,8 +226,6 @@ impl OnDiskCache {
                 (file_to_file_index, file_index_to_stable_id)
             };
 
-            let hygiene_encode_context = HygieneEncodeContext::default();
-
             let mut encoder = CacheEncoder {
                 tcx,
                 encoder,
@@ -233,8 +234,9 @@ impl OnDiskCache {
                 interpret_allocs: Default::default(),
                 caching_source_map_view: CachingSourceMapView::new(tcx.sess.source_map()),
                 file_to_file_index,
-                hygiene_context: &hygiene_encode_context,
+                hygiene_context: Default::default(),
                 symbol_index_table: Default::default(),
+                source_span_cache: Default::default(),
                 query_values_index: Default::default(),
                 side_effects_index: Default::default(),
             };
@@ -278,7 +280,8 @@ impl OnDiskCache {
             // Encode all hygiene data (`SyntaxContextData` and `ExpnData`) from the current
             // session.
 
-            hygiene_encode_context.encode(
+            HygieneEncodeContext::encode(
+                &Rc::clone(&encoder.hygiene_context),
                 &mut encoder,
                 |encoder, index, ctxt_data| {
                     let pos = AbsoluteBytePos::new(encoder.position());
@@ -288,7 +291,7 @@ impl OnDiskCache {
                 |encoder, expn_id, data, hash| {
                     if expn_id.krate == LOCAL_CRATE {
                         let pos = AbsoluteBytePos::new(encoder.position());
-                        encoder.encode_tagged(TAG_EXPN_DATA, data);
+                        encoder.encode_tagged(TAG_EXPN_DATA, data.expect("local expn"));
                         expn_data.insert(hash, pos);
                     } else {
                         foreign_expn_data.insert(hash, expn_id.local_id.as_u32());
@@ -333,13 +336,6 @@ impl OnDiskCache {
         let side_effect: Option<QuerySideEffect> =
             self.load_indexed(tcx, dep_node_index, &self.side_effects_index);
         side_effect
-    }
-
-    /// Returns true if there is a disk-cached query return value for the given node.
-    #[inline]
-    pub fn loadable_from_disk(&self, dep_node_index: SerializedDepNodeIndex) -> bool {
-        self.query_values_index.contains_key(&dep_node_index)
-        // with_decoder is infallible, so we can stop here
     }
 
     /// Returns the disk-cached query return value for the given node, if there is one.
@@ -389,6 +385,7 @@ impl OnDiskCache {
             expn_data: &self.expn_data,
             foreign_expn_data: &self.foreign_expn_data,
             hygiene_context: &self.hygiene_context,
+            source_span_cache: SourceSpanCache::default(),
         };
         f(&mut decoder)
     }
@@ -409,6 +406,7 @@ pub struct CacheDecoder<'a, 'tcx> {
     expn_data: &'a UnhashMap<ExpnHash, AbsoluteBytePos>,
     foreign_expn_data: &'a UnhashMap<ExpnHash, u32>,
     hygiene_context: &'a HygieneDecodeContext,
+    source_span_cache: SourceSpanCache,
 }
 
 impl<'a, 'tcx> CacheDecoder<'a, 'tcx> {
@@ -489,11 +487,6 @@ where
 impl<'a, 'tcx> TyDecoder<'tcx> for CacheDecoder<'a, 'tcx> {
     const CLEAR_CROSS_CRATE: bool = false;
 
-    #[inline]
-    fn interner(&self) -> TyCtxt<'tcx> {
-        self.tcx
-    }
-
     fn cached_ty_for_shorthand<F>(&mut self, shorthand: usize, or_insert_with: F) -> Ty<'tcx>
     where
         F: FnOnce(&mut Self) -> Ty<'tcx>,
@@ -502,13 +495,13 @@ impl<'a, 'tcx> TyDecoder<'tcx> for CacheDecoder<'a, 'tcx> {
 
         let cache_key = ty::CReaderCacheKey { cnum: None, pos: shorthand };
 
-        if let Some(&ty) = tcx.ty_rcache.borrow().get(&cache_key) {
+        if let Some(&ty) = tcx.caches.ty_rcache.borrow().get(&cache_key) {
             return ty;
         }
 
         let ty = or_insert_with(self);
         // This may overwrite the entry, but it should overwrite with the same value.
-        tcx.ty_rcache.borrow_mut().insert_same(cache_key, ty);
+        tcx.caches.ty_rcache.borrow_mut().insert_same(cache_key, ty);
         ty
     }
 
@@ -531,7 +524,18 @@ impl<'a, 'tcx> TyDecoder<'tcx> for CacheDecoder<'a, 'tcx> {
     }
 }
 
-crate::implement_ty_decoder!(CacheDecoder<'a, 'tcx>);
+impl<'a, 'tcx> rustc_type_ir::InternerDecoder for CacheDecoder<'a, 'tcx> {
+    type Interner = TyCtxt<'tcx>;
+
+    #[inline]
+    fn interner(&self) -> Self::Interner {
+        self.tcx
+    }
+}
+
+impl<'a, 'tcx> Decoder for CacheDecoder<'a, 'tcx> {
+    forward_all_decoder_methods_to!(|self| self.opaque);
+}
 
 // This ensures that the `Decodable<opaque::Decoder>::decode` specialization for `Vec<u8>` is used
 // when a `CacheDecoder` is passed to `Decodable::decode`. Unfortunately, we have to manually opt
@@ -611,7 +615,9 @@ impl<'a, 'tcx> SpanDecoder for CacheDecoder<'a, 'tcx> {
                 let dlo = u32::decode(self);
                 let dto = u32::decode(self);
 
-                let enclosing = self.tcx.source_span_untracked(parent.unwrap()).data_untracked();
+                let enclosing = self
+                    .source_span_cache
+                    .lookup(parent.unwrap(), &self.tcx.untracked().source_span);
                 (
                     BytePos(enclosing.lo.0.wrapping_add(dlo)),
                     BytePos(enclosing.lo.0.wrapping_add(dto)),
@@ -688,96 +694,56 @@ impl<'a, 'tcx> BlobDecoder for CacheDecoder<'a, 'tcx> {
     fn decode_def_index(&mut self) -> DefIndex {
         panic!("trying to decode `DefIndex` outside the context of a `DefId`")
     }
-}
 
-impl<'a, 'tcx> Decodable<CacheDecoder<'a, 'tcx>> for &'tcx UnordSet<LocalDefId> {
-    #[inline]
-    fn decode(d: &mut CacheDecoder<'a, 'tcx>) -> Self {
-        RefDecodable::decode(d)
+    fn decode_local_def_id(&mut self) -> LocalDefId {
+        self.decode_def_id().expect_local()
     }
 }
 
-impl<'a, 'tcx> Decodable<CacheDecoder<'a, 'tcx>>
-    for &'tcx UnordMap<DefId, ty::EarlyBinder<'tcx, Ty<'tcx>>>
-{
-    #[inline]
-    fn decode(d: &mut CacheDecoder<'a, 'tcx>) -> Self {
-        RefDecodable::decode(d)
-    }
-}
-
-impl<'a, 'tcx> Decodable<CacheDecoder<'a, 'tcx>>
-    for &'tcx IndexVec<mir::Promoted, mir::Body<'tcx>>
-{
-    #[inline]
-    fn decode(d: &mut CacheDecoder<'a, 'tcx>) -> Self {
-        RefDecodable::decode(d)
-    }
-}
-
-impl<'a, 'tcx> Decodable<CacheDecoder<'a, 'tcx>> for &'tcx [(ty::Clause<'tcx>, Span)] {
-    #[inline]
-    fn decode(d: &mut CacheDecoder<'a, 'tcx>) -> Self {
-        RefDecodable::decode(d)
-    }
-}
-
-impl<'a, 'tcx> Decodable<CacheDecoder<'a, 'tcx>> for &'tcx [rustc_ast::InlineAsmTemplatePiece] {
-    #[inline]
-    fn decode(d: &mut CacheDecoder<'a, 'tcx>) -> Self {
-        RefDecodable::decode(d)
-    }
-}
-
-impl<'a, 'tcx> Decodable<CacheDecoder<'a, 'tcx>> for &'tcx [Spanned<MonoItem<'tcx>>] {
-    #[inline]
-    fn decode(d: &mut CacheDecoder<'a, 'tcx>) -> Self {
-        RefDecodable::decode(d)
-    }
-}
-
-impl<'a, 'tcx> Decodable<CacheDecoder<'a, 'tcx>>
-    for &'tcx crate::traits::specialization_graph::Graph
-{
-    #[inline]
-    fn decode(d: &mut CacheDecoder<'a, 'tcx>) -> Self {
-        RefDecodable::decode(d)
-    }
-}
-
-impl<'a, 'tcx> Decodable<CacheDecoder<'a, 'tcx>> for &'tcx rustc_ast::tokenstream::TokenStream {
-    #[inline]
-    fn decode(d: &mut CacheDecoder<'a, 'tcx>) -> Self {
-        RefDecodable::decode(d)
-    }
-}
-
-macro_rules! impl_ref_decoder {
-    (<$tcx:tt> $($ty:ty,)*) => {
-        $(impl<'a, $tcx> Decodable<CacheDecoder<'a, $tcx>> for &$tcx [$ty] {
-            #[inline]
-            fn decode(d: &mut CacheDecoder<'a, $tcx>) -> Self {
-                RefDecodable::decode(d)
+/// Implements [`Decodable`] for `&'tcx T`, where [`T: RefDecodable`](RefDecodable).
+///
+/// Due to orphan-rule restrictions, these foreign impls cannot use a blanket
+/// [`D: TyDecoder`](TyDecoder), and must instead specify a specific decoder.
+///
+/// For impls on types defined in `rustc_middle`, see
+/// `impl_decodable_via_ref_decodable_for_local_type!` instead.
+macro_rules! impl_decodable_via_ref_decodable_for_foreign_types {
+    (
+        $(
+            &'tcx $T:ty,
+        )*
+    ) => {
+        $(
+            impl<'tcx> Decodable<CacheDecoder<'_, 'tcx>> for &'tcx $T {
+                fn decode(decoder: &mut CacheDecoder<'_, 'tcx>) -> Self {
+                    RefDecodable::decode(decoder)
+                }
             }
-        })*
-    };
+        )*
+    }
 }
 
-impl_ref_decoder! {<'tcx>
-    Span,
-    rustc_hir::Attribute,
-    rustc_span::Ident,
-    ty::Variance,
-    rustc_span::def_id::DefId,
-    rustc_span::def_id::LocalDefId,
-    (rustc_middle::middle::exported_symbols::ExportedSymbol<'tcx>, rustc_middle::middle::exported_symbols::SymbolExportInfo),
-    rustc_middle::middle::deduced_param_attrs::DeducedParamAttrs,
+impl_decodable_via_ref_decodable_for_foreign_types! {
+    // tidy-alphabetical-start
+    &'tcx IndexVec<mir::Promoted, mir::Body<'tcx>>,
+    &'tcx UnordMap<DefId, ty::EarlyBinder<'tcx, Ty<'tcx>>>,
+    &'tcx UnordSet<LocalDefId>,
+    &'tcx [(
+        rustc_middle::middle::exported_symbols::ExportedSymbol<'tcx>,
+        rustc_middle::middle::exported_symbols::SymbolExportInfo,
+    )],
+    &'tcx [(ty::Clause<'tcx>, Span)],
+    &'tcx [DefId],
+    &'tcx [Spanned<MonoItem<'tcx>>],
+    &'tcx [ty::Variance],
+    &'tcx rustc_ast::tokenstream::TokenStream,
+    // tidy-alphabetical-end
 }
 
 //- ENCODING -------------------------------------------------------------------
 
 /// An encoder that can write to the incremental compilation cache.
-pub struct CacheEncoder<'a, 'tcx> {
+pub struct CacheEncoder<'tcx> {
     tcx: TyCtxt<'tcx>,
     encoder: FileEncoder<'static>,
     type_shorthands: FxHashMap<Ty<'tcx>, usize>,
@@ -785,22 +751,23 @@ pub struct CacheEncoder<'a, 'tcx> {
     interpret_allocs: FxIndexSet<interpret::AllocId>,
     caching_source_map_view: CachingSourceMapView<'tcx>,
     file_to_file_index: FxHashMap<*const SourceFile, SourceFileIndex>,
-    hygiene_context: &'a HygieneEncodeContext,
+    hygiene_context: Rc<RefCell<HygieneEncodeContext>>,
     // Used for both `Symbol`s and `ByteSymbol`s.
     symbol_index_table: FxHashMap<u32, usize>,
+    source_span_cache: SourceSpanCache,
 
     query_values_index: Vec<(SerializedDepNodeIndex, AbsoluteBytePos)>,
     side_effects_index: Vec<(SerializedDepNodeIndex, AbsoluteBytePos)>,
 }
 
-impl<'a, 'tcx> fmt::Debug for CacheEncoder<'a, 'tcx> {
+impl<'tcx> fmt::Debug for CacheEncoder<'tcx> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Add more details here if/when necessary.
         f.write_str("CacheEncoder")
     }
 }
 
-impl<'a, 'tcx> CacheEncoder<'a, 'tcx> {
+impl<'tcx> CacheEncoder<'tcx> {
     #[inline]
     fn source_file_index(&mut self, source_file: Arc<SourceFile>) -> SourceFileIndex {
         self.file_to_file_index[&(&raw const *source_file)]
@@ -869,13 +836,14 @@ impl<'a, 'tcx> CacheEncoder<'a, 'tcx> {
     }
 }
 
-impl<'a, 'tcx> SpanEncoder for CacheEncoder<'a, 'tcx> {
+impl<'tcx> SpanEncoder for CacheEncoder<'tcx> {
     fn encode_syntax_context(&mut self, syntax_context: SyntaxContext) {
-        rustc_span::hygiene::raw_encode_syntax_context(syntax_context, self.hygiene_context, self);
+        let idx = self.hygiene_context.borrow_mut().get_syntax_ctxt_encoding_index(syntax_context);
+        idx.encode(self);
     }
 
     fn encode_expn_id(&mut self, expn_id: ExpnId) {
-        self.hygiene_context.schedule_expn_data_for_encoding(expn_id);
+        self.hygiene_context.borrow_mut().schedule_expn_data_for_encoding(expn_id);
         expn_id.expn_hash().encode(self);
     }
 
@@ -888,8 +856,9 @@ impl<'a, 'tcx> SpanEncoder for CacheEncoder<'a, 'tcx> {
             return TAG_PARTIAL_SPAN.encode(self);
         }
 
-        let parent =
-            span_data.parent.map(|parent| self.tcx.source_span_untracked(parent).data_untracked());
+        let parent = span_data
+            .parent
+            .map(|parent| self.source_span_cache.lookup(parent, &self.tcx.untracked().source_span));
         if let Some(parent) = parent
             && parent.contains(span_data)
         {
@@ -947,7 +916,7 @@ impl<'a, 'tcx> SpanEncoder for CacheEncoder<'a, 'tcx> {
     }
 }
 
-impl<'a, 'tcx> TyEncoder<'tcx> for CacheEncoder<'a, 'tcx> {
+impl<'tcx> TyEncoder<'tcx> for CacheEncoder<'tcx> {
     const CLEAR_CROSS_CRATE: bool = false;
 
     #[inline]
@@ -972,14 +941,16 @@ impl<'a, 'tcx> TyEncoder<'tcx> for CacheEncoder<'a, 'tcx> {
 
 macro_rules! encoder_methods {
     ($($name:ident($ty:ty);)*) => {
-        #[inline]
-        $(fn $name(&mut self, value: $ty) {
-            self.encoder.$name(value)
-        })*
+        $(
+            #[inline]
+            fn $name(&mut self, value: $ty) {
+                self.encoder.$name(value)
+            }
+        )*
     }
 }
 
-impl<'a, 'tcx> Encoder for CacheEncoder<'a, 'tcx> {
+impl<'tcx> Encoder for CacheEncoder<'tcx> {
     encoder_methods! {
         emit_usize(usize);
         emit_u128(u128);
@@ -1002,8 +973,8 @@ impl<'a, 'tcx> Encoder for CacheEncoder<'a, 'tcx> {
 // is used when a `CacheEncoder` having an `opaque::FileEncoder` is passed to `Encodable::encode`.
 // Unfortunately, we have to manually opt into specializations this way, given how `CacheEncoder`
 // and the encoding traits currently work.
-impl<'a, 'tcx> Encodable<CacheEncoder<'a, 'tcx>> for [u8] {
-    fn encode(&self, e: &mut CacheEncoder<'a, 'tcx>) {
+impl<'tcx> Encodable<CacheEncoder<'tcx>> for [u8] {
+    fn encode(&self, e: &mut CacheEncoder<'tcx>) {
         self.encode(&mut e.encoder);
     }
 }

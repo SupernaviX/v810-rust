@@ -7,9 +7,22 @@
 
 [relabel]
 allow-unauthenticated = [
-    "needs-triage",
-    "S-*",
+    "A-*",
+    "B-*",
     "C-*",
+    "E-*",
+    "F-*",
+    "I-*",
+    "needs-rfc",
+    "needs-triage",
+    "regression-*",
+    "S-*",
+    "SO-*",
+    "T-*",
+    "UO-*",
+    "unstable-language-feature",
+    "unstable-option",
+    "X-*",
 ]
 
 # ------------------------------------------------------------------------------
@@ -26,6 +39,19 @@ exclude_labels = [
 # manually if we determine that a PR does not need relnotes.
 [autolabel."release-notes"]
 pr_merged = true
+
+# Prioritization of regression triaging.
+[autolabel."I-prioritize"]
+trigger_labels = [
+    "regression-from-stable-to-beta",
+    "regression-from-stable-to-nightly",
+    "regression-from-stable-to-stable",
+    "regression-untriaged",
+]
+exclude_labels = [
+    "P-*",
+    "requires-nightly",
+]
 
 [autolabel."A-CI"]
 trigger_files = [
@@ -81,3 +107,15 @@ add_labels = ["S-waiting-on-review"]
 # ------------------------------------------------------------------------------
 
 [assign]
+
+# ------------------------------------------------------------------------------
+# Misc
+# ------------------------------------------------------------------------------
+
+# Canonicalize issue numbers to avoid closing the wrong issue
+# when commits are included in subtrees, as well as warning links in commits.
+# Documentation at: https://forge.rust-lang.org/triagebot/issue-links.html
+[issue-links]
+# This prevents links from resolving to the wrong repository when the subtree is
+# merged upstream while still allowing issue links in commits.
+check-commits = "uncanonicalized"

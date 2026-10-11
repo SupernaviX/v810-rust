@@ -1,10 +1,9 @@
 use clippy_utils::diagnostics::span_lint;
-use clippy_utils::res::MaybeDef;
+use clippy_utils::res::MaybeDef as _;
 use clippy_utils::ty::implements_trait;
 use clippy_utils::{higher, sym};
 use rustc_hir::{BorrowKind, Closure, Expr, ExprKind};
-use rustc_lint::{LateContext, LateLintPass};
-use rustc_session::declare_lint_pass;
+use rustc_lint::{LateContext, LateLintPass, declare_lint_pass};
 use rustc_span::Symbol;
 
 declare_clippy_lint! {
@@ -162,7 +161,7 @@ fn is_infinite(cx: &LateContext<'_>, expr: &Expr<'_>) -> Finiteness {
                 && let ExprKind::Closure(&Closure { body, .. }) = args[0].kind
             {
                 let body = cx.tcx.hir_body(body);
-                return is_infinite(cx, body.value);
+                return is_infinite(cx, &body.value);
             }
             Finite
         },

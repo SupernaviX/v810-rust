@@ -10,8 +10,9 @@
 //! defined directly on the `f128` type.
 
 #![unstable(feature = "f128", issue = "116909")]
+#![expect(clippy::approx_constant, reason = "this module defines f128 constants")]
 
-use crate::convert::FloatToInt;
+use crate::convert::{FloatToFloat, FloatToInt};
 use crate::num::FpCategory;
 use crate::panic::const_assert;
 use crate::{intrinsics, mem};
@@ -593,7 +594,7 @@ impl f128 {
     /// conserved over arithmetic operations, the result of `is_sign_positive` on
     /// a NaN might produce an unexpected or non-portable result. See the [specification
     /// of NaN bit patterns](f32#nan-bit-patterns) for more info. Use `self.signum() == 1.0`
-    /// if you need fully portable behavior (will return `false` for all NaNs).
+    /// if you need fully portable behavior (evaluates to `false` for all NaNs).
     ///
     /// ```
     /// #![feature(f128)]
@@ -619,7 +620,7 @@ impl f128 {
     /// conserved over arithmetic operations, the result of `is_sign_negative` on
     /// a NaN might produce an unexpected or non-portable result. See the [specification
     /// of NaN bit patterns](f32#nan-bit-patterns) for more info. Use `self.signum() == -1.0`
-    /// if you need fully portable behavior (will return `false` for all NaNs).
+    /// if you need fully portable behavior (evaluates to `false` for all NaNs).
     ///
     /// ```
     /// #![feature(f128)]
@@ -1028,6 +1029,100 @@ impl f128 {
         unsafe { FloatToInt::<Int>::to_int_unchecked(self) }
     }
 
+    /// Converts to the target float type, rounding as defined in IEEE 754.
+    ///
+    /// This is equivalent to `self as Flt`. Narrowing to a smaller type can
+    /// produce an infinity.
+    ///
+    /// ```
+    /// #![feature(float_conversions, f128)]
+    /// # #[cfg(target_has_reliable_f128)] {
+    ///
+    /// let x = 1.5_f128;
+    /// assert_eq!(x.cast::<f64>(), 1.5_f64);
+    /// # }
+    /// ```
+    #[unstable(feature = "float_conversions", issue = "159913")]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
+    #[inline]
+    pub fn cast<Flt>(self) -> Flt
+    where
+        Self: FloatToFloat<Flt>,
+    {
+        FloatToFloat::<Flt>::cast(self)
+    }
+
+    /// Rounds toward zero and converts to any primitive integer type, saturating
+    /// at the type's boundaries and mapping `NaN` to zero.
+    ///
+    /// This is equivalent to `self as Int`.
+    ///
+    /// ```
+    /// #![feature(float_conversions, f128)]
+    /// # #[cfg(target_has_reliable_f128)] {
+    ///
+    /// assert_eq!(4.6_f128.to_int_saturating::<u8>(), 4);
+    /// assert_eq!(f128::NAN.to_int_saturating::<u8>(), 0);
+    /// # }
+    /// ```
+    #[unstable(feature = "float_conversions", issue = "159913")]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
+    #[inline]
+    pub fn to_int_saturating<Int>(self) -> Int
+    where
+        Self: FloatToInt<Int>,
+    {
+        FloatToInt::<Int>::to_int_saturating(self)
+    }
+
+    /// Rounds toward zero and converts to any primitive integer type, returning
+    /// `None` if the value is `NaN`, infinite, or does not fit in the target type.
+    ///
+    /// ```
+    /// #![feature(float_conversions, f128)]
+    /// # #[cfg(target_has_reliable_f128)] {
+    ///
+    /// assert_eq!(4.6_f128.to_int_checked::<u8>(), Some(4));
+    /// assert_eq!(f128::NAN.to_int_checked::<u8>(), None);
+    /// # }
+    /// ```
+    #[unstable(feature = "float_conversions", issue = "159913")]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
+    #[inline]
+    pub fn to_int_checked<Int>(self) -> Option<Int>
+    where
+        Self: FloatToInt<Int>,
+    {
+        FloatToInt::<Int>::to_int_checked(self)
+    }
+
+    /// Rounds toward zero and converts to any primitive integer type.
+    ///
+    /// This is equivalent to `self.to_int_checked().unwrap()`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the value is `NaN`, infinite, or does not fit in the target type.
+    ///
+    /// ```
+    /// #![feature(float_conversions, f128)]
+    /// # #[cfg(target_has_reliable_f128)] {
+    ///
+    /// assert_eq!(4.6_f128.to_int_strict::<u8>(), 4);
+    /// # }
+    /// ```
+    #[unstable(feature = "float_conversions", issue = "159913")]
+    #[must_use = "this returns the result of the operation, without modifying the original"]
+    #[inline]
+    #[track_caller]
+    pub fn to_int_strict<Int>(self) -> Int
+    where
+        Self: FloatToInt<Int>,
+    {
+        self.to_int_checked::<Int>()
+            .expect("the value cannot be represented in the target integer type")
+    }
+
     /// Raw transmutation to `u128`.
     ///
     /// This is currently identical to `transmute::<f128, u128>(self)` on all platforms.
@@ -1388,7 +1483,7 @@ impl f128 {
     ///
     /// ```
     /// #![feature(f128)]
-    /// # #[cfg(target_has_reliable_f128)] {
+    /// # #[cfg(target_has_reliable_f128_math)] {
     ///
     /// assert!((-3.0f128).clamp(-2.0, 1.0) == -2.0);
     /// assert!((0.0f128).clamp(-2.0, 1.0) == 0.0);
@@ -1405,6 +1500,7 @@ impl f128 {
     #[inline]
     #[unstable(feature = "f128", issue = "116909")]
     #[must_use = "method returns a new number and does not mutate the original value"]
+    #[expect(clippy::neg_cmp_op_on_partial_ord, reason = "NaN is also invalid")]
     pub const fn clamp(mut self, min: f128, max: f128) -> f128 {
         const_assert!(
             min <= max,
@@ -1448,11 +1544,50 @@ impl f128 {
     /// ```
     #[inline]
     #[unstable(feature = "clamp_magnitude", issue = "148519")]
-    #[must_use = "this returns the clamped value and does not modify the original"]
-    pub fn clamp_magnitude(self, limit: f128) -> f128 {
-        assert!(limit >= 0.0, "limit must be non-negative");
+    #[rustc_const_unstable(feature = "clamp_magnitude", issue = "148519")]
+    #[must_use = "method returns a new number and does not mutate the original value"]
+    #[expect(clippy::neg_cmp_op_on_partial_ord, reason = "NaN is also invalid")]
+    pub const fn clamp_magnitude(self, limit: f128) -> f128 {
+        assert!(limit >= 0.0, "limit must be non-negative and not NaN");
         let limit = limit.abs(); // Canonicalises -0.0 to 0.0
         self.clamp(-limit, limit)
+    }
+
+    /// Restrict a value to a certain range, unless it is NaN.
+    ///
+    /// This is largely equal to `max`, `min`, or `clamp`, depending on whether the range is
+    /// `min..`, `..=max`, or `min..=max`, respectively. However, unlike `max` and `min`, it will
+    /// panic if any bound is NaN.
+    ///
+    /// Note that this function returns NaN if the initial value was NaN as
+    /// well.
+    ///
+    /// Exclusive ranges are not permitted.
+    ///
+    /// # Panics
+    ///
+    /// Panics on `min..=max` if `min > max`, or if any bound is NaN.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(f128, clamp_to)]
+    /// # #[cfg(target_has_reliable_f128_math)] {
+    /// assert_eq!((-3.0f128).clamp_to(-2.0..=1.0), -2.0);
+    /// assert_eq!(0.0f128.clamp_to(-2.0..=1.0), 0.0);
+    /// assert_eq!(2.0f128.clamp_to(..=1.0), 1.0);
+    /// assert_eq!(5.0f128.clamp_to(7.0..), 7.0);
+    /// assert!(f128::NAN.clamp_to(1.0..=2.0).is_nan());
+    /// # }
+    /// ```
+    #[must_use]
+    #[inline]
+    #[unstable(feature = "clamp_to", issue = "147781")]
+    pub fn clamp_to<R>(self, range: R) -> Self
+    where
+        R: crate::cmp::ClampBounds<Self>,
+    {
+        range.clamp(self)
     }
 
     /// Computes the absolute value of `self`.
@@ -1601,6 +1736,33 @@ impl f128 {
     #[inline]
     pub const fn algebraic_rem(self, rhs: f128) -> f128 {
         intrinsics::frem_algebraic(self, rhs)
+    }
+
+    /// Returns `self` if the value is not NaN, otherwise returns `replacement`
+    /// if `self` is NaN.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(f128)]
+    /// #![feature(float_nan_to)]
+    /// # #[cfg(target_has_reliable_f128)] {
+    ///
+    /// let n = f128::NAN;
+    /// let x = 2.0f128;
+    /// let y = f128::INFINITY;
+    ///
+    /// assert_eq!(n.nan_to(0.0f128), 0.0f128);
+    /// assert_eq!(x.nan_to(0.0f128), 2.0f128);
+    /// assert_eq!(y.nan_to(0.0f128), f128::INFINITY);
+    /// # }
+    /// ```
+    #[must_use = "method returns a new float and does not mutate the original value"]
+    #[unstable(feature = "float_nan_to", issue = "161248")]
+    #[rustc_const_unstable(feature = "float_nan_to", issue = "161248")]
+    #[inline]
+    pub const fn nan_to(self, replacement: f128) -> f128 {
+        if self.is_nan() { replacement } else { self }
     }
 }
 
@@ -1834,6 +1996,45 @@ impl f128 {
     #[must_use = "method returns a new number and does not mutate the original value"]
     pub const fn mul_add(self, a: f128, b: f128) -> f128 {
         intrinsics::fmaf128(self, a, b)
+    }
+
+    /// Computes `(self * a) + b` with nondeterministic rounding.
+    ///
+    /// This is similar to [`mul_add`](Self::mul_add), but the intermediate
+    /// result may be rounded differently depending on the implementation.
+    /// The operation is either executed as a single fused multiply-add
+    /// instruction, or as separate multiply and add instructions.
+    ///
+    /// The choice of which one is used is unspecified and non-deterministic:
+    /// it may vary by target, optimization level, and surrounding code, and
+    /// even two invocations of this operation with the same inputs may
+    /// produce different results.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(f128)]
+    /// #![feature(float_mul_add_relaxed)]
+    /// # #[cfg(any(miri, target_has_reliable_f128_math))] { // Miri uses softfloats, always works
+    ///
+    /// // When the fused and unfused operations round differently, either
+    /// // result may be returned:
+    /// // - 7.824090399073145653039910391751267e-37 is the fused result (one rounding)
+    /// // - 1.5046327690525280101999827676444745e-36 is the unfused result (two roundings)
+    /// let r = 0.1_f128.mul_add_relaxed(0.1_f128, -0.01_f128);
+    /// assert!(
+    ///     r == 7.824090399073145653039910391751267e-37
+    ///         || r == 1.5046327690525280101999827676444745e-36
+    /// );
+    /// # }
+    /// ```
+    #[inline]
+    #[rustc_allow_incoherent_impl]
+    #[doc(alias = "fmuladd")]
+    #[unstable(feature = "float_mul_add_relaxed", issue = "151770")]
+    #[must_use = "method returns a new number and does not mutate the original value"]
+    pub const fn mul_add_relaxed(self, a: f128, b: f128) -> f128 {
+        intrinsics::fmuladdf128(self, a, b)
     }
 
     /// Calculates Euclidean division, the matching method for `rem_euclid`.

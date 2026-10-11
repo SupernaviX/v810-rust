@@ -5,12 +5,13 @@ use clippy_utils::{
     span_contains_cfg, span_find_starting_semi, sym,
 };
 use rustc_ast::MetaItemInner;
+use rustc_attr_ir::lang_items::LangItem;
 use rustc_errors::Applicability;
 use rustc_hir::intravisit::FnKind;
-use rustc_hir::{Body, Expr, ExprKind, HirId, LangItem, MatchSource, StmtKind};
-use rustc_lint::{LateContext, Level, LintContext};
+use rustc_hir::{Body, Expr, ExprKind, HirId, MatchSource, StmtKind};
+use rustc_lint::{LateContext, Level, LintContext as _};
 use rustc_middle::ty::{self, Ty};
-use rustc_span::{BytePos, Pos, Span};
+use rustc_span::{BytePos, Pos as _, Span};
 use std::borrow::Cow;
 use std::fmt::Display;
 
@@ -69,7 +70,7 @@ pub(super) fn check_fn<'tcx>(cx: &LateContext<'tcx>, kind: FnKind<'tcx>, body: &
             } else {
                 RetReplacement::Empty
             };
-            check_final_expr(cx, body.value, vec![], replacement, None);
+            check_final_expr(cx, &body.value, vec![], replacement, None);
         },
         FnKind::ItemFn(..) | FnKind::Method(..) => {
             check_block_return(cx, &body.value.kind, sp, vec![]);

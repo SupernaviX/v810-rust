@@ -1,9 +1,13 @@
 //@ check-pass
 //@ compile-flags: -Znext-solver
 
-#![feature(min_generic_const_args)]
-#![feature(generic_const_args)]
-#![feature(generic_const_items)]
+#![feature(
+    gca_min_const_items,
+    gca_macroless_args,
+    gca_macroless_items,
+    gca_const_items,
+    generic_const_items
+)]
 #![expect(incomplete_features)]
 
 trait Trait {
@@ -32,6 +36,8 @@ struct Struct<const N: usize>;
 fn f<const N: usize>() {
     let _: Struct<{ <GenericStructImpl<N> as Trait>::PROJECTED_A }> =
         Struct::<{ <GenericStructImpl<N> as Trait>::PROJECTED_A }>;
+    let _: Struct<{ <GenericStructImpl<N> as Trait>::PROJECTED_A }> =
+        Struct::<{ <GenericStructImpl<N> as Trait>::PROJECTED_B }>;
 }
 
 fn g<T: Trait>() {

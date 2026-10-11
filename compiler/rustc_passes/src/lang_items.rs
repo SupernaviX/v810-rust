@@ -9,12 +9,13 @@
 
 use rustc_ast as ast;
 use rustc_ast::visit;
+use rustc_attr_ir::lang_items::{GenericRequirement, LangItem, LanguageItems};
+use rustc_attr_ir::target::Target;
+use rustc_crate_store::ExternCrate;
 use rustc_hir::def_id::{DefId, LocalDefId};
-use rustc_hir::lang_items::GenericRequirement;
-use rustc_hir::{LangItem, LanguageItems, Target};
+use rustc_middle::middle::resolve::ResolverAstLowering;
 use rustc_middle::query::Providers;
-use rustc_middle::ty::{ResolverAstLowering, TyCtxt};
-use rustc_session::cstore::ExternCrate;
+use rustc_middle::ty::TyCtxt;
 use rustc_span::{Span, Symbol, sym};
 
 use crate::diagnostics::{DuplicateLangItem, IncorrectCrateType, IncorrectTarget};
@@ -230,7 +231,7 @@ impl<'ast, 'tcx> LanguageItemCollector<'ast, 'tcx> {
             }
         }
 
-        if self.tcx.crate_types().contains(&rustc_session::config::CrateType::Sdylib) {
+        if self.tcx.crate_types().contains(&rustc_structures::CrateType::Sdylib) {
             self.tcx.dcx().emit_err(IncorrectCrateType { span: attr_span });
         }
 
@@ -314,7 +315,8 @@ impl<'ast, 'tcx> visit::Visitor<'ast> for LanguageItemCollector<'ast, 'tcx> {
 /// Extracts the first `lang = "$name"` out of a list of attributes.
 /// The `#[panic_handler]` attribute is also extracted out when found.
 ///
-/// This function is used for `ast::Attribute`, for `hir::Attribute` use the `find_attr!` macro with `AttributeKind::Lang`
+/// This function is used for `ast::Attribute`, for `rustc_attr_ir::Attribute`
+/// use `find_attr!(attrs, Lang(lang_item))`.
 pub(crate) fn extract_ast(attrs: &[rustc_ast::ast::Attribute]) -> Option<(Symbol, Span)> {
     attrs.iter().find_map(|attr| {
         Some(match attr {

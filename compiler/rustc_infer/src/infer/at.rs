@@ -26,9 +26,9 @@
 //! things. (That system should probably be refactored.)
 
 use relate::lattice::{LatticeOp, LatticeOpKind};
-use rustc_middle::bug;
 use rustc_middle::ty::relate::solver_relating::RelateExt as NextSolverRelate;
 use rustc_middle::ty::{Const, TypingMode};
+use rustc_span::bug;
 
 use super::*;
 use crate::infer::relate::type_relating::TypeRelating;
@@ -78,6 +78,7 @@ impl<'tcx> InferCtxt<'tcx> {
             selection_cache: self.selection_cache.clone(),
             evaluation_cache: self.evaluation_cache.clone(),
             reported_trait_errors: self.reported_trait_errors.clone(),
+            reported_hir_errors: self.reported_hir_errors.clone(),
             reported_signature_mismatch: self.reported_signature_mismatch.clone(),
             tainted_by_errors: self.tainted_by_errors.clone(),
             universe: self.universe.clone(),
@@ -85,7 +86,9 @@ impl<'tcx> InferCtxt<'tcx> {
                 .placeholder_assumptions_for_next_solver
                 .clone(),
             next_trait_solver: self.next_trait_solver,
+            enable_next_solver_overflow_fcw: self.enable_next_solver_overflow_fcw.clone(),
             obligation_inspector: self.obligation_inspector.clone(),
+            canonicalizer_state: Default::default(),
         }
     }
 
@@ -106,6 +109,7 @@ impl<'tcx> InferCtxt<'tcx> {
             selection_cache: Default::default(),
             evaluation_cache: Default::default(),
             reported_trait_errors: self.reported_trait_errors.clone(),
+            reported_hir_errors: self.reported_hir_errors.clone(),
             reported_signature_mismatch: self.reported_signature_mismatch.clone(),
             tainted_by_errors: self.tainted_by_errors.clone(),
             universe: self.universe.clone(),
@@ -113,7 +117,9 @@ impl<'tcx> InferCtxt<'tcx> {
                 .placeholder_assumptions_for_next_solver
                 .clone(),
             next_trait_solver: self.next_trait_solver,
+            enable_next_solver_overflow_fcw: self.enable_next_solver_overflow_fcw.clone(),
             obligation_inspector: self.obligation_inspector.clone(),
+            canonicalizer_state: Default::default(),
         };
         forked.inner.borrow_mut().projection_cache().clear();
         forked

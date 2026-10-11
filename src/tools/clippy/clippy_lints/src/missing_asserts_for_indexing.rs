@@ -13,8 +13,7 @@ use rustc_data_structures::packed::Pu128;
 use rustc_data_structures::unhash::UnindexMap;
 use rustc_errors::{Applicability, Diag};
 use rustc_hir::{Block, Body, Expr, ExprKind, UnOp};
-use rustc_lint::{LateContext, LateLintPass};
-use rustc_session::declare_lint_pass;
+use rustc_lint::{LateContext, LateLintPass, declare_lint_pass};
 use rustc_span::{Span, Spanned, Symbol, sym};
 
 declare_clippy_lint! {
@@ -69,7 +68,7 @@ declare_lint_pass!(MissingAssertsForIndexing => [MISSING_ASSERTS_FOR_INDEXING]);
 
 fn report_lint<F>(cx: &LateContext<'_>, index_spans: Vec<Span>, msg: &'static str, f: F)
 where
-    F: FnOnce(&mut Diag<'_, ()>),
+    F: FnOnce(&mut Diag<'_>),
 {
     span_lint_and_then(cx, MISSING_ASSERTS_FOR_INDEXING, index_spans, msg, |diag| {
         f(diag);
@@ -437,7 +436,7 @@ impl LateLintPass<'_> for MissingAssertsForIndexing {
     fn check_body(&mut self, cx: &LateContext<'_>, body: &Body<'_>) {
         let mut map = UnindexMap::default();
 
-        for_each_expr_without_closures(body.value, |expr| {
+        for_each_expr_without_closures(&body.value, |expr| {
             check_index(cx, expr, &mut map);
             check_assert(cx, expr, &mut map);
             ControlFlow::<!, ()>::Continue(())

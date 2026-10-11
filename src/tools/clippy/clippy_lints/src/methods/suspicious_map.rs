@@ -1,6 +1,6 @@
 use clippy_utils::diagnostics::span_lint_and_help;
 use clippy_utils::expr_or_init;
-use clippy_utils::res::{MaybeDef, MaybeTypeckRes};
+use clippy_utils::res::{MaybeDef as _, MaybeTypeckRes as _};
 use clippy_utils::usage::mutated_variables;
 use rustc_hir as hir;
 use rustc_lint::LateContext;
@@ -15,9 +15,9 @@ pub fn check(cx: &LateContext<'_>, expr: &hir::Expr<'_>, count_recv: &hir::Expr<
         .is_diag_item(cx, sym::Iterator)
         && let hir::ExprKind::Closure(closure) = expr_or_init(cx, map_arg).kind
         && let closure_body = cx.tcx.hir_body(closure.body)
-        && !cx.typeck_results().expr_ty(closure_body.value).is_unit()
+        && !cx.typeck_results().expr_ty(&closure_body.value).is_unit()
     {
-        if let Some(map_mutated_vars) = mutated_variables(closure_body.value, cx)
+        if let Some(map_mutated_vars) = mutated_variables(&closure_body.value, cx)
             // A variable is used mutably inside of the closure. Suppress the lint.
             && !map_mutated_vars.is_empty()
         {

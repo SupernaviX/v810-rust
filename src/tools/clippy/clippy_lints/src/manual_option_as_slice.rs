@@ -1,13 +1,12 @@
 use clippy_config::Conf;
 use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::msrvs::Msrv;
-use clippy_utils::res::{MaybeDef, MaybeQPath, MaybeResPath};
+use clippy_utils::res::{MaybeDef as _, MaybeQPath as _, MaybeResPath as _};
 use clippy_utils::source::snippet_with_context;
 use clippy_utils::{as_some_pattern, is_none_pattern, msrvs, peel_hir_expr_refs, sym};
 use rustc_errors::Applicability;
 use rustc_hir::{Arm, Expr, ExprKind, Pat, PatKind, QPath, is_range_literal};
-use rustc_lint::{LateContext, LateLintPass};
-use rustc_session::impl_lint_pass;
+use rustc_lint::{LateContext, LateLintPass, impl_lint_pass};
 use rustc_span::{Span, Symbol};
 
 declare_clippy_lint! {
@@ -48,7 +47,7 @@ pub struct ManualOptionAsSlice {
 
 impl ManualOptionAsSlice {
     pub fn new(conf: &Conf) -> Self {
-        Self { msrv: conf.msrv }
+        Self { msrv: conf.msrv.into() }
     }
 }
 
@@ -179,7 +178,7 @@ fn check_arms(cx: &LateContext<'_>, none_arm: &Arm<'_>, some_arm: &Arm<'_>) -> b
 fn returns_empty_slice(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
     match expr.kind {
         ExprKind::Path(_) => expr.res(cx).is_diag_item(cx, sym::default_fn),
-        ExprKind::Closure(cl) => is_empty_slice(cx, cx.tcx.hir_body(cl.body).value),
+        ExprKind::Closure(cl) => is_empty_slice(cx, &cx.tcx.hir_body(cl.body).value),
         _ => false,
     }
 }

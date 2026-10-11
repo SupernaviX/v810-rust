@@ -1,4 +1,4 @@
-use clippy_utils::res::{MaybeDef, MaybeQPath, MaybeResPath};
+use clippy_utils::res::{MaybeDef as _, MaybeQPath as _, MaybeResPath as _};
 use rustc_errors::Applicability;
 use rustc_hir::{Closure, Expr, ExprKind, HirId, StmtKind, UnOp};
 use rustc_lint::LateContext;
@@ -8,7 +8,7 @@ use rustc_span::Span;
 use super::NEEDLESS_CHARACTER_ITERATION;
 use super::utils::get_last_chain_binding_hir_id;
 use clippy_utils::diagnostics::span_lint_and_sugg;
-use clippy_utils::source::SpanExt;
+use clippy_utils::source::SpanExt as _;
 use clippy_utils::{peel_blocks, sym};
 
 fn peels_expr_ref<'a, 'tcx>(mut expr: &'a Expr<'tcx>) -> &'a Expr<'tcx> {
@@ -108,7 +108,7 @@ pub(super) fn check(cx: &LateContext<'_>, call_expr: &Expr<'_>, recv: &Expr<'_>,
         while let ExprKind::MethodCall(_, new_recv, _, _) = recv.kind {
             recv = new_recv;
         }
-        let body_expr = peel_blocks(body.value);
+        let body_expr = peel_blocks(&body.value);
 
         handle_expr(
             cx,

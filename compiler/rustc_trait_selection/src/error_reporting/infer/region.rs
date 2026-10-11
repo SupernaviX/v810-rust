@@ -8,14 +8,13 @@ use rustc_hir::def::{DefKind, Namespace};
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_hir::intravisit::Visitor;
 use rustc_hir::{self as hir, ParamName};
-use rustc_middle::bug;
 use rustc_middle::traits::ObligationCauseCode;
 use rustc_middle::ty::error::TypeError;
 use rustc_middle::ty::print::RegionHighlightMode;
 use rustc_middle::ty::{
     self, IsSuggestable, Region, Ty, TyCtxt, TypeVisitableExt as _, Upcast as _,
 };
-use rustc_span::{BytePos, ErrorGuaranteed, Span, Symbol, kw, sym};
+use rustc_span::{BytePos, ErrorGuaranteed, Span, Symbol, bug, kw, sym};
 use tracing::{debug, instrument};
 
 use super::ObligationCauseAsDiagArg;
@@ -73,10 +72,10 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                     RegionResolutionError::ConcreteFailure(origin, sub, sup) => {
                         if sub.is_placeholder() || sup.is_placeholder() {
                             self.report_placeholder_failure(generic_param_scope, origin, sub, sup)
-                                .emit()
+                                .emit_err()
                         } else {
                             self.report_concrete_failure(generic_param_scope, origin, sub, sup)
-                                .emit()
+                                .emit_err()
                         }
                     }
 
@@ -105,7 +104,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                                 sub_r,
                                 sup_r,
                             )
-                            .emit()
+                            .emit_err()
                         } else if sup_r.is_placeholder() {
                             self.report_placeholder_failure(
                                 generic_param_scope,
@@ -113,7 +112,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                                 sub_r,
                                 sup_r,
                             )
-                            .emit()
+                            .emit_err()
                         } else {
                             self.report_sub_sup_conflict(
                                 generic_param_scope,
@@ -148,7 +147,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                             sub_r,
                             sup_r,
                         )
-                        .emit()
+                        .emit_err()
                     }
 
                     RegionResolutionError::CannotNormalize(clause, origin) => {
@@ -157,7 +156,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                         self.tcx
                             .dcx()
                             .struct_span_err(origin.span(), format!("cannot normalize `{clause}`"))
-                            .emit()
+                            .emit_err()
                     }
                 }
             };
@@ -211,12 +210,17 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
         };
 
         // sort the errors by span, for better error message stability.
-        errors.sort_by_key(|u| match *u {
-            RegionResolutionError::ConcreteFailure(ref sro, _, _) => sro.span(),
-            RegionResolutionError::GenericBoundFailure(ref sro, _, _) => sro.span(),
-            RegionResolutionError::SubSupConflict(_, ref rvo, _, _, _, _, _) => rvo.span(),
-            RegionResolutionError::UpperBoundUniverseConflict(_, ref rvo, _, _, _) => rvo.span(),
-            RegionResolutionError::CannotNormalize(_, ref sro) => sro.span(),
+        errors.sort_by_key(|u| {
+            match *u {
+                RegionResolutionError::ConcreteFailure(ref sro, _, _) => sro.span(),
+                RegionResolutionError::GenericBoundFailure(ref sro, _, _) => sro.span(),
+                RegionResolutionError::SubSupConflict(_, ref rvo, _, _, _, _, _) => rvo.span(),
+                RegionResolutionError::UpperBoundUniverseConflict(_, ref rvo, _, _, _) => {
+                    rvo.span()
+                }
+                RegionResolutionError::CannotNormalize(_, ref sro) => sro.span(),
+            }
+            .lo_hi()
         });
         errors
     }
@@ -290,14 +294,14 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
             SubregionOrigin::CheckAssociatedTypeBounds { ref parent, .. } => {
                 self.note_region_origin(err, parent);
             }
-            SubregionOrigin::AscribeUserTypeProvePredicate(span) => {
+            SubregionOrigin::AscribeUserTypeProvePredicate(span, _) => {
                 RegionOriginNote::Plain { span, msg: msg!("...so that the where clause holds") }
                     .add_to_diag(err);
             }
             SubregionOrigin::SolverRegionConstraint(span) => {
                 RegionOriginNote::Plain {
                     span,
-                    msg: msg!("this diagnostic is currently WIP while -Zassumptions-on-binders is incomplete"),
+                    msg: msg!("...so that a higher-ranked lifetime bound can be satisfied"),
                 }
                 .add_to_diag(err);
             }
@@ -430,7 +434,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                 );
                 self.dcx().create_err(FulfillReqLifetime {
                     span,
-                    ty: self.resolve_vars_if_possible(ty),
+                    ty: self.deeply_resolve_ignoring_regions(ty),
                     note,
                 })
             }
@@ -450,9 +454,9 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                     && let Some(def_id) = preds.principal_def_id()
                 {
                     for (clause, span) in
-                        self.tcx.predicates_of(def_id).instantiate_identity(self.tcx).into_iter()
+                        self.tcx.clauses_of(def_id).instantiate_identity(self.tcx).into_iter()
                     {
-                        if let ty::ClauseKind::TypeOutlives(ty::OutlivesPredicate(a, b)) =
+                        if let ty::ClauseKind::TypeOutlives(ty::OutlivesClause(a, b)) =
                             clause.kind().skip_binder()
                             && let ty::Param(param) = a.kind()
                             && param.name == kw::SelfUpper
@@ -495,7 +499,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                 );
                 self.dcx().create_err(RefLongerThanData {
                     span,
-                    ty: self.resolve_vars_if_possible(ty),
+                    ty: self.deeply_resolve_ignoring_regions(ty),
                     notes: pointer_valid.into_iter().chain(data_valid).collect(),
                 })
             }
@@ -547,7 +551,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                 );
                 err
             }
-            SubregionOrigin::AscribeUserTypeProvePredicate(span) => {
+            SubregionOrigin::AscribeUserTypeProvePredicate(span, _) => {
                 let instantiated = note_and_explain::RegionExplanation::new(
                     self.tcx,
                     generic_param_scope,
@@ -569,14 +573,9 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                     notes: instantiated.into_iter().chain(must_outlive).collect(),
                 })
             }
-            SubregionOrigin::SolverRegionConstraint(span) => {
-                let mut d = self.dcx().struct_span_err(
-                    span,
-                    "unsatisfied lifetime constraint from -Zassumptions-on-binders :3",
-                );
-                d.note("meoow :c");
-                d
-            }
+            SubregionOrigin::SolverRegionConstraint(span) => self
+                .dcx()
+                .struct_span_err(span, "higher-ranked lifetime bound could not be satisfied"),
         };
         if sub.is_error() || sup.is_error() {
             err.downgrade_to_delayed_bug();
@@ -610,11 +609,15 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
 
         let Ok(trait_predicates) = self
             .tcx
-            .explicit_predicates_of(trait_item_def_id)
+            .explicit_clauses_of(trait_item_def_id)
             .instantiate_own(self.tcx, trait_item_args)
-            .map(|(pred, _)| {
-                let pred = pred.skip_norm_wip();
-                if pred.is_suggestable(self.tcx, false) { Ok(pred.to_string()) } else { Err(()) }
+            .map(|(clause, _)| {
+                let clause = clause.skip_norm_wip();
+                if clause.is_suggestable(self.tcx, false) {
+                    Ok(clause.to_string())
+                } else {
+                    Err(())
+                }
             })
             .collect::<Result<Vec<_>, ()>>()
         else {
@@ -706,7 +709,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
         sub: Region<'tcx>,
     ) -> ErrorGuaranteed {
         self.construct_generic_bound_failure(generic_param_scope, span, origin, bound_kind, sub)
-            .emit()
+            .emit_err()
     }
 
     pub fn construct_generic_bound_failure(
@@ -1053,7 +1056,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
             return if sub_region.is_error() | sup_region.is_error() {
                 err.delay_as_bug()
             } else {
-                err.emit()
+                err.emit_err()
             };
         }
 
@@ -1070,7 +1073,11 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
         );
 
         self.note_region_origin(&mut err, &sub_origin);
-        if sub_region.is_error() | sup_region.is_error() { err.delay_as_bug() } else { err.emit() }
+        if sub_region.is_error() | sup_region.is_error() {
+            err.delay_as_bug()
+        } else {
+            err.emit_err()
+        }
     }
 
     fn report_inference_failure(&self, var_origin: RegionVariableOrigin<'tcx>) -> Diag<'_> {
@@ -1378,6 +1385,15 @@ fn suggest_precise_capturing<'tcx>(
         hir::GenericBound::Use(args, span) => Some((args, span)),
         _ => None,
     }) {
+        // '_ is an elision marker, not a lifetime name, so it cannot appear twice in a
+        // capture list. the branch for opaques with no use<..> yet already skips captured
+        // lifetimes; do the same here to avoid suggesting use<'_, '_>.
+        if args.iter().any(|arg| {
+            matches!(arg, hir::PreciseCapturingArg::Lifetime(lt) if lt.ident.name == new_lifetime)
+        }) {
+            return;
+        }
+
         let last_lifetime_span = args.iter().rev().find_map(|arg| match arg {
             hir::PreciseCapturingArg::Lifetime(lt) => Some(lt.ident.span),
             _ => None,

@@ -382,11 +382,11 @@ regexes! {
     // Windows file paths
     r"\\"                           => "/",
     // erase Rust stdlib path
-    "[^ \n`]*/(rust[^/]*|checkout)/library/" => "RUSTLIB/",
+    "[^ \n`\"\']*/library/(core|alloc|std|panic_(unwind|abort))/src" => "RUSTLIB/$1/src",
     // erase platform file paths
-    r"\bsys/([a-z_]+)/[a-z]+\b"     => "sys/$1/PLATFORM",
+    r"/sys/([a-z_]+)/[a-z]+\b"      => "/sys/$1/PLATFORM",
     // erase paths into the crate registry
-    r"[^ ]*/\.?cargo/registry/.*/(.*\.rs)"  => "CARGO_REGISTRY/.../$1",
+    "[^ \n`\"\']*/\\.?cargo/registry/.*/(.*\\.rs)" => "CARGO_REGISTRY/.../$1",
     // remove time print from GenMC estimation mode output.
     "\nExpected verification time: .* ± .*" => "\nExpected verification time: [MEAN] ± [SD]",
 }
@@ -413,7 +413,7 @@ fn ui(
         WithoutDeps => false,
     };
     run_tests(mode, path, target, with_dependencies, tmpdir)
-        .with_context(|| format!("ui tests in {path} for {target} failed"))
+        .with_context(|| format!("{mode} ui tests in {path} for {target} failed"))
 }
 
 fn get_host() -> String {
@@ -440,7 +440,10 @@ fn main() -> Result<()> {
 
     ui(Mode::Pass { native: false }, "tests/pass", &target, WithoutDeps, tmpdir.path())?;
     ui(Mode::Pass { native: false }, "tests/pass-dep", &target, WithDeps, tmpdir.path())?;
-    if target == host {
+    if target == host
+        // Skip native test execution during bootstrap as the sysroot is not quite right there.
+        && env::var("RUSTC_STAGE").ok().is_none_or(|s| s != "0")
+    {
         ui(Mode::Pass { native: true }, "tests/pass", &target, WithoutDeps, tmpdir.path())?;
         ui(Mode::Pass { native: true }, "tests/pass-dep", &target, WithDeps, tmpdir.path())?;
     }

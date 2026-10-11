@@ -31,8 +31,8 @@ pub(super) mod netc {
         IP_DROP_MEMBERSHIP, IP_MULTICAST_LOOP, IP_MULTICAST_TTL, IP_TTL, IPPROTO_IP, IPPROTO_IPV6,
         IPV6_ADD_MEMBERSHIP, IPV6_DROP_MEMBERSHIP, IPV6_MULTICAST_LOOP, IPV6_V6ONLY, SO_BROADCAST,
         SO_RCVTIMEO, SO_SNDTIMEO, SOCK_DGRAM, SOCK_STREAM, SOCKADDR as sockaddr,
-        SOCKADDR_STORAGE as sockaddr_storage, SOL_SOCKET, bind, connect, freeaddrinfo, getpeername,
-        getsockname, getsockopt, listen, setsockopt,
+        SOCKADDR_STORAGE as sockaddr_storage, SOL_SOCKET, WSAEMSGSIZE as EMSGSIZE, bind, connect,
+        freeaddrinfo, getpeername, getsockname, getsockopt, listen, setsockopt,
     };
 
     #[allow(non_camel_case_types)]
@@ -88,7 +88,7 @@ pub(super) mod netc {
     }
 
     pub unsafe fn send(socket: SOCKET, buf: *const c_void, len: c_int, flags: c_int) -> c_int {
-        unsafe { c::send(socket, buf.cast::<u8>(), len, flags) }
+        unsafe { c::send(socket, buf.cast::<i8>(), len, flags) }
     }
     pub unsafe fn sendto(
         socket: SOCKET,
@@ -98,7 +98,7 @@ pub(super) mod netc {
         addr: *const SOCKADDR,
         addrlen: c_int,
     ) -> c_int {
-        unsafe { c::sendto(socket, buf.cast::<u8>(), len, flags, addr, addrlen) }
+        unsafe { c::sendto(socket, buf.cast::<i8>(), len, flags, addr, addrlen) }
     }
     pub unsafe fn getaddrinfo(
         node: *const c_char,
@@ -309,7 +309,7 @@ impl Socket {
     ) -> io::Result<(usize, SocketAddr)> {
         let mut storage = unsafe { mem::zeroed::<c::SOCKADDR_STORAGE>() };
         let mut addrlen = size_of_val(&storage) as netc::socklen_t;
-        let length = cmp::min(buf.len(), <wrlen_t>::MAX as usize) as wrlen_t;
+        let length = cmp::min(buf.len(), super::MAX_SEND_LEN) as wrlen_t;
 
         // On unix when a socket is shut down all further reads return 0, so we
         // do the same on windows to map a shut down socket to returning EOF.

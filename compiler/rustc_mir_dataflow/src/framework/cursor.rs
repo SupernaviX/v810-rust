@@ -134,7 +134,7 @@ where
         if A::Direction::IS_FORWARD {
             self.seek_to_block_entry(block)
         } else {
-            self.seek_after(Location { block, statement_index: 0 }, Effect::Primary)
+            self.seek_after(block.start_location(), Effect::Primary)
         }
     }
 
@@ -195,28 +195,20 @@ where
         debug_assert_eq!(target.block, self.pos.block);
 
         let block_data = &self.body[target.block];
-        #[rustfmt::skip]
-        let next_effect = if A::Direction::IS_FORWARD {
-            self.pos.curr_effect_index.map_or_else(
-                || Effect::Early.at_index(0),
-                EffectIndex::next_in_forward_order,
-            )
-        } else {
-            self.pos.curr_effect_index.map_or_else(
-                || Effect::Early.at_index(block_data.statements.len()),
-                EffectIndex::next_in_backward_order,
-            )
-        };
-
+        let next_effect = self.pos.curr_effect_index.map_or_else(
+            || A::Direction::first_index(block_data),
+            |idx| A::Direction::next_index(idx),
+        );
         let target_effect_index = effect.at_index(target.statement_index);
 
-        A::Direction::apply_effects_in_range(
-            &self.results.analysis,
-            &mut self.state,
-            target.block,
-            block_data,
-            next_effect..=target_effect_index,
-        );
+        let mut idx = next_effect;
+        loop {
+            self.results.analysis.apply_effect(&mut self.state, target.block, block_data, idx);
+            if idx == target_effect_index {
+                break;
+            }
+            idx = A::Direction::next_index(idx);
+        }
 
         self.pos =
             CursorPosition { block: target.block, curr_effect_index: Some(target_effect_index) };

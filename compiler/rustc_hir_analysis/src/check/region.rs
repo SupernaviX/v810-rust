@@ -15,9 +15,10 @@ use rustc_hir::def_id::LocalDefId;
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{Arm, Block, Expr, LetStmt, Pat, PatKind, Stmt};
 use rustc_index::Idx;
+use rustc_lint_defs::LintId;
+use rustc_lint_defs::builtin::TAIL_EXPR_DROP_ORDER;
 use rustc_middle::middle::region::*;
 use rustc_middle::ty::TyCtxt;
-use rustc_session::lint;
 use rustc_span::Spanned;
 use tracing::debug;
 
@@ -146,10 +147,7 @@ fn resolve_block<'tcx>(
             let edition = blk.span.edition();
             let terminating = edition.at_least_rust_2024();
             if !terminating
-                && !visitor
-                    .tcx
-                    .skippable_lints(())
-                    .contains(&lint::LintId::of(lint::builtin::TAIL_EXPR_DROP_ORDER))
+                && !visitor.tcx.skippable_lints(()).contains(&LintId::of(TAIL_EXPR_DROP_ORDER))
             {
                 // If this temporary scope will be changing once the codebase adopts Rust 2024,
                 // and we are linting about possible semantic changes that would result,
@@ -587,9 +585,7 @@ fn resolve_local<'tcx>(
             | PatKind::TupleStruct(_, subpats, _)
             | PatKind::Tuple(subpats, _) => subpats.iter().any(|p| is_binding_pat(p)),
 
-            PatKind::Box(subpat) | PatKind::Deref(subpat) | PatKind::Guard(subpat, _) => {
-                is_binding_pat(subpat)
-            }
+            PatKind::Deref(subpat) | PatKind::Guard(subpat, _) => is_binding_pat(subpat),
 
             PatKind::Ref(_, _, _)
             | PatKind::Binding(hir::BindingMode(hir::ByRef::No, _), ..)
@@ -766,7 +762,7 @@ impl<'tcx> Visitor<'tcx> for ScopeResolutionVisitor<'tcx> {
         resolve_block(self, b, false);
     }
 
-    fn visit_body(&mut self, body: &hir::Body<'tcx>) {
+    fn visit_body(&mut self, body: &'tcx hir::Body<'tcx>) {
         let body_id = body.id();
         let owner_id = self.tcx.hir_body_owner_def_id(body_id);
 
@@ -787,7 +783,7 @@ impl<'tcx> Visitor<'tcx> for ScopeResolutionVisitor<'tcx> {
                 }
 
                 // The body of the every fn is a root scope.
-                resolve_expr(this, body.value, true);
+                resolve_expr(this, &body.value, true);
             } else {
                 // All bodies have an outer temporary drop scope, but temporaries
                 // and `super let` bindings in constant initializers may be extended
@@ -812,7 +808,7 @@ impl<'tcx> Visitor<'tcx> for ScopeResolutionVisitor<'tcx> {
                     local_id: body.value.hir_id.local_id,
                     data: ScopeData::Destruction,
                 });
-                resolve_local(this, None, Some(body.value), LetKind::Regular);
+                resolve_local(this, None, Some(&body.value), LetKind::Regular);
             }
         })
     }

@@ -17,8 +17,7 @@ use rustc_middle::traits::ObligationCause;
 use rustc_middle::ty::{
     self, GenericArgs, GenericArgsRef, GenericParamDefKind, Ty, TypeVisitableExt, Unnormalized,
 };
-use rustc_middle::{bug, span_bug};
-use rustc_span::{ErrorGuaranteed, Ident, Span, Symbol};
+use rustc_span::{ErrorGuaranteed, Ident, Span, Symbol, bug, span_bug};
 use rustc_trait_selection::traits::query::evaluate_obligation::InferCtxtExt;
 use rustc_trait_selection::traits::{self, NormalizeExt};
 use tracing::{debug, instrument};
@@ -440,15 +439,15 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         //
         // Note that as the method comes from a trait, it should not have
         // any late-bound regions appearing in its bounds.
-        let bounds = self.tcx.predicates_of(def_id).instantiate(self.tcx, args);
+        let bounds = self.tcx.clauses_of(def_id).instantiate(self.tcx, args);
 
         let predicates_cause = obligation.cause.clone();
         let mut normalization_obligations = PredicateObligations::new();
         obligations.extend(traits::predicates_for_generics(
             move |_, _| predicates_cause.clone(),
-            |pred| {
+            |clause| {
                 let InferOk { value: pred, obligations: o } =
-                    self.at(&obligation.cause, self.param_env).normalize(pred);
+                    self.at(&obligation.cause, self.param_env).normalize(clause);
                 normalization_obligations.extend(o);
                 assert!(!pred.has_escaping_bound_vars());
                 pred

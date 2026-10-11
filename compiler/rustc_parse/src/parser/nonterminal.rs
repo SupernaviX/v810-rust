@@ -139,7 +139,7 @@ impl<'a> Parser<'a> {
                     this.parse_block().map(|block| WithTokens::new(block))
                 })?))
             }
-            NonterminalKind::Stmt => match self.parse_stmt(ForceCollect::Yes)? {
+            NonterminalKind::Stmt => match self.parse_stmt_nonterminal(ForceCollect::Yes) {
                 Some(stmt) => Ok(ParseNtResult::Stmt(Box::new(stmt))),
                 None => {
                     Err(self.dcx().create_err(UnexpectedNonterminal::Statement(self.token.span)))
@@ -174,9 +174,9 @@ impl<'a> Parser<'a> {
             })?)),
             // This could be handled like a token, since it is one.
             NonterminalKind::Ident => {
-                if let Some((ident, is_raw)) = get_macro_ident(&self.token) {
+                if let Some((ident, kind)) = get_macro_ident(&self.token) {
                     self.bump();
-                    Ok(ParseNtResult::Ident(ident, is_raw))
+                    Ok(ParseNtResult::Ident(ident, kind))
                 } else {
                     Err(self.dcx().create_err(UnexpectedNonterminal::Ident {
                         span: self.token.span,
@@ -220,6 +220,6 @@ impl<'a> Parser<'a> {
 
 /// The token is an identifier, but not `_`.
 /// We prohibit passing `_` to macros expecting `ident` for now.
-fn get_macro_ident(token: &Token) -> Option<(Ident, token::IdentIsRaw)> {
+fn get_macro_ident(token: &Token) -> Option<(Ident, token::IdentKind)> {
     token.ident().filter(|(ident, _)| ident.name != kw::Underscore)
 }

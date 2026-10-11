@@ -3,6 +3,7 @@
 //! [`PointerCoercion::Unsize`]: `rustc_middle::ty::adjustment::PointerCoercion::Unsize`
 
 use rustc_codegen_ssa::base::validate_trivial_unsize;
+use rustc_middle::ty::consts::ConstExt;
 use rustc_middle::ty::layout::HasTypingEnv;
 use rustc_middle::ty::print::{with_no_trimmed_paths, with_no_visible_paths};
 
@@ -190,7 +191,7 @@ pub(crate) fn size_and_align_of<'tcx>(
             // The info in this case is the length of the str, so the size is that
             // times the unit size.
             (
-                fx.bcx.ins().imul_imm(info.unwrap(), unit.size.bytes() as i64),
+                fx.bcx.ins().imul_imm_u(info.unwrap(), unit.size.bytes() as i64),
                 fx.bcx.ins().iconst(fx.pointer_type, unit.align.bytes() as i64),
             )
         }
@@ -282,7 +283,7 @@ pub(crate) fn size_and_align_of<'tcx>(
             // emulated via the semi-standard fast bit trick:
             //
             //   `(size + (align-1)) & -align`
-            let addend = fx.bcx.ins().iadd_imm(full_align, -1);
+            let addend = fx.bcx.ins().iadd_imm_s(full_align, -1);
             let add = fx.bcx.ins().iadd(full_size, addend);
             let neg = fx.bcx.ins().ineg(full_align);
             let full_size = fx.bcx.ins().band(add, neg);

@@ -1,6 +1,6 @@
 use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::msrvs::{self, Msrv};
-use clippy_utils::res::{MaybeDef, MaybeResPath, MaybeTypeckRes};
+use clippy_utils::res::{MaybeDef as _, MaybeResPath as _, MaybeTypeckRes as _};
 use clippy_utils::sym;
 use rustc_errors::Applicability;
 use rustc_hir::{Body, Closure, Expr, ExprKind};
@@ -49,7 +49,7 @@ pub(super) fn check_filter_or_flat_map(
                 {
                     method.ident.name == sym::ok
                         && receiver.res_local_id() == Some(param.pat.hir_id)
-                        && cx.ty_based_def(*value).is_diag_item(cx, sym::result_ok_method)
+                        && cx.ty_based_def(value).is_diag_item(cx, sym::result_ok_method)
                 } else {
                     false
                 }

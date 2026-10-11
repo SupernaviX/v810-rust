@@ -1,8 +1,7 @@
 // regression test for #133808.
 //@ aux-build:non_local_type_const.rs
 
-#![feature(generic_const_exprs)]
-#![feature(min_generic_const_args)]
+#![feature(gca_min_const_items, gca_macroless_args, generic_const_exprs)]
 #![allow(incomplete_features)]
 #![crate_type = "lib"]
 extern crate non_local_type_const;

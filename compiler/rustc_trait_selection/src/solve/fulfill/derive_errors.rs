@@ -1,6 +1,6 @@
 use std::ops::ControlFlow;
 
-use rustc_hir::LangItem;
+use rustc_attr_ir::lang_items::LangItem;
 use rustc_infer::infer::InferCtxt;
 use rustc_infer::traits::solve::{CandidateSource, GoalSource, MaybeCause};
 use rustc_infer::traits::{
@@ -10,8 +10,8 @@ use rustc_infer::traits::{
 use rustc_middle::traits::query::NoSolution;
 use rustc_middle::ty::error::{ExpectedFound, TypeError};
 use rustc_middle::ty::{self, Ty, TyCtxt};
-use rustc_middle::{bug, span_bug};
 use rustc_next_trait_solver::solve::{GoalEvaluation, MaybeInfo, SolverDelegateEvalExt as _};
+use rustc_span::{bug, span_bug};
 use tracing::{instrument, trace};
 
 use crate::solve::delegate::SolverDelegate;
@@ -66,6 +66,9 @@ pub(super) fn fulfillment_error_for_no_solution<'tcx>(
             let expected_found = ExpectedFound::new(b, a);
             FulfillmentErrorCode::Subtype(expected_found, TypeError::Sorts(expected_found))
         }
+        ty::PredicateKind::Clause(
+            ty::ClauseKind::RegionOutlives(_) | ty::ClauseKind::TypeOutlives(_),
+        ) if infcx.tcx.assumptions_on_binders() => FulfillmentErrorCode::Outlives,
         ty::PredicateKind::Clause(_)
         | ty::PredicateKind::DynCompatible(_)
         | ty::PredicateKind::Ambiguous => {
@@ -118,17 +121,16 @@ pub(super) fn fulfillment_error_for_stalled<'tcx>(
                 false,
             ),
             Ok(GoalEvaluation { certainty: Certainty::Yes, .. }) => {
-                span_bug!(
-                    root_obligation.cause.span,
-                    "did not expect successful goal when collecting ambiguity errors for `{:?}`",
-                    infcx.resolve_vars_if_possible(root_obligation.predicate),
-                )
+                // FIXME: We should ICE here. See the following links for details
+                // - <https://rust-lang.zulipchat.com/#narrow/channel/144729-t-types/topic/resolving.20equal.20regions/near/623484902>
+                // - <https://github.com/rust-lang/rust/issues/161669>
+                (FulfillmentErrorCode::Ambiguity { overflow: None }, false)
             }
             Err(_) => {
                 span_bug!(
                     root_obligation.cause.span,
                     "did not expect selection error when collecting ambiguity errors for `{:?}`",
-                    infcx.resolve_vars_if_possible(root_obligation.predicate),
+                    infcx.deeply_resolve_ignoring_regions(root_obligation.predicate),
                 )
             }
         }
@@ -145,24 +147,13 @@ pub(super) fn fulfillment_error_for_stalled<'tcx>(
     }
 }
 
-pub(super) fn fulfillment_error_for_overflow<'tcx>(
-    infcx: &InferCtxt<'tcx>,
-    root_obligation: PredicateObligation<'tcx>,
-) -> FulfillmentError<'tcx> {
-    FulfillmentError {
-        obligation: find_best_leaf_obligation(infcx, &root_obligation, true),
-        code: FulfillmentErrorCode::Ambiguity { overflow: Some(true) },
-        root_obligation,
-    }
-}
-
 #[instrument(level = "debug", skip(infcx), ret)]
 fn find_best_leaf_obligation<'tcx>(
     infcx: &InferCtxt<'tcx>,
     obligation: &PredicateObligation<'tcx>,
     consider_ambiguities: bool,
 ) -> PredicateObligation<'tcx> {
-    let obligation = infcx.resolve_vars_if_possible(obligation.clone());
+    let obligation = infcx.deeply_resolve_ignoring_regions(obligation.clone());
     // FIXME: we use a probe here as the `BestObligation` visitor does not
     // check whether it uses candidates which get shadowed by where-bounds.
     //
@@ -223,20 +214,16 @@ impl<'tcx> BestObligation<'tcx> {
                 // We always handle rigid alias candidates separately as we may not add them for
                 // aliases whose trait bound doesn't hold.
                 candidates.retain(|c| !matches!(c.kind(), inspect::ProbeKind::RigidAlias { .. }));
-                // If we have >1 candidate, one may still be due to "boring" reasons, like
-                // an alias-relate that failed to hold when deeply evaluated. We really
-                // don't care about reasons like this.
+                // If there are multiple candidates, we can still recurse into a single one if all
+                // others fail due to boring reasons. Currently that's if we fail to normalize
+                // while considering the candidate.
                 if candidates.len() > 1 {
                     candidates.retain(|candidate| {
                         goal.infcx().probe(|_| {
-                            candidate.instantiate_nested_goals(self.span()).iter().any(
+                            !candidate.instantiate_nested_goals(self.span()).iter().any(
                                 |nested_goal| {
-                                    matches!(
-                                        nested_goal.source(),
-                                        GoalSource::ImplWhereBound
-                                            | GoalSource::AliasBoundConstCondition
-                                            | GoalSource::AliasWellFormed
-                                    ) && nested_goal.result().is_err()
+                                    nested_goal.source() == GoalSource::Normalization
+                                        && nested_goal.result().is_err()
                                 },
                             )
                         })
@@ -302,7 +289,7 @@ impl<'tcx> BestObligation<'tcx> {
         if let ty::Alias(_, alias) = *self_ty.kind() {
             let infer_term = goal.infcx().next_ty_var(self.obligation.cause.span);
             let pred =
-                ty::ProjectionPredicate { projection_term: alias.into(), term: infer_term.into() };
+                ty::ProjectionClause { projection_term: alias.into(), term: infer_term.into() };
             let obligation =
                 Obligation::new(tcx, self.obligation.cause.clone(), goal.goal().param_env, pred);
             self.with_derived_obligation(obligation, |this| {
@@ -453,15 +440,15 @@ impl<'tcx> ProofTreeVisitor<'tcx> for BestObligation<'tcx> {
             ty::PredicateKind::Clause(ty::ClauseKind::Trait(trait_pred)) => {
                 ChildMode::Trait(pred.kind().rebind(trait_pred))
             }
-            ty::PredicateKind::Clause(ty::ClauseKind::HostEffect(host_pred)) => {
-                ChildMode::Host(pred.kind().rebind(host_pred))
+            ty::PredicateKind::Clause(ty::ClauseKind::HostEffect(host_clause)) => {
+                ChildMode::Host(pred.kind().rebind(host_clause))
             }
             ty::PredicateKind::Clause(ty::ClauseKind::Projection(projection))
                 if projection.projection_term.kind.is_trait_projection() =>
             {
-                ChildMode::Trait(pred.kind().rebind(ty::TraitPredicate {
+                ChildMode::Trait(pred.kind().rebind(ty::TraitClause {
                     trait_ref: projection.projection_term.trait_ref(tcx),
-                    polarity: ty::PredicatePolarity::Positive,
+                    polarity: ty::ClausePolarity::Positive,
                 }))
             }
             ty::PredicateKind::Clause(ty::ClauseKind::WellFormed(term)) => {
@@ -505,7 +492,7 @@ impl<'tcx> ProofTreeVisitor<'tcx> for BestObligation<'tcx> {
             match (child_mode, nested_goal.source()) {
                 (
                     ChildMode::Trait(_) | ChildMode::Host(_),
-                    GoalSource::Misc | GoalSource::TypeRelating | GoalSource::NormalizeGoal(_),
+                    GoalSource::Misc | GoalSource::Normalization,
                 ) => {
                     continue;
                 }
@@ -520,7 +507,7 @@ impl<'tcx> ProofTreeVisitor<'tcx> for BestObligation<'tcx> {
                     impl_where_bound_count += 1;
                 }
                 (
-                    ChildMode::Host(parent_host_pred),
+                    ChildMode::Host(parent_host_clause),
                     GoalSource::ImplWhereBound | GoalSource::AliasBoundConstCondition,
                 ) => {
                     obligation = make_obligation(derive_host_cause(
@@ -528,7 +515,7 @@ impl<'tcx> ProofTreeVisitor<'tcx> for BestObligation<'tcx> {
                         candidate.kind(),
                         self.obligation.cause.clone(),
                         impl_where_bound_count,
-                        parent_host_pred,
+                        parent_host_clause,
                     ));
                     impl_where_bound_count += 1;
                 }
@@ -552,11 +539,11 @@ enum ChildMode<'tcx> {
     // Try to derive an `ObligationCause::{ImplDerived,BuiltinDerived}`,
     // and skip all `GoalSource::Misc`, which represent useless obligations
     // such as alias-eq which may not hold.
-    Trait(ty::PolyTraitPredicate<'tcx>),
+    Trait(ty::PolyTraitClause<'tcx>),
     // Try to derive an `ObligationCause::{ImplDerived,BuiltinDerived}`,
     // and skip all `GoalSource::Misc`, which represent useless obligations
     // such as alias-eq which may not hold.
-    Host(ty::Binder<'tcx, ty::HostEffectPredicate<'tcx>>),
+    Host(ty::Binder<'tcx, ty::HostEffectClause<'tcx>>),
     // Skip trying to derive an `ObligationCause` from this obligation, and
     // report *all* sub-obligations as if they came directly from the parent
     // obligation.
@@ -568,7 +555,7 @@ fn derive_cause<'tcx>(
     candidate_kind: inspect::ProbeKind<TyCtxt<'tcx>>,
     mut cause: ObligationCause<'tcx>,
     idx: usize,
-    parent_trait_pred: ty::PolyTraitPredicate<'tcx>,
+    parent_trait_pred: ty::PolyTraitClause<'tcx>,
 ) -> ObligationCause<'tcx> {
     match candidate_kind {
         inspect::ProbeKind::TraitCandidate {
@@ -576,13 +563,13 @@ fn derive_cause<'tcx>(
             result: _,
         } => {
             if let Some((_, span)) =
-                tcx.predicates_of(impl_def_id).instantiate_identity(tcx).iter().nth(idx)
+                tcx.clauses_of(impl_def_id).instantiate_identity(tcx).iter().nth(idx)
             {
                 cause = cause.derived_cause(parent_trait_pred, |derived| {
                     ObligationCauseCode::ImplDerived(Box::new(traits::ImplDerivedCause {
                         derived,
                         impl_or_alias_def_id: impl_def_id,
-                        impl_def_predicate_index: Some(idx),
+                        impl_def_clause_index: Some(idx),
                         span,
                     }))
                 })
@@ -604,7 +591,7 @@ fn derive_host_cause<'tcx>(
     candidate_kind: inspect::ProbeKind<TyCtxt<'tcx>>,
     mut cause: ObligationCause<'tcx>,
     idx: usize,
-    parent_host_pred: ty::Binder<'tcx, ty::HostEffectPredicate<'tcx>>,
+    parent_host_clause: ty::Binder<'tcx, ty::HostEffectClause<'tcx>>,
 ) -> ObligationCause<'tcx> {
     match candidate_kind {
         inspect::ProbeKind::TraitCandidate {
@@ -612,7 +599,7 @@ fn derive_host_cause<'tcx>(
             result: _,
         } => {
             if let Some((_, span)) = tcx
-                .predicates_of(impl_def_id)
+                .clauses_of(impl_def_id)
                 .instantiate_identity(tcx)
                 .into_iter()
                 .chain(tcx.const_conditions(impl_def_id).instantiate_identity(tcx).into_iter().map(
@@ -620,7 +607,7 @@ fn derive_host_cause<'tcx>(
                         (
                             trait_ref.to_host_effect_clause(
                                 tcx,
-                                parent_host_pred.skip_binder().constness,
+                                parent_host_clause.skip_binder().constness,
                             ),
                             span,
                         )
@@ -629,7 +616,7 @@ fn derive_host_cause<'tcx>(
                 .nth(idx)
             {
                 cause =
-                    cause.derived_host_cause(parent_host_pred, |derived| {
+                    cause.derived_host_cause(parent_host_clause, |derived| {
                         ObligationCauseCode::ImplDerivedHost(Box::new(
                             traits::ImplDerivedHostCause { derived, impl_def_id, span },
                         ))
@@ -640,8 +627,8 @@ fn derive_host_cause<'tcx>(
             source: CandidateSource::BuiltinImpl(..),
             result: _,
         } => {
-            cause =
-                cause.derived_host_cause(parent_host_pred, ObligationCauseCode::BuiltinDerivedHost);
+            cause = cause
+                .derived_host_cause(parent_host_clause, ObligationCauseCode::BuiltinDerivedHost);
         }
         _ => {}
     };

@@ -1,5 +1,4 @@
-#![feature(import_trait_associated_functions)]
-#![feature(min_generic_const_args)]
+#![feature(import_trait_associated_functions, gca_min_const_items, gca_macroless_args)]
 #![allow(incomplete_features)]
 
 trait Trait {

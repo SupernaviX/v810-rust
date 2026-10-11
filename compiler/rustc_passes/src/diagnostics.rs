@@ -2,11 +2,10 @@ use std::io::Error;
 use std::path::{Path, PathBuf};
 
 use rustc_errors::codes::*;
-use rustc_errors::{
-    Diag, DiagCtxtHandle, DiagSymbolList, Diagnostic, EmissionGuarantee, Level, MultiSpan, msg,
-};
+use rustc_errors::{Diag, DiagCtxtHandle, DiagSymbolList, Diagnostic, Level, msg};
 use rustc_macros::{Diagnostic, Subdiagnostic};
-use rustc_middle::ty::{MainDefinition, Ty};
+use rustc_middle::middle::resolve::MainDefinition;
+use rustc_middle::ty::Ty;
 use rustc_span::{DUMMY_SP, Ident, Span, Symbol};
 
 use crate::check_attr::ProcMacroKind;
@@ -30,33 +29,6 @@ pub(crate) struct MixedExportNameAndNoMangle {
 }
 
 #[derive(Diagnostic)]
-#[diag("crate-level attribute should be an inner attribute")]
-pub(crate) struct OuterCrateLevelAttr {
-    #[subdiagnostic]
-    pub suggestion: OuterCrateLevelAttrSuggestion,
-}
-
-#[derive(Subdiagnostic)]
-#[multipart_suggestion("add a `!`", style = "verbose")]
-pub(crate) struct OuterCrateLevelAttrSuggestion {
-    #[suggestion_part(code = "!")]
-    pub bang_position: Span,
-}
-
-#[derive(Diagnostic)]
-#[diag("crate-level attribute should be in the root module")]
-pub(crate) struct InnerCrateLevelAttr;
-
-#[derive(Diagnostic)]
-#[diag("`#[non_exhaustive]` can't be used to annotate items with default field values")]
-pub(crate) struct NonExhaustiveWithDefaultFieldValues {
-    #[primary_span]
-    pub attr_span: Span,
-    #[label("this struct has default field values")]
-    pub defn_span: Span,
-}
-
-#[derive(Diagnostic)]
 #[diag("`#[doc(alias = \"...\")]` isn't allowed on {$location}")]
 pub(crate) struct DocAliasBadLocation<'a> {
     #[primary_span]
@@ -73,16 +45,8 @@ pub(crate) struct DocAliasNotAnAlias {
 }
 
 #[derive(Diagnostic)]
-#[diag("`#[doc({$attr_name} = \"...\")]` should be used on empty modules")]
-pub(crate) struct DocKeywordAttributeEmptyMod {
-    #[primary_span]
-    pub span: Span,
-    pub attr_name: &'static str,
-}
-
-#[derive(Diagnostic)]
-#[diag("`#[doc({$attr_name} = \"...\")]` should be used on modules")]
-pub(crate) struct DocKeywordAttributeNotMod {
+#[diag("`#[doc({$attr_name} = \"...\")]` should be used on anonymous constants")]
+pub(crate) struct DocKeywordAttributeNotAnonConst {
     #[primary_span]
     pub span: Span,
     pub attr_name: &'static str,
@@ -109,26 +73,6 @@ pub(crate) struct DocKeywordOnlyImpl {
 pub(crate) struct DocSearchUnboxInvalid {
     #[primary_span]
     pub span: Span,
-}
-
-#[derive(Diagnostic)]
-#[diag("conflicting doc inlining attributes")]
-#[help("remove one of the conflicting attributes")]
-pub(crate) struct DocInlineConflict {
-    #[primary_span]
-    pub spans: MultiSpan,
-}
-
-#[derive(Diagnostic)]
-#[diag("this attribute can only be applied to a `use` item")]
-#[note(
-    "read <https://doc.rust-lang.org/nightly/rustdoc/the-doc-attribute.html#inline-and-no_inline> for more information"
-)]
-pub(crate) struct DocInlineOnlyUse {
-    #[label("only applicable on `use` items")]
-    pub attr_span: Span,
-    #[label("not a `use` item")]
-    pub item_span: Span,
 }
 
 #[derive(Diagnostic)]
@@ -163,48 +107,6 @@ pub(crate) struct BothOptimizeNoneAndInline {
 }
 
 #[derive(Diagnostic)]
-#[diag("attribute should be applied to an `extern` block with non-Rust ABI")]
-#[warning(
-    "this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!"
-)]
-pub(crate) struct Link;
-
-#[derive(Diagnostic)]
-#[diag("#[rustc_legacy_const_generics] functions must only have const generics")]
-pub(crate) struct RustcLegacyConstGenericsOnly {
-    #[primary_span]
-    pub attr_span: Span,
-    #[label("non-const generic parameter")]
-    pub param_span: Span,
-}
-
-#[derive(Diagnostic)]
-#[diag("#[rustc_legacy_const_generics] must have one index for each generic parameter")]
-pub(crate) struct RustcLegacyConstGenericsIndex {
-    #[primary_span]
-    pub attr_span: Span,
-    #[label("generic parameters")]
-    pub generics_span: Span,
-}
-
-#[derive(Diagnostic)]
-#[diag("index exceeds number of arguments")]
-pub(crate) struct RustcLegacyConstGenericsIndexExceed {
-    #[primary_span]
-    #[label(
-        "there {$arg_count ->
-            [one] is
-            *[other] are
-        } only {$arg_count} {$arg_count ->
-            [one] argument
-            *[other] arguments
-        }"
-    )]
-    pub span: Span,
-    pub arg_count: usize,
-}
-
-#[derive(Diagnostic)]
 #[diag("conflicting representation hints", code = E0566)]
 pub(crate) struct ReprConflicting {
     #[primary_span]
@@ -214,15 +116,6 @@ pub(crate) struct ReprConflicting {
 #[derive(Diagnostic)]
 #[diag("conflicting representation hints", code = E0566)]
 pub(crate) struct ReprConflictingLint;
-
-#[derive(Diagnostic)]
-#[diag("attribute should be applied to a macro")]
-pub(crate) struct MacroOnlyAttribute {
-    #[primary_span]
-    pub attr_span: Span,
-    #[label("not a macro")]
-    pub span: Span,
-}
 
 #[derive(Diagnostic)]
 #[diag("couldn't read {$file}: {$error}")]
@@ -243,15 +136,6 @@ pub(crate) struct RustcAllowConstFnUnstable {
 }
 
 #[derive(Diagnostic)]
-#[diag("attribute should be applied to `#[repr(transparent)]` types")]
-pub(crate) struct RustcPubTransparent {
-    #[primary_span]
-    pub attr_span: Span,
-    #[label("not a `#[repr(transparent)]` type")]
-    pub span: Span,
-}
-
-#[derive(Diagnostic)]
 #[diag("attribute cannot be applied to a `async`, `gen` or `async gen` function")]
 pub(crate) struct RustcForceInlineCoro {
     #[primary_span]
@@ -260,27 +144,20 @@ pub(crate) struct RustcForceInlineCoro {
     pub span: Span,
 }
 
-#[derive(Diagnostic)]
-pub(crate) enum MacroExport {
-    #[diag("`#[macro_export]` has no effect on declarative macro definitions")]
-    #[note("declarative macros follow the same exporting rules as regular items")]
-    OnDeclMacro,
-}
-
 #[derive(Subdiagnostic)]
 pub(crate) enum UnusedNote {
     #[note("attribute `{$name}` with an empty list has no effect")]
     EmptyList { name: Symbol },
     #[note("attribute `{$name}` without any lints has no effect")]
     NoLints { name: Symbol },
-    #[note("`default_method_body_is_const` has been replaced with `const` on traits")]
-    DefaultMethodBodyConst,
     #[note(
         "the `linker_messages` and `linker_info` lints can only be controlled at the root of a crate that needs to be linked"
     )]
     LinkerMessagesBinaryCrateOnly,
     #[note("the `dead_code_pub_in_binary` lint has no effect in library crates")]
     NoEffectDeadCodePubInBinary,
+    #[note("`#[path]` is unused on this inline module")]
+    PathOnInlineModule,
 }
 
 #[derive(Diagnostic)]
@@ -308,17 +185,6 @@ pub(crate) struct InvalidMayDangle {
 }
 
 #[derive(Diagnostic)]
-#[diag("this `#[deprecated]` annotation has no effect")]
-pub(crate) struct DeprecatedAnnotationHasNoEffect {
-    #[suggestion(
-        "remove the unnecessary deprecation attribute",
-        applicability = "machine-applicable",
-        code = ""
-    )]
-    pub span: Span,
-}
-
-#[derive(Diagnostic)]
 #[diag("`#[panic_handler]` function required, but not found")]
 pub(crate) struct MissingPanicHandler;
 
@@ -343,26 +209,6 @@ pub(crate) struct MissingLangItem {
 }
 
 #[derive(Diagnostic)]
-#[diag(
-    "{$name ->
-    [panic_impl] `#[panic_handler]`
-    *[other] `{$name}` lang item
-} function is not allowed to have `#[track_caller]`"
-)]
-pub(crate) struct LangItemWithTrackCaller {
-    #[primary_span]
-    pub attr_span: Span,
-    pub name: Symbol,
-    #[label(
-        "{$name ->
-            [panic_impl] `#[panic_handler]`
-            *[other] `{$name}` lang item
-        } function is not allowed to have `#[track_caller]`"
-    )]
-    pub sig_span: Span,
-}
-
-#[derive(Diagnostic)]
 #[diag("duplicate diagnostic item in crate `{$crate_name}`: `{$name}`")]
 pub(crate) struct DuplicateDiagnosticItemInCrate {
     #[primary_span]
@@ -370,6 +216,20 @@ pub(crate) struct DuplicateDiagnosticItemInCrate {
     #[note("the diagnostic item is first defined here")]
     pub orig_span: Option<Span>,
     #[note("the diagnostic item is first defined in crate `{$orig_crate_name}`")]
+    pub different_crates: bool,
+    pub crate_name: Symbol,
+    pub orig_crate_name: Symbol,
+    pub name: Symbol,
+}
+
+#[derive(Diagnostic)]
+#[diag("duplicate canonical symbol in crate `{$crate_name}`: `{$name}`")]
+pub(crate) struct DuplicateCanonicalSymbolInCrate {
+    #[primary_span]
+    pub duplicate_span: Option<Span>,
+    #[note("the canonical symbol is first defined here")]
+    pub orig_span: Option<Span>,
+    #[note("the canonical symbol is first defined in crate `{$orig_crate_name}`")]
     pub different_crates: bool,
     pub crate_name: Symbol,
     pub orig_crate_name: Symbol,
@@ -400,7 +260,7 @@ pub(crate) struct AbiNe {
 
 #[derive(Diagnostic)]
 #[diag(
-    "`#[rustc_abi]` can only be applied to function items, type aliases, and associated functions"
+    "the `rustc_abi` attribute can only be applied to function items, type aliases, and associated functions"
 )]
 pub(crate) struct AbiInvalidAttribute {
     #[primary_span]
@@ -463,9 +323,9 @@ pub(crate) struct NoMainErr {
     pub add_teach_note: bool,
 }
 
-impl<'a, G: EmissionGuarantee> Diagnostic<'a, G> for NoMainErr {
+impl<'a> Diagnostic<'a> for NoMainErr {
     #[track_caller]
-    fn into_diag(self, dcx: DiagCtxtHandle<'a>, level: Level) -> Diag<'a, G> {
+    fn into_diag(self, dcx: DiagCtxtHandle<'a>, level: Level) -> Diag<'a> {
         let mut diag =
             Diag::new(dcx, level, msg!("`main` function not found in crate `{$crate_name}`"));
         diag.span(DUMMY_SP);
@@ -510,10 +370,10 @@ impl<'a, G: EmissionGuarantee> Diagnostic<'a, G> for NoMainErr {
         if self.add_teach_note {
             diag.note(msg!("if you don't know the basics of Rust, you can go look to the Rust Book to get started: https://doc.rust-lang.org/book/"));
         }
+
         diag
     }
 }
-
 pub(crate) struct DuplicateLangItem {
     pub local_span: Option<Span>,
     pub lang_item_name: Symbol,
@@ -529,9 +389,9 @@ pub(crate) struct DuplicateLangItem {
     pub(crate) duplicate: Duplicate,
 }
 
-impl<G: EmissionGuarantee> Diagnostic<'_, G> for DuplicateLangItem {
+impl Diagnostic<'_> for DuplicateLangItem {
     #[track_caller]
-    fn into_diag(self, dcx: DiagCtxtHandle<'_>, level: Level) -> Diag<'_, G> {
+    fn into_diag(self, dcx: DiagCtxtHandle<'_>, level: Level) -> Diag<'_> {
         let mut diag = Diag::new(
             dcx,
             level,
@@ -634,19 +494,17 @@ pub(crate) struct UselessAssignment<'a> {
 }
 
 #[derive(Diagnostic)]
-#[diag("`#[inline]` is ignored on externally exported functions")]
-#[help(
-    "externally exported functions are functions with `#[no_mangle]`, `#[export_name]`, or `#[linkage]`"
-)]
-pub(crate) struct InlineIgnoredForExported;
-
-#[derive(Diagnostic)]
 #[diag("transparent {$target} cannot have other repr hints", code = E0692)]
 pub(crate) struct TransparentIncompatible {
     #[primary_span]
     pub hint_spans: Vec<Span>,
     pub target: String,
 }
+
+#[derive(Diagnostic)]
+#[diag("`#[repr(..)]` attribute is specified more than once")]
+#[note("for consistency, only specify the representation once")]
+pub(crate) struct RepeatedRepr;
 
 #[derive(Diagnostic)]
 #[diag("deprecated attribute must be paired with either stable or unstable attribute", code = E0549)]
@@ -805,13 +663,13 @@ pub(crate) struct MissingConstErr {
 
 #[derive(Diagnostic)]
 #[diag(
-    "attribute `#[rustc_const_stable]` can only be applied to functions that are declared `#[stable]`"
+    "the `rustc_const_stable` attribute can only be applied to functions marked with the `stable` attribute"
 )]
 pub(crate) struct ConstStableNotStable {
     #[primary_span]
     pub fn_sig_span: Span,
     #[label("attribute specified here")]
-    pub const_span: Span,
+    pub path_span: Span,
 }
 
 #[derive(Diagnostic)]
@@ -994,6 +852,9 @@ pub(crate) struct UnnecessaryPartialStableFeature {
 #[note("see issue #55436 <https://github.com/rust-lang/rust/issues/55436> for more information")]
 pub(crate) struct IneffectiveUnstableImpl;
 
+#[diag("`#[unstable]` does not make this re-exported path unstable")]
+pub(crate) struct IneffectiveUnstableReexport;
+
 #[derive(Diagnostic)]
 #[diag("interrupt attribute not allowed here")]
 pub(crate) struct InterruptAttributeNotAllowed {
@@ -1063,13 +924,6 @@ pub(crate) enum UnexportableItem<'a> {
 }
 
 #[derive(Diagnostic)]
-#[diag("`eii_macro_for` is only valid on functions and statics")]
-pub(crate) struct EiiImplTarget {
-    #[primary_span]
-    pub span: Span,
-}
-
-#[derive(Diagnostic)]
 #[diag("`#[{$name}]` is unsafe to implement")]
 pub(crate) struct EiiImplRequiresUnsafe {
     #[primary_span]
@@ -1089,13 +943,13 @@ pub(crate) struct EiiImplRequiresUnsafeSuggestion {
 }
 
 #[derive(Diagnostic)]
-#[diag("`#[{$name}]` is not allowed to have `#[track_caller]`")]
-pub(crate) struct EiiWithTrackCaller {
+#[diag("`{$name}` is not unsafe to implement")]
+pub(crate) struct EiiImplCannotBeUnsafe {
     #[primary_span]
-    pub attr_span: Span,
+    pub impl_span: Span,
+    #[label("`unsafe` is not allowed here")]
+    pub unsafe_span: Span,
     pub name: Symbol,
-    #[label("`#[{$name}]` is not allowed to have `#[track_caller]`")]
-    pub sig_span: Span,
 }
 
 #[derive(Diagnostic)]
@@ -1154,14 +1008,6 @@ pub(crate) struct FunctionNotFoundInTrait {
 }
 
 #[derive(Diagnostic)]
-#[diag("functions names are duplicated")]
-#[note("all `#[rustc_must_implement_one_of]` arguments must be unique")]
-pub(crate) struct FunctionNamesDuplicated {
-    #[primary_span]
-    pub spans: Vec<Span>,
-}
-
-#[derive(Diagnostic)]
 #[diag("there is no parameter `{$argument_name}` on trait `{$trait_name}`")]
 pub(crate) struct UnknownFormatParameterForOnUnimplementedAttr {
     pub argument_name: Symbol,
@@ -1205,4 +1051,41 @@ pub(crate) struct OnTypeErrorMalformedFormatLiterals {
 )]
 pub(crate) struct OnTypeErrorNotExactlyOneGeneric {
     pub count: usize,
+}
+
+#[derive(Diagnostic)]
+#[diag("extern mutable statics are incompatible with the `linkage` attribute")]
+#[note(
+    "the `linkage` attribute on extern statics generates a symbol that contains the address of \
+    another static. Making the extern static mutable would allow changing the address, rather \
+    than the static the address is pointing to"
+)]
+pub(crate) struct StaticMutLinkage {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag("`const fn` are incompatible with the `linkage` attribute")]
+#[note("`const fn` may be called at compile time, which happens before linking")]
+pub(crate) struct ConstFnLinkage {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag("use of deprecated import through accidentally stabilized module `{$module}`")]
+pub(crate) struct RustcAtumSuggestion {
+    #[primary_span]
+    pub import_span: Span,
+    pub message: Symbol,
+    pub suggestion: Symbol,
+    pub module: Ident,
+    #[suggestion(
+        "{$message}",
+        code = "{suggestion}",
+        style = "verbose",
+        applicability = "machine-applicable"
+    )]
+    pub unstable_mod_span: Span,
 }
