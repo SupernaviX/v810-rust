@@ -258,6 +258,7 @@ impl AttributeKind {
             Inline(..) => false,
             InstructionSet(..) => false,
             InstrumentFn(..) => false,
+            Interrupt(..) => false,
             Lang(item) => item.link_name().is_some(),
             Link(..) => false,
             LinkName { .. } => false,
