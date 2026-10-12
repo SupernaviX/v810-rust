@@ -70,7 +70,6 @@ fn days_since_beta_promotion() -> u64 {
 static STABLE_TOOLS: &[(&str, &str)] = &[
     ("book", "src/doc/book"),
     ("nomicon", "src/doc/nomicon"),
-    ("reference", "src/doc/reference"),
     ("rust-by-example", "src/doc/rust-by-example"),
     ("edition-guide", "src/doc/edition-guide"),
 ];
