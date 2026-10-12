@@ -15,5 +15,5 @@ static FOO: [u8; 22] = *b"custom section content";
 // CHECK: @llvm.used = appending global [1 x ptr] [ptr @FOO], section "llvm.metadata"
 
 // Custom section
-// CHECK: !wasm.custom_sections = !{!3}
-// CHECK: !3 = !{!"foo", !"custom section content"}
+// CHECK: !wasm.custom_sections = !{!5}
+// CHECK: !5 = !{!"foo", !"custom section content"}

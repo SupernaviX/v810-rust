@@ -57,10 +57,6 @@
 //@ [WASM64] compile-flags: --target wasm64-unknown-unknown
 //@ [WASM64] needs-llvm-components: webassembly
 
-//@ revisions: CSKY
-//@ [CSKY] compile-flags: --target csky-unknown-linux-gnuabiv2
-//@ [CSKY] needs-llvm-components: csky
-
 //@ revisions: SPARC64 SPARC
 //@ [SPARC64] compile-flags: --target sparc64-unknown-linux-gnu
 //@ [SPARC64] needs-llvm-components: sparc
