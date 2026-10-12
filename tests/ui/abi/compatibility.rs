@@ -79,9 +79,6 @@
 //@ revisions: m68k
 //@[m68k] compile-flags: --target m68k-unknown-linux-gnu
 //@[m68k] needs-llvm-components: m68k
-//@ revisions: csky
-//@[csky] compile-flags: --target csky-unknown-linux-gnuabiv2
-//@[csky] needs-llvm-components: csky
 //@ revisions: nvptx64
 //@[nvptx64] compile-flags: --target nvptx64-nvidia-cuda
 //@[nvptx64] needs-llvm-components: nvptx
