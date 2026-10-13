@@ -10,9 +10,10 @@
 #![allow(internal_features)]
 #![allow(rustc::default_hash_types)]
 #![allow(rustc::potential_query_instability)]
+#![cfg_attr(bootstrap, feature(unwrap_infallible))]
 #![cfg_attr(test, feature(test))]
 #![deny(unsafe_op_in_unsafe_fn)]
-#![feature(allocator_api)]
+#![feature(allocator_ext)]
 #![feature(ascii_char)]
 #![feature(ascii_char_variants)]
 #![feature(auto_traits)]
@@ -24,7 +25,7 @@
 #![feature(map_try_insert)]
 #![feature(min_specialization)]
 #![feature(negative_impls)]
-#![feature(never_type)]
+#![feature(nonzero_internals)]
 #![feature(pattern_type_macro)]
 #![feature(pattern_types)]
 #![feature(ptr_alignment_type)]
@@ -33,7 +34,6 @@
 #![feature(thread_id_value)]
 #![feature(trusted_len)]
 #![feature(type_alias_impl_trait)]
-#![feature(unwrap_infallible)]
 // tidy-alphabetical-end
 
 // This allows derive macros to reference this crate
@@ -50,7 +50,6 @@ pub use hashbrown::hash_table;
 pub use rustc_index::static_assert_size;
 // Re-export some data-structure crates which are part of our public API.
 pub use {either, indexmap, smallvec, thin_vec};
-
 pub mod aligned;
 pub mod base_n;
 pub mod binary_search_util;
@@ -75,7 +74,6 @@ pub mod snapshot_map;
 pub mod sorted_map;
 pub mod sso;
 pub mod stable_hash;
-pub mod stack;
 pub mod steal;
 pub mod svh;
 pub mod sync;
@@ -87,7 +85,6 @@ pub mod unhash;
 pub mod union_find;
 pub mod unord;
 pub mod vec_cache;
-pub mod work_queue;
 
 mod atomic_ref;
 

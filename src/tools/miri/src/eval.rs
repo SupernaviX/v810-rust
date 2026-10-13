@@ -111,6 +111,8 @@ pub struct MiriConfig {
     pub set_env_vars: FxHashMap<String, String>,
     /// Command-line arguments passed to the interpreted program.
     pub args: Vec<String>,
+    /// The binary we pretend to be.
+    pub current_exe: Option<PathBuf>,
     /// The seed to use when non-determinism or randomness are required (e.g. ptr-to-int cast, `getrandom()`).
     pub seed: Option<u64>,
     /// The stacked borrows pointer ids to report about.
@@ -184,6 +186,7 @@ impl Default for MiriConfig {
             forwarded_env_vars: vec![],
             set_env_vars: FxHashMap::default(),
             args: vec![],
+            current_exe: None,
             seed: None,
             tracked_pointer_tags: FxHashSet::default(),
             tracked_alloc_ids: FxHashSet::default(),
@@ -458,11 +461,13 @@ fn call_main<'tcx>(
     // Call start function.
     match entry_type {
         MiriEntryFnType::Rustc(EntryFnType::Main { .. }) => {
+            let entry_sig = tcx.fn_sig(entry_id).no_bound_vars().unwrap();
+            let main_ret_ty = entry_sig.output();
+            let main_ret_ty = main_ret_ty.no_bound_vars().unwrap();
+
             let start_id = tcx.lang_items().start_fn().unwrap_or_else(|| {
                 tcx.dcx().fatal("could not find start lang item");
             });
-            let main_ret_ty = tcx.fn_sig(entry_id).no_bound_vars().unwrap().output();
-            let main_ret_ty = main_ret_ty.no_bound_vars().unwrap();
             let start_instance = ty::Instance::try_resolve(
                 tcx,
                 ecx.typing_env(),
@@ -484,8 +489,7 @@ fn call_main<'tcx>(
                 &[
                     ImmTy::from_scalar(
                         Scalar::from_pointer(main_ptr, ecx),
-                        // FIXME use a proper fn ptr type
-                        ecx.machine.layouts.const_raw_ptr,
+                        ecx.layout_of(Ty::new_fn_ptr(tcx, entry_sig)).unwrap(),
                     ),
                     argc,
                     argv,
@@ -510,8 +514,8 @@ fn call_main<'tcx>(
 }
 
 /// Evaluates the entry function specified by `entry_id`.
-/// Returns `Some(return_code)` if program execution completed.
-/// Returns `None` if an evaluation error occurred.
+/// Returns `Ok(())` if program execution completed with exit code 0.
+/// Returns `Err(code)` if an evaluation error occurred or the program returned a non-0 exit code.
 pub fn eval_entry<'tcx>(
     tcx: TyCtxt<'tcx>,
     entry_id: DefId,

@@ -1,9 +1,11 @@
+//@ revisions: old next
+//@ ignore-compare-mode-next-solver (explicit revisions)
+//@[next] compile-flags: -Znext-solver
 //@ check-pass
 //@ edition:2018
 //@ aux-crate:fn_header_aux=fn-header-aux.rs
 //@ ignore-backends: gcc
 
-#![feature(c_variadic)]
 #![feature(fn_delegation)]
 #![deny(unused_unsafe)]
 

@@ -2,16 +2,16 @@
 
 use rustc_abi::FieldIdx;
 use rustc_index::{Idx, IndexVec};
-use rustc_middle::bug;
 use rustc_middle::middle::region::{self, TempLifetime};
 use rustc_middle::mir::interpret::Scalar;
 use rustc_middle::mir::*;
 use rustc_middle::thir::*;
 use rustc_middle::ty::adjustment::PointerCoercion;
 use rustc_middle::ty::cast::{CastTy, mir_cast_kind};
+use rustc_middle::ty::consts::ConstExt;
 use rustc_middle::ty::util::IntTypeExt;
 use rustc_middle::ty::{self, Ty, UpvarArgs};
-use rustc_span::{DUMMY_SP, Span, Spanned};
+use rustc_span::{DUMMY_SP, Span, Spanned, bug};
 use tracing::debug;
 
 use crate::builder::expr::as_place::PlaceBase;
@@ -58,6 +58,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             ExprKind::Scope { region_scope, hir_id, value } => {
                 let region_scope = (region_scope, source_info);
                 this.in_scope(region_scope, LintLevel::Explicit(hir_id), |this| {
+                    this.push_coverage_point_for_expr(block, source_info, hir_id);
                     this.as_rvalue(block, scope, value)
                 })
             }
@@ -385,7 +386,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             | ExprKind::Match { .. }
             | ExprKind::If { .. }
             | ExprKind::NeverToAny { .. }
-            | ExprKind::Use { .. }
+            | ExprKind::ValueExpr { .. }
             | ExprKind::Borrow { .. }
             | ExprKind::RawBorrow { .. }
             | ExprKind::Adt { .. }
@@ -600,7 +601,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             debug!(?kind, "check_constness");
             match kind {
                 &ExprKind::ValueTypeAscription { source: eid, user_ty: _, user_ty_span: _ }
-                | &ExprKind::Use { source: eid }
+                | &ExprKind::ValueExpr { source: eid }
                 | &ExprKind::PointerCoercion {
                     cast: PointerCoercion::Unsize,
                     source: eid,
@@ -735,7 +736,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
 
     // Helper to get a `-1` value of the appropriate type
     fn neg_1_literal(&mut self, span: Span, ty: Ty<'tcx>) -> Operand<'tcx> {
-        let typing_env = ty::TypingEnv::fully_monomorphized();
+        let typing_env = self.typing_env();
         let size = self.tcx.layout_of(typing_env.as_query_input(ty)).unwrap().size;
         let literal = Const::from_bits(self.tcx, size.unsigned_int_max(), typing_env, ty);
 
@@ -745,7 +746,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     // Helper to get the minimum value of the appropriate type
     fn minval_literal(&mut self, span: Span, ty: Ty<'tcx>) -> Operand<'tcx> {
         assert!(ty.is_signed());
-        let typing_env = ty::TypingEnv::fully_monomorphized();
+        let typing_env = self.typing_env();
         let bits = self.tcx.layout_of(typing_env.as_query_input(ty)).unwrap().size.bits();
         let n = 1 << (bits - 1);
         let literal = Const::from_bits(self.tcx, n, typing_env, ty);

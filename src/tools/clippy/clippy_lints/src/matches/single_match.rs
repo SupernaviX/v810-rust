@@ -1,6 +1,6 @@
 use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::source::{
-    SpanExt, expr_block, snippet, snippet_block_with_context, snippet_with_applicability, snippet_with_context,
+    SpanExt as _, expr_block, snippet, snippet_block_with_context, snippet_with_applicability, snippet_with_context,
 };
 use clippy_utils::ty::{implements_trait, peel_and_count_ty_refs};
 use clippy_utils::{is_lint_allowed, is_unit_expr, peel_blocks, peel_hir_pat_refs, peel_n_hir_expr_refs, sym};
@@ -11,6 +11,7 @@ use rustc_hir::def::{DefKind, Res};
 use rustc_hir::intravisit::{Visitor, walk_pat};
 use rustc_hir::{Arm, Expr, ExprKind, HirId, Node, Pat, PatExpr, PatExprKind, PatKind, QPath, StmtKind};
 use rustc_lint::LateContext;
+use rustc_middle::ty::consts::ConstExt as _;
 use rustc_middle::ty::{self, AdtDef, TyCtxt, TypeckResults, VariantDef};
 use rustc_span::Span;
 
@@ -90,7 +91,7 @@ fn report_single_pattern(
 ) {
     let lint = if els.is_some() { SINGLE_MATCH_ELSE } else { SINGLE_MATCH };
     let ctxt = expr.span.ctxt();
-    let note = |diag: &mut Diag<'_, ()>| {
+    let note = |diag: &mut Diag<'_>| {
         if contains_comments {
             diag.note("you might want to preserve the comments from inside the `match`");
         }
@@ -375,7 +376,6 @@ impl<'a> PatState<'a> {
             // Patterns for things which can only contain a single sub-pattern.
             PatKind::Binding(_, _, _, Some(pat))
             | PatKind::Ref(pat, _, _)
-            | PatKind::Box(pat)
             | PatKind::Deref(pat) => {
                 self.add_pat(cx, pat)
             },

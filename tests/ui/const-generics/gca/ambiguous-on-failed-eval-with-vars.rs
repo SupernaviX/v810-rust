@@ -1,9 +1,12 @@
 //@ check-pass
 //@ compile-flags: -Znext-solver
 
-#![feature(generic_const_items)]
-#![feature(min_generic_const_args)]
-#![feature(generic_const_args)]
+#![feature(
+    gca_min_const_items,
+    gca_macroless_args,
+    gca_const_items,
+    generic_const_items
+)]
 #![expect(incomplete_features)]
 
 const FREE<const A: usize>: usize = 10;

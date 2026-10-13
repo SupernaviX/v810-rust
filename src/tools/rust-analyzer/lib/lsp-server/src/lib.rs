@@ -5,7 +5,7 @@
 //! Run with `RUST_LOG=lsp_server=debug` to see all the messages.
 
 #![warn(rust_2018_idioms, unused_lifetimes)]
-#![allow(clippy::print_stdout, clippy::disallowed_types)]
+#![allow(clippy::print_stdout)]
 
 mod error;
 mod msg;
@@ -22,9 +22,7 @@ use crossbeam_channel::{Receiver, RecvError, RecvTimeoutError, Sender};
 
 pub use crate::{
     error::{ExtractError, ProtocolError},
-    msg::{
-        ErrorCode, Message, Notification, Request, RequestId, Response, ResponseError, ResponseKind,
-    },
+    msg::{ErrorCode, Message, Notification, Request, RequestId, Response, ResponseError},
     req_queue::{Incoming, Outgoing, ReqQueue},
     stdio::IoThreads,
 };

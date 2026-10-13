@@ -19,6 +19,8 @@
 #![allow(internal_features)]
 #![cfg_attr(target_arch = "loongarch64", feature(stdarch_loongarch))]
 #![feature(core_io_borrowed_buf)]
+#![feature(decl_macro)]
+#![feature(diagnostic_on_unknown)]
 #![feature(map_try_insert)]
 #![feature(negative_impls)]
 #![feature(read_buf)]
@@ -30,7 +32,6 @@
 // this crate without this line making `rustc_span` available.
 extern crate self as rustc_span;
 
-use derive_where::derive_where;
 use rustc_data_structures::stable_hash::StableHashCtxt;
 use rustc_data_structures::{AtomicRef, outline};
 use rustc_macros::{Decodable, Encodable, StableHash};
@@ -58,7 +59,7 @@ pub mod def_id;
 use def_id::{CrateNum, DefId, DefIndex, LOCAL_CRATE, LocalDefId, StableCrateId};
 pub mod edit_distance;
 mod span_encoding;
-pub use span_encoding::{DUMMY_SP, Span};
+pub use span_encoding::{DUMMY_SP, OrdSpan, Span};
 
 pub mod symbol;
 pub use symbol::{
@@ -70,8 +71,8 @@ pub mod fatal_error;
 
 pub mod profiling;
 
+pub mod macros;
 use std::borrow::Cow;
-use std::cmp::{self, Ordering};
 use std::fmt::Display;
 use std::hash::Hash;
 use std::io::{self, Read};
@@ -79,8 +80,9 @@ use std::ops::{Add, Range, Sub};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::{fmt, iter};
+use std::{cmp, fmt, iter};
 
+pub use macros::{bug, span_bug};
 use md5::{Digest, Md5};
 use rustc_data_structures::stable_hash::{StableHash, StableHasher};
 use rustc_data_structures::sync::{FreezeLock, FreezeWriteGuard, Lock};
@@ -518,7 +520,8 @@ pub enum FileName {
     CliCrateAttr(Hash64),
     /// Custom sources for explicit parser calls from plugins and drivers.
     Custom(String),
-    DocTest(PathBuf, isize),
+    /// Custom path for doctests
+    DocTest(RealFileName, isize),
     /// Post-substitution inline assembly from LLVM.
     InlineAsm(Hash64),
 }
@@ -541,7 +544,7 @@ impl fmt::Display for FileNameDisplay<'_> {
     fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         use FileName::*;
         match *self.inner {
-            Real(ref name) => {
+            Real(ref name) | DocTest(ref name, _) => {
                 write!(fmt, "{}", name.to_string_lossy(self.display_pref))
             }
             CfgSpec(_) => write!(fmt, "<cfgspec>"),
@@ -550,7 +553,6 @@ impl fmt::Display for FileNameDisplay<'_> {
             ProcMacroSourceCode(_) => write!(fmt, "<proc-macro source code>"),
             CliCrateAttr(_) => write!(fmt, "<crate attribute>"),
             Custom(ref s) => write!(fmt, "<{s}>"),
-            DocTest(ref path, _) => write!(fmt, "{}", path.display()),
             InlineAsm(_) => write!(fmt, "<inline asm>"),
         }
     }
@@ -641,7 +643,7 @@ impl FileName {
         FileName::CliCrateAttr(hasher.finish())
     }
 
-    pub fn doc_test_source_code(path: PathBuf, line: isize) -> FileName {
+    pub fn doc_test_source_code(path: RealFileName, line: isize) -> FileName {
         FileName::DocTest(path, line)
     }
 
@@ -658,7 +660,7 @@ impl FileName {
     pub fn into_local_path(self) -> Option<PathBuf> {
         match self {
             FileName::Real(path) => path.into_local_path(),
-            FileName::DocTest(path, _) => Some(path),
+            FileName::DocTest(path, _) => path.into_local_path(),
             _ => None,
         }
     }
@@ -680,21 +682,19 @@ impl FileName {
 /// sent to other threads, but some pieces of performance infra run in a separate thread.
 /// Using `Span` is generally preferred.
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
-#[derive_where(PartialOrd, Ord)]
 pub struct SpanData {
     pub lo: BytePos,
     pub hi: BytePos,
     /// Information about where the macro came from, if this piece of
     /// code was created by a macro expansion.
-    #[derive_where(skip)]
-    // `SyntaxContext` does not implement `Ord`.
-    // The other fields are enough to determine in-file order.
     pub ctxt: SyntaxContext,
-    #[derive_where(skip)]
-    // `LocalDefId` does not implement `Ord`.
-    // The other fields are enough to determine in-file order.
     pub parent: Option<LocalDefId>,
 }
+
+// `SyntaxContext` and `LocalDefId` aren't orderable. See the equivalent negative impls for `Span`
+// for more details.
+impl !PartialOrd for SpanData {}
+impl !Ord for SpanData {}
 
 impl SpanData {
     #[inline]
@@ -736,17 +736,6 @@ impl Default for SpanData {
     }
 }
 
-impl PartialOrd for Span {
-    fn partial_cmp(&self, rhs: &Self) -> Option<Ordering> {
-        Some(self.cmp(rhs))
-    }
-}
-impl Ord for Span {
-    fn cmp(&self, rhs: &Self) -> Ordering {
-        Ord::cmp(&self.data(), &rhs.data())
-    }
-}
-
 impl Span {
     #[inline]
     pub fn lo(self) -> BytePos {
@@ -767,6 +756,16 @@ impl Span {
     #[inline]
     pub fn with_ctxt(self, ctxt: SyntaxContext) -> Span {
         self.map_ctxt(|_| ctxt)
+    }
+
+    /// When to use this:
+    /// - Use it instead of `==` for span equality comparisons when either span could be generated
+    ///   code and you only care that they point to the same bytes of source text.
+    /// - Use it (possibly via `OrdSpan`) for span ordering comparisons of any kind.
+    #[inline]
+    pub fn lo_hi(self) -> (BytePos, BytePos) {
+        let data = self.data();
+        (data.lo, data.hi)
     }
 
     #[inline]
@@ -855,16 +854,6 @@ impl Span {
         let span = self.data();
         let other = other.data();
         span.lo <= other.hi && other.lo <= span.hi
-    }
-
-    /// Returns `true` if the spans are equal with regards to the source text.
-    ///
-    /// Use this instead of `==` when either span could be generated code,
-    /// and you only care that they point to the same bytes of source text.
-    pub fn source_equal(self, other: Span) -> bool {
-        let span = self.data();
-        let other = other.data();
-        span.lo == other.lo && span.hi == other.hi
     }
 
     /// Returns `Some(span)`, where the start is trimmed by the end of `other`.
@@ -1080,7 +1069,7 @@ impl Span {
                 }
 
                 let expn_data = ctxt.outer_expn_data();
-                let is_recursive = expn_data.call_site.source_equal(prev_span);
+                let is_recursive = expn_data.call_site.lo_hi() == prev_span.lo_hi();
 
                 prev_span = self;
                 self = expn_data.call_site;
@@ -1365,6 +1354,20 @@ pub trait SpanEncoder: Encoder {
     fn encode_crate_num(&mut self, crate_num: CrateNum);
     fn encode_def_index(&mut self, def_index: DefIndex);
     fn encode_def_id(&mut self, def_id: DefId);
+
+    fn encode_local_def_id(&mut self, def_id: LocalDefId) {
+        self.encode_def_id(def_id.to_def_id());
+    }
+
+    // `rustc_span` does not reference `rustc_hir_id` (`rustc_hir_id` references `rustc_span` instead),
+    // so we can't use `DefKey` or `DisambiguatedDefPathData` here.
+    fn encode_def_key(&mut self, parent: Option<DefIndex>, disambiguated_data: impl Encodable<Self>)
+    where
+        Self: Sized,
+    {
+        parent.encode(self);
+        disambiguated_data.encode(self);
+    }
 }
 
 impl SpanEncoder for FileEncoder<'_> {
@@ -1420,11 +1423,11 @@ impl SpanEncoder for MemEncoder {
     }
 
     fn encode_expn_id(&mut self, _expn_id: ExpnId) {
-        panic!("cannot encode `ExpnId` with `FileEncoder`");
+        panic!("cannot encode `ExpnId` with `MemEncoder`");
     }
 
     fn encode_syntax_context(&mut self, _syntax_context: SyntaxContext) {
-        panic!("cannot encode `SyntaxContext` with `FileEncoder`");
+        panic!("cannot encode `SyntaxContext` with `MemEncoder`");
     }
 
     fn encode_crate_num(&mut self, crate_num: CrateNum) {
@@ -1432,7 +1435,7 @@ impl SpanEncoder for MemEncoder {
     }
 
     fn encode_def_index(&mut self, _def_index: DefIndex) {
-        panic!("cannot encode `DefIndex` with `FileEncoder`");
+        panic!("cannot encode `DefIndex` with `MemEncoder`");
     }
 
     fn encode_def_id(&mut self, def_id: DefId) {
@@ -1499,6 +1502,12 @@ pub trait BlobDecoder: Decoder {
     fn decode_symbol(&mut self) -> Symbol;
     fn decode_byte_symbol(&mut self) -> ByteSymbol;
     fn decode_def_index(&mut self) -> DefIndex;
+
+    // This function is placed here (not in a `SpanDecoder`),
+    // as during metadata decoding `LocalDefId` is just a wrapper
+    // around `DefIndex`, so it can be decoded without extra knowledge
+    // like crate remapping.
+    fn decode_local_def_id(&mut self) -> LocalDefId;
 }
 
 /// This trait is used to allow decoder specific encodings of certain types.
@@ -1537,6 +1546,10 @@ impl BlobDecoder for MemDecoder<'_> {
 
     fn decode_def_index(&mut self) -> DefIndex {
         panic!("cannot decode `DefIndex` with `MemDecoder`");
+    }
+
+    fn decode_local_def_id(&mut self) -> LocalDefId {
+        self.decode_def_id().expect_local()
     }
 }
 
@@ -2126,10 +2139,8 @@ impl fmt::Debug for SourceFile {
 ///
 /// When `SourceFile`s are exported in crate metadata, the `StableSourceFileId`
 /// is updated to incorporate the `StableCrateId` of the exporting crate.
-#[derive(
-    Debug, Clone, Copy, Hash, PartialEq, Eq, StableHash, Encodable, Decodable, Default, PartialOrd,
-    Ord
-)]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Default, Ord)]
+#[derive(StableHash, Encodable, Decodable)]
 pub struct StableSourceFileId(Hash128);
 
 impl StableSourceFileId {

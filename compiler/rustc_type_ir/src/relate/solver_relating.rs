@@ -5,7 +5,7 @@ use crate::data_structures::DelayedSet;
 use crate::relate::combine::combine_ty_args;
 pub use crate::relate::*;
 use crate::solve::{Goal, VisibleForLeakCheck};
-use crate::{self as ty, InferCtxtLike, Interner};
+use crate::{self as ty, Const, InferCtxtLike, Interner, Region};
 
 pub trait RelateExt: InferCtxtLike {
     fn relate<T: Relate<Self::Interner>>(
@@ -13,17 +13,6 @@ pub trait RelateExt: InferCtxtLike {
         param_env: <Self::Interner as Interner>::ParamEnv,
         lhs: T,
         variance: ty::Variance,
-        rhs: T,
-        span: <Self::Interner as Interner>::Span,
-    ) -> Result<
-        Vec<Goal<Self::Interner, <Self::Interner as Interner>::Predicate>>,
-        TypeError<Self::Interner>,
-    >;
-
-    fn eq_structurally_relating_aliases<T: Relate<Self::Interner>>(
-        &self,
-        param_env: <Self::Interner as Interner>::ParamEnv,
-        lhs: T,
         rhs: T,
         span: <Self::Interner as Interner>::Span,
     ) -> Result<
@@ -44,29 +33,7 @@ impl<Infcx: InferCtxtLike> RelateExt for Infcx {
         Vec<Goal<Self::Interner, <Self::Interner as Interner>::Predicate>>,
         TypeError<Self::Interner>,
     > {
-        let mut relate =
-            SolverRelating::new(self, StructurallyRelateAliases::No, variance, param_env, span);
-        relate.relate(lhs, rhs)?;
-        Ok(relate.goals)
-    }
-
-    fn eq_structurally_relating_aliases<T: Relate<Self::Interner>>(
-        &self,
-        param_env: <Self::Interner as Interner>::ParamEnv,
-        lhs: T,
-        rhs: T,
-        span: <Self::Interner as Interner>::Span,
-    ) -> Result<
-        Vec<Goal<Self::Interner, <Self::Interner as Interner>::Predicate>>,
-        TypeError<Self::Interner>,
-    > {
-        let mut relate = SolverRelating::new(
-            self,
-            StructurallyRelateAliases::Yes,
-            ty::Invariant,
-            param_env,
-            span,
-        );
+        let mut relate = SolverRelating::new(self, variance, param_env, span);
         relate.relate(lhs, rhs)?;
         Ok(relate.goals)
     }
@@ -76,7 +43,6 @@ impl<Infcx: InferCtxtLike> RelateExt for Infcx {
 pub struct SolverRelating<'infcx, Infcx, I: Interner> {
     infcx: &'infcx Infcx,
     // Immutable fields.
-    structurally_relate_aliases: StructurallyRelateAliases,
     param_env: I::ParamEnv,
     span: I::Span,
     // Mutable fields.
@@ -114,14 +80,13 @@ where
 {
     pub fn new(
         infcx: &'infcx Infcx,
-        structurally_relate_aliases: StructurallyRelateAliases,
         ambient_variance: ty::Variance,
         param_env: I::ParamEnv,
         span: I::Span,
     ) -> Self {
+        debug_assert!(infcx.next_trait_solver());
         SolverRelating {
             infcx,
-            structurally_relate_aliases,
             span,
             ambient_variance,
             param_env,
@@ -160,6 +125,7 @@ where
             combine_ty_args(self.infcx, self, a_ty, b_ty, variances, a_args, b_args, |_| a_ty)
         }
     }
+
     fn relate_with_variance<T: Relate<I>>(
         &mut self,
         variance: ty::Variance,
@@ -229,11 +195,30 @@ where
                 }
             }
 
+            (ty::Alias(ty::IsRigid::No, alias), _) if infcx.next_trait_solver() => {
+                let new_var = infcx.next_ty_infer();
+                self.goals.push(Goal::new(
+                    self.cx(),
+                    self.param_env,
+                    ty::ProjectionClause { projection_term: alias.into(), term: new_var.into() },
+                ));
+                self.tys(new_var, b)?;
+            }
+            (_, ty::Alias(ty::IsRigid::No, alias)) if infcx.next_trait_solver() => {
+                let new_var = infcx.next_ty_infer();
+                self.goals.push(Goal::new(
+                    self.cx(),
+                    self.param_env,
+                    ty::ProjectionClause { projection_term: alias.into(), term: new_var.into() },
+                ));
+                self.tys(a, new_var)?;
+            }
+
             (ty::Infer(ty::TyVar(a_vid)), _) => {
-                infcx.instantiate_ty_var_raw(self, true, a_vid, self.ambient_variance, b)?;
+                infcx.instantiate_ty_var(self, true, a_vid, self.ambient_variance, b)?;
             }
             (_, ty::Infer(ty::TyVar(b_vid))) => {
-                infcx.instantiate_ty_var_raw(
+                infcx.instantiate_ty_var(
                     self,
                     false,
                     b_vid,
@@ -253,7 +238,7 @@ where
     }
 
     #[instrument(skip(self), level = "trace")]
-    fn regions(&mut self, a: I::Region, b: I::Region) -> RelateResult<I, I::Region> {
+    fn regions(&mut self, a: Region<I>, b: Region<I>) -> RelateResult<I, Region<I>> {
         match self.ambient_variance {
             // Subtype(&'a u8, &'b u8) => Outlives('a: 'b) => SubRegion('b, 'a)
             ty::Covariant => self.infcx.sub_regions(b, a, VisibleForLeakCheck::Yes, self.span),
@@ -269,7 +254,7 @@ where
     }
 
     #[instrument(skip(self), level = "trace")]
-    fn consts(&mut self, a: I::Const, b: I::Const) -> RelateResult<I, I::Const> {
+    fn consts(&mut self, a: Const<I>, b: Const<I>) -> RelateResult<I, Const<I>> {
         super_combine_consts(self.infcx, self, a, b)
     }
 
@@ -366,10 +351,6 @@ where
         self.param_env
     }
 
-    fn structurally_relate_aliases(&self) -> StructurallyRelateAliases {
-        self.structurally_relate_aliases
-    }
-
     fn register_predicates(
         &mut self,
         obligations: impl IntoIterator<Item: ty::Upcast<I, I::Predicate>>,
@@ -381,9 +362,5 @@ where
 
     fn register_goals(&mut self, obligations: impl IntoIterator<Item = Goal<I, I::Predicate>>) {
         self.goals.extend(obligations);
-    }
-
-    fn ambient_variance(&self) -> ty::Variance {
-        self.ambient_variance
     }
 }

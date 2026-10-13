@@ -18,8 +18,8 @@
 
 impl X {
 //~^ ERROR: cannot find type `X` in this scope
-    reuse< std::fmt::Debug as Iterator >::*;
-    //~^ ERROR: expected method or associated constant, found associated type `Iterator::Item`
+    reuse< std::fmt::Debug as Iterator >::*; //~ ERROR failed to resolve delegation callee
+    //~^ ERROR: cannot find method or associated constant `Item` in trait `Iterator`
     //~| ERROR: expected a type, found a trait
 }
 

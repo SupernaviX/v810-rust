@@ -8,7 +8,7 @@ IFS=$'\n\t'
 source "$(cd "$(dirname "$0")" && pwd)/../shared.sh"
 
 REPO_URL="https://github.com/SupernaviX/v810-llvm"
-BUILD_DATE="2026-07-10"
+BUILD_DATE="2026-10-09"
 
 if isMacOS; then
     targetName=darwin

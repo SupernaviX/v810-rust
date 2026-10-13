@@ -1,6 +1,6 @@
 use clippy_utils::diagnostics::{span_lint_and_sugg, span_lint_and_then};
 use clippy_utils::msrvs::{self, Msrv};
-use clippy_utils::res::{MaybeDef, MaybeTypeckRes};
+use clippy_utils::res::{MaybeDef as _, MaybeTypeckRes as _};
 use clippy_utils::source::{snippet_with_applicability, snippet_with_context};
 use clippy_utils::sugg::Sugg;
 use clippy_utils::{SpanlessEq, get_parent_expr, sym};
@@ -149,7 +149,7 @@ impl<'hir> MapFunc<'hir> {
     fn sugg(self, cx: &LateContext<'hir>, invert: bool, app: &mut Applicability) -> String {
         match self {
             Self::Closure(closure) => {
-                let body = Sugg::hir_with_applicability(cx, cx.tcx.hir_body(closure.body).value, "..", app);
+                let body = Sugg::hir_with_applicability(cx, &cx.tcx.hir_body(closure.body).value, "..", app);
                 format!(
                     "{} {}",
                     snippet_with_applicability(cx, closure.fn_decl_span, "|..|", app),

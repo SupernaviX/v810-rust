@@ -1,6 +1,6 @@
 use super::{IncrementVisitor, InitializeVisitor, MANUAL_MEMCPY};
 use clippy_utils::diagnostics::span_lint_and_sugg;
-use clippy_utils::res::MaybeResPath;
+use clippy_utils::res::MaybeResPath as _;
 use clippy_utils::source::snippet;
 use clippy_utils::sugg::Sugg;
 use clippy_utils::ty::is_copy;
@@ -11,6 +11,7 @@ use rustc_errors::Applicability;
 use rustc_hir::intravisit::walk_block;
 use rustc_hir::{BinOpKind, Block, Expr, ExprKind, HirId, Pat, PatKind, StmtKind};
 use rustc_lint::LateContext;
+use rustc_middle::ty::consts::ConstExt as _;
 use rustc_middle::ty::{self, Ty};
 use rustc_span::symbol::sym;
 use std::fmt::Display;

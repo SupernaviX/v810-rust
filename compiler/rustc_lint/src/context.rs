@@ -3,7 +3,6 @@
 //! See <https://rustc-dev-guide.rust-lang.org/diagnostics.html> for an
 //! overview of how lints are implemented.
 
-use std::cell::Cell;
 use std::slice;
 
 use rustc_abi as abi;
@@ -19,7 +18,10 @@ use rustc_hir::def::Res;
 use rustc_hir::def_id::{CrateNum, DefId};
 use rustc_hir::definitions::{DefPathData, DisambiguatedDefPathData};
 use rustc_hir::{Pat, PatKind};
-use rustc_middle::bug;
+use rustc_lint_defs::{
+    FutureIncompatibleInfo, Lint, LintExpectationId, LintId, StableLintExpectationId,
+    UnstableLintExpectationId,
+};
 use rustc_middle::lint::{LevelSpec, StableLevelSpec, UnstableLevelSpec};
 use rustc_middle::middle::privacy::EffectiveVisibilities;
 use rustc_middle::ty::layout::{LayoutError, LayoutOfHelpers, TyAndLayout};
@@ -27,13 +29,9 @@ use rustc_middle::ty::print::{PrintError, PrintTraitRefExt as _, Printer, with_n
 use rustc_middle::ty::{
     self, GenericArg, RegisteredTools, Ty, TyCtxt, TypingEnv, TypingMode, Unnormalized,
 };
-use rustc_session::lint::{
-    FutureIncompatibleInfo, Lint, LintExpectationId, LintId, StableLintExpectationId,
-    UnstableLintExpectationId,
-};
 use rustc_session::{DynLintStore, Session};
 use rustc_span::edit_distance::find_best_match_for_names;
-use rustc_span::{Ident, Span, Symbol, sym};
+use rustc_span::{Ident, Span, Symbol, bug, sym};
 use tracing::debug;
 
 use self::TargetLint::*;
@@ -346,13 +344,13 @@ impl LintStore {
         &self,
         lint_name: &str,
         tool_name: Option<Symbol>,
-        registered_tools: &RegisteredTools,
+        registered_lint_tools: &RegisteredTools,
     ) -> CheckLintNameResult<'_> {
         if let Some(tool_name) = tool_name {
             // FIXME: rustc and rustdoc are considered tools for lints, but not for attributes.
             if tool_name != sym::rustc
                 && tool_name != sym::rustdoc
-                && !registered_tools.contains(&Ident::with_dummy_span(tool_name))
+                && !registered_lint_tools.contains(&Ident::with_dummy_span(tool_name))
             {
                 return CheckLintNameResult::NoTool;
             }
@@ -484,11 +482,8 @@ pub struct LateContext<'tcx> {
     /// Current body, or `None` if outside a body.
     pub enclosing_body: Option<hir::BodyId>,
 
-    /// Type-checking results for the current body. Access using the `typeck_results`
-    /// and `maybe_typeck_results` methods, which handle querying the typeck results on demand.
-    // FIXME(eddyb) move all the code accessing internal fields like this,
-    // to this module, to avoid exposing it to lint logic.
-    pub(super) cached_typeck_results: Cell<Option<&'tcx ty::TypeckResults<'tcx>>>,
+    /// Type-checking results for the current body.
+    pub typeck_results: Option<&'tcx ty::TypeckResults<'tcx>>,
 
     /// Parameter environment for the item we are in.
     pub param_env: ty::ParamEnv<'tcx>,
@@ -526,7 +521,7 @@ pub trait LintContext {
         &self,
         lint: &'static Lint,
         span: Option<S>,
-        decorate: impl for<'a> Diagnostic<'a, ()>,
+        decorate: impl for<'a> Diagnostic<'a>,
     );
 
     /// Emit a lint at `span` from a lint struct (some type that implements `Diagnostic`,
@@ -536,7 +531,7 @@ pub trait LintContext {
         &self,
         lint: &'static Lint,
         span: S,
-        decorator: impl for<'a> Diagnostic<'a, ()>,
+        decorator: impl for<'a> Diagnostic<'a>,
     ) {
         self.opt_span_lint(lint, Some(span), decorator);
     }
@@ -552,17 +547,7 @@ pub trait LintContext {
     /// retrieved from the current lint pass. Buffered or manually created ids can
     /// cause ICEs.
     fn fulfill_expectation(&self, expectation: Self::LintExpectationId) {
-        // We need to make sure that submitted expectation ids are correctly fulfilled suppressed
-        // and stored between compilation sessions. To not manually do these steps, we simply create
-        // a dummy diagnostic and emit it as usual, which will be suppressed and stored like a
-        // normal expected lint diagnostic.
-        self.sess()
-            .dcx()
-            .struct_expect(
-                "this is a dummy diagnostic, to submit and store an expectation",
-                expectation.into(),
-            )
-            .emit();
+        self.sess().dcx().fulfill_expectation(expectation);
     }
 }
 
@@ -572,7 +557,7 @@ impl<'a> EarlyContext<'a> {
         features: &'a Features,
         lint_added_lints: bool,
         lint_store: &'a LintStore,
-        registered_tools: &'a RegisteredTools,
+        registered_lint_tools: &'a RegisteredTools,
         buffered: LintBuffer,
     ) -> EarlyContext<'a> {
         EarlyContext {
@@ -581,7 +566,7 @@ impl<'a> EarlyContext<'a> {
                 features,
                 lint_added_lints,
                 lint_store,
-                registered_tools,
+                registered_lint_tools,
             ),
             buffered,
         }
@@ -600,7 +585,7 @@ impl<'tcx> LintContext for LateContext<'tcx> {
         &self,
         lint: &'static Lint,
         span: Option<S>,
-        decorate: impl for<'a> Diagnostic<'a, ()>,
+        decorate: impl for<'a> Diagnostic<'a>,
     ) {
         let hir_id = self.last_node_with_lint_attrs;
 
@@ -627,7 +612,7 @@ impl LintContext for EarlyContext<'_> {
         &self,
         lint: &'static Lint,
         span: Option<S>,
-        decorator: impl for<'a> Diagnostic<'a, ()>,
+        decorator: impl for<'a> Diagnostic<'a>,
     ) {
         self.builder.opt_span_lint(lint, span.map(|s| s.into()), decorator)
     }
@@ -645,7 +630,7 @@ impl<'tcx> LateContext<'tcx> {
             && self.tcx.use_typing_mode_post_typeck_until_borrowck()
         {
             let def_id = self.tcx.hir_enclosing_body_owner(body_id.hir_id);
-            TypingMode::borrowck(self.tcx, def_id)
+            TypingMode::post_borrowck_analysis(self.tcx, def_id)
         } else {
             TypingMode::non_body_analysis()
         }
@@ -663,24 +648,13 @@ impl<'tcx> LateContext<'tcx> {
         self.tcx.type_is_use_cloned_modulo_regions(self.typing_env(), ty)
     }
 
-    /// Gets the type-checking results for the current body,
-    /// or `None` if outside a body.
-    pub fn maybe_typeck_results(&self) -> Option<&'tcx ty::TypeckResults<'tcx>> {
-        self.cached_typeck_results.get().or_else(|| {
-            self.enclosing_body.map(|body| {
-                let typeck_results = self.tcx.typeck_body(body);
-                self.cached_typeck_results.set(Some(typeck_results));
-                typeck_results
-            })
-        })
-    }
-
     /// Gets the type-checking results for the current body.
     /// As this will ICE if called outside bodies, only call when working with
     /// `Expr` or `Pat` nodes (they are guaranteed to be found only in bodies).
+    #[inline]
     #[track_caller]
     pub fn typeck_results(&self) -> &'tcx ty::TypeckResults<'tcx> {
-        self.maybe_typeck_results().expect("`LateContext::typeck_results` called outside of body")
+        self.typeck_results.expect("`LateContext::typeck_results` called outside of body")
     }
 
     /// Returns the final resolution of a `QPath`, or `Res::Err` if unavailable.
@@ -690,7 +664,7 @@ impl<'tcx> LateContext<'tcx> {
         match *qpath {
             hir::QPath::Resolved(_, path) => path.res,
             hir::QPath::TypeRelative(..) => self
-                .maybe_typeck_results()
+                .typeck_results
                 .filter(|typeck_results| typeck_results.hir_owner == id.owner)
                 .or_else(|| {
                     self.tcx
@@ -858,7 +832,10 @@ impl<'tcx> LateContext<'tcx> {
     /// be used for pretty-printing HIR by rustc_hir_pretty.
     pub fn precedence(&self, expr: &hir::Expr<'_>) -> ExprPrecedence {
         let has_attr = |id: hir::HirId| -> bool {
-            self.tcx.hir_attrs(id).iter().any(hir::Attribute::is_prefix_attr_for_suggestions)
+            self.tcx
+                .hir_attrs(id)
+                .iter()
+                .any(rustc_attr_ir::Attribute::is_prefix_attr_for_suggestions)
         };
         expr.precedence(&has_attr)
     }
@@ -947,7 +924,7 @@ impl<'tcx> LateContext<'tcx> {
                 hir::Node::Item(item) => match item.kind {
                     // FIXME(mgca): figure out how to handle ConstArgKind::Path (or don't but add warning in docs here)
                     hir::ItemKind::Const(.., hir::ConstItemRhs::Body(body_id))
-                    | hir::ItemKind::Static(.., body_id) => Some(self.tcx.hir_body(body_id).value),
+                    | hir::ItemKind::Static(.., body_id) => Some(&self.tcx.hir_body(body_id).value),
                     _ => None,
                 },
                 _ => None,

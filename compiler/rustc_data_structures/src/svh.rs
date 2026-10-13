@@ -11,17 +11,8 @@ use rustc_macros::{Decodable_NoContext, Encodable_NoContext, StableHash};
 
 use crate::fingerprint::Fingerprint;
 
-#[derive(
-    Copy,
-    Clone,
-    PartialEq,
-    Eq,
-    Debug,
-    Encodable_NoContext,
-    Decodable_NoContext,
-    Hash,
-    StableHash
-)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
+#[derive(Encodable_NoContext, Decodable_NoContext, StableHash)]
 pub struct Svh {
     hash: Fingerprint,
 }
@@ -40,6 +31,10 @@ impl Svh {
 
     pub fn to_hex(self) -> String {
         format!("{:032x}", self.hash.as_u128())
+    }
+
+    pub fn as_fingerprint(self) -> Fingerprint {
+        self.hash
     }
 }
 

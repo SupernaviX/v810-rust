@@ -1,15 +1,14 @@
 use std::borrow::Cow;
 
 use clippy_utils::diagnostics::span_lint_and_then;
-use clippy_utils::source::{SpanExt, snippet_indent};
+use clippy_utils::source::{SpanExt as _, snippet_indent};
 use clippy_utils::tokenize_with_text;
-use itertools::Itertools;
+use itertools::Itertools as _;
 use rustc_ast::token::CommentKind;
 use rustc_ast::{AssocItemKind, AttrKind, AttrStyle, Attribute, Crate, Item, ItemKind, ModKind, NodeId};
 use rustc_errors::{Applicability, Diag, SuggestionStyle};
 use rustc_lexer::TokenKind;
-use rustc_lint::{EarlyContext, EarlyLintPass, LintContext};
-use rustc_session::impl_lint_pass;
+use rustc_lint::{EarlyContext, EarlyLintPass, LintContext as _, impl_lint_pass};
 use rustc_span::{BytePos, ExpnKind, Ident, InnerSpan, Span, SpanData, Symbol, kw, sym};
 
 declare_clippy_lint! {
@@ -432,7 +431,7 @@ impl EmptyLineAfter {
 
     /// If the node the attributes/docs apply to is the first in the module/crate suggest converting
     /// them to inner attributes/docs
-    fn suggest_inner(&self, diag: &mut Diag<'_, ()>, kind: StopKind, gaps: &[Gap<'_>], id: NodeId) {
+    fn suggest_inner(&self, diag: &mut Diag<'_>, kind: StopKind, gaps: &[Gap<'_>], id: NodeId) {
         if let Some(parent) = self.items.iter().rev().nth(1)
             && matches!(parent.kind, ItemKindDescr::Module | ItemKindDescr::Crate)
             && parent.mod_items == Some(id)

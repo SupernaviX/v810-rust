@@ -1,3 +1,4 @@
+use rustc_attr_ir::find_attr;
 use rustc_hir::{Expr, ExprKind};
 use rustc_span::sym;
 
@@ -6,14 +7,11 @@ use crate::LateContext;
 /// Given an expression, peel all of casts (`<expr> as ...`, `<expr>.cast{,_mut,_const}()`,
 /// `ptr::from_ref(<expr>)`, ...) and init expressions.
 ///
-/// Returns the innermost expression and a boolean representing if one of the casts was
-/// `UnsafeCell::raw_get(<expr>)`
+/// Returns the innermost expression.
 pub(crate) fn peel_casts<'tcx>(
     cx: &LateContext<'tcx>,
     mut e: &'tcx Expr<'tcx>,
-) -> (&'tcx Expr<'tcx>, bool) {
-    let mut gone_trough_unsafe_cell_raw_get = false;
-
+) -> &'tcx Expr<'tcx> {
     loop {
         e = e.peel_blocks();
         // <expr> as ...
@@ -37,9 +35,6 @@ pub(crate) fn peel_casts<'tcx>(
                 Some(sym::ptr_from_ref | sym::unsafe_cell_raw_get | sym::transmute)
             )
         {
-            if cx.tcx.is_diagnostic_item(sym::unsafe_cell_raw_get, def_id) {
-                gone_trough_unsafe_cell_raw_get = true;
-            }
             arg
         } else {
             let init = cx.expr_or_init(e);
@@ -51,5 +46,16 @@ pub(crate) fn peel_casts<'tcx>(
         };
     }
 
-    (e, gone_trough_unsafe_cell_raw_get)
+    e
+}
+
+/// Crate to use for rustfix / diagnostic paths that exist in both `std` and `core`. Returns `None` for `#![no_core]`.
+pub fn std_or_core(cx: &LateContext<'_>) -> Option<&'static str> {
+    if find_attr!(cx.tcx, crate, NoCore) {
+        None
+    } else if find_attr!(cx.tcx, crate, NoStd) {
+        Some("core")
+    } else {
+        Some("std")
+    }
 }

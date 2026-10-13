@@ -2,22 +2,23 @@ use std::cmp;
 use std::ops::Range;
 
 use rustc_abi::{
-    Align, ArmCall, BackendRepr, CanonAbi, ExternAbi, HasDataLayout, Reg, Size, WrappingRange,
+    Align, ArmCall, BackendRepr, CanonAbi, ExternAbi, FieldsShape, HasDataLayout, Reg, Size,
+    VariantIdx, Variants, WrappingRange,
 };
 use rustc_ast as ast;
 use rustc_ast::{InlineAsmOptions, InlineAsmTemplatePiece};
+use rustc_attr_ir::UnrollAttr;
+use rustc_attr_ir::lang_items::LangItem;
 use rustc_data_structures::packed::Pu128;
-use rustc_hir::attrs::AttributeKind;
-use rustc_hir::lang_items::LangItem;
 use rustc_lint_defs::builtin::TAIL_CALL_TRACK_CALLER;
+use rustc_middle::mir::interpret::{CTFE_ALLOC_SALT, Scalar};
 use rustc_middle::mir::{self, AssertKind, InlineAsmMacro, SwitchTargets, UnwindTerminateReason};
-use rustc_middle::ty::layout::{HasTyCtxt, LayoutOf, ValidityRequirement};
+use rustc_middle::ty::layout::{HasTyCtxt, LayoutOf, TyAndLayout, ValidityRequirement};
 use rustc_middle::ty::print::{with_no_trimmed_paths, with_no_visible_paths};
 use rustc_middle::ty::{self, Instance, Ty, TypeVisitableExt};
-use rustc_middle::{bug, span_bug};
 use rustc_session::config::OptLevel;
-use rustc_span::{Span, Spanned};
-use rustc_target::callconv::{ArgAbi, ArgAttributes, CastTarget, FnAbi, PassMode};
+use rustc_span::{Span, Spanned, bug, span_bug};
+use rustc_target::callconv::{ArgAbi, ArgAttributes, CastTarget, FnAbi, IndirectMode, PassMode};
 use tracing::{debug, info};
 
 use super::operand::OperandRef;
@@ -96,7 +97,7 @@ impl<'a, 'tcx> TerminatorCodegenHelper<'tcx> {
         }
         if is_cleanupret {
             // Cross-funclet jump - need a trampoline
-            assert!(base::wants_new_eh_instructions(fx.cx.tcx().sess));
+            assert!(base::wants_new_eh_instructions(&fx.cx.tcx().sess.target));
             debug!("llbb_with_cleanup: creating cleanup trampoline for {:?}", target);
             let name = &format!("{:?}_cleanup_trampoline_{:?}", self.bb, target);
             let trampoline_llbb = Bx::append_block(fx.cx, fx.llfn, name);
@@ -139,7 +140,7 @@ impl<'a, 'tcx> TerminatorCodegenHelper<'tcx> {
         bx: &mut Bx,
         target: mir::BasicBlock,
         mergeable_succ: bool,
-        attributes: &[AttributeKind],
+        loop_hint_attrs: &[UnrollAttr],
     ) -> MergingSucc {
         let (needs_landing_pad, is_cleanupret) = self.llbb_characteristics(fx, target);
         if mergeable_succ && !needs_landing_pad && !is_cleanupret {
@@ -155,7 +156,7 @@ impl<'a, 'tcx> TerminatorCodegenHelper<'tcx> {
                 // to a trampoline.
                 bx.cleanup_ret(self.funclet(fx).unwrap(), Some(lltarget));
             } else {
-                bx.br_with_attrs(lltarget, attributes);
+                bx.br_with_attrs(lltarget, loop_hint_attrs);
             }
             MergingSucc::False
         }
@@ -163,12 +164,16 @@ impl<'a, 'tcx> TerminatorCodegenHelper<'tcx> {
 
     /// Call `fn_ptr` of `fn_abi` with the arguments `llargs`, the optional
     /// return destination `destination` and the unwind action `unwind`.
+    /// The `return_slot` is [`ReturnSlot::Indirect`] for functions returning
+    /// via `PassMode::Indirect`, and points to a buffer where the return value
+    /// shall be stored.
     fn do_call<Bx: BuilderMethods<'a, 'tcx>>(
         &self,
         fx: &mut FunctionCx<'a, 'tcx, Bx>,
         bx: &mut Bx,
         fn_abi: &'tcx FnAbi<'tcx, Ty<'tcx>>,
         fn_ptr: Bx::Value,
+        return_slot: ReturnSlot<Bx::Value>,
         llargs: &[Bx::Value],
         destination: Option<(ReturnDest<'tcx, Bx::Value>, mir::BasicBlock)>,
         mut unwind: mir::UnwindAction,
@@ -194,7 +199,7 @@ impl<'a, 'tcx> TerminatorCodegenHelper<'tcx> {
                     "compiler_builtins call to diverging function {:?} replaced with abort",
                     instance.def_id()
                 );
-                bx.abort();
+                bx.abort_immediate();
                 bx.unreachable();
                 return MergingSucc::False;
             }
@@ -216,16 +221,22 @@ impl<'a, 'tcx> TerminatorCodegenHelper<'tcx> {
         }
 
         let unwind_block = match unwind {
-            mir::UnwindAction::Cleanup(cleanup) => Some(self.llbb_with_cleanup(fx, cleanup)),
+            mir::UnwindAction::Cleanup(cleanup) => {
+                if !fx.nop_landing_pads.contains(cleanup) {
+                    Some(self.llbb_with_cleanup(fx, cleanup))
+                } else {
+                    None
+                }
+            }
             mir::UnwindAction::Continue => None,
             mir::UnwindAction::Unreachable => None,
             mir::UnwindAction::Terminate(reason) => {
-                if fx.mir[self.bb].is_cleanup && base::wants_wasm_eh(fx.cx.tcx().sess) {
+                if fx.mir[self.bb].is_cleanup && base::wants_wasm_eh(&fx.cx.tcx().sess.target) {
                     // For wasm, we need to generate a nested `cleanuppad within %outer_pad`
                     // to catch exceptions during cleanup and call `panic_in_cleanup`.
                     Some(fx.terminate_block(reason, Some(self.bb)))
                 } else if fx.mir[self.bb].is_cleanup
-                    && base::wants_new_eh_instructions(fx.cx.tcx().sess)
+                    && base::wants_new_eh_instructions(&fx.cx.tcx().sess.target)
                 {
                     // MSVC SEH will abort automatically if an exception tries to
                     // propagate out from cleanup.
@@ -236,8 +247,23 @@ impl<'a, 'tcx> TerminatorCodegenHelper<'tcx> {
             }
         };
 
+        debug_assert_eq!(
+            return_slot.is_indirect(),
+            fn_abi.ret.is_indirect(),
+            "a return slot must be provided if and only if the return is `PassMode::Indirect`",
+        );
+
         if kind == CallKind::Tail {
-            bx.tail_call(fn_ty, caller_attrs, fn_abi, fn_ptr, llargs, self.funclet(fx), instance);
+            bx.tail_call(
+                fn_ty,
+                caller_attrs,
+                fn_abi,
+                fn_ptr,
+                return_slot,
+                llargs,
+                self.funclet(fx),
+                instance,
+            );
             return MergingSucc::False;
         }
 
@@ -252,6 +278,7 @@ impl<'a, 'tcx> TerminatorCodegenHelper<'tcx> {
                 caller_attrs,
                 Some(fn_abi),
                 fn_ptr,
+                return_slot,
                 llargs,
                 ret_llbb,
                 unwind_block,
@@ -283,6 +310,7 @@ impl<'a, 'tcx> TerminatorCodegenHelper<'tcx> {
                 caller_attrs,
                 Some(fn_abi),
                 fn_ptr,
+                return_slot,
                 llargs,
                 self.funclet(fx),
                 instance,
@@ -319,7 +347,13 @@ impl<'a, 'tcx> TerminatorCodegenHelper<'tcx> {
         mergeable_succ: bool,
     ) -> MergingSucc {
         let unwind_target = match unwind {
-            mir::UnwindAction::Cleanup(cleanup) => Some(self.llbb_with_cleanup(fx, cleanup)),
+            mir::UnwindAction::Cleanup(cleanup) => {
+                if !fx.nop_landing_pads.contains(cleanup) {
+                    Some(self.llbb_with_cleanup(fx, cleanup))
+                } else {
+                    None
+                }
+            }
             mir::UnwindAction::Terminate(reason) => Some(fx.terminate_block(reason, None)),
             mir::UnwindAction::Continue => None,
             mir::UnwindAction::Unreachable => None,
@@ -553,7 +587,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
             // so we should make sure that we never actually do.
             // We play it safe by using a well-defined `abort`, but we could go for immediate UB
             // if that turns out to be helpful.
-            bx.abort();
+            bx.abort_immediate();
             // `abort` does not terminate the block, so we still need to generate
             // an `unreachable` terminator after it.
             bx.unreachable();
@@ -574,7 +608,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                 }
             }
 
-            PassMode::Cast { cast: cast_ty, pad_i32: _ } => {
+            PassMode::Cast { cast: cast_ty, pad_i32_count: _ } => {
                 let op = match self.locals[mir::RETURN_PLACE] {
                     LocalRef::Operand(op) => op,
                     LocalRef::PendingOperand => bug!("use of return before def"),
@@ -603,19 +637,14 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
 
                 if self.fn_abi.conv == CanonAbi::Arm(ArmCall::CCmseNonSecureEntry) {
                     // The return value of an `extern "cmse-nonsecure-entry"` function crosses the
-                    // secure boundary. Zero padding bytes so information does not leak.
-                    //
-                    // This only zeroes "guaranteed" padding. There may be more bytes that are
-                    // padding for some but not all variants of this type; those are not zeroed.
-                    //
-                    // Returning a value with value-dependent padding will instead trigger a lint.
+                    // secure boundary. Clear any padding bytes so information does not leak.
                     let ret_layout = self.fn_abi.ret.layout;
-                    let uninit_ranges = ret_layout.padding_ranges(bx.cx());
-                    self.zero_byte_ranges(bx, llslot, ret_layout.size, &uninit_ranges);
+                    self.clear_padding_cmse(bx, llslot, ret_layout.size, ret_layout);
                 }
 
                 load_cast(bx, cast_ty, llslot, self.fn_abi.ret.layout.align.abi)
             }
+            PassMode::IndirectUnsized { .. } => bug!("unsized returns are not supported"),
         };
         bx.ret(llval);
     }
@@ -710,6 +739,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
             bx,
             fn_abi,
             drop_fn,
+            ReturnSlot::Direct,
             args,
             Some((ReturnDest::Nothing, target)),
             unwind,
@@ -814,6 +844,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
             bx,
             fn_abi,
             llfn,
+            ReturnSlot::Direct,
             &args,
             None,
             unwind,
@@ -845,6 +876,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
             bx,
             fn_abi,
             llfn,
+            ReturnSlot::Direct,
             &[],
             None,
             mir::UnwindAction::Unreachable,
@@ -914,6 +946,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
             bx,
             fn_abi,
             llfn,
+            ReturnSlot::Direct,
             &[msg.0, msg.1],
             target.as_ref().map(|bb| (ReturnDest::Nothing, *bb)),
             unwind,
@@ -1067,7 +1100,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                                 }
                                 // Also we need to terminate the block to avoid an LLVM assertion,
                                 // even though we're not going to actually use the IR.
-                                bx.abort();
+                                bx.abort_immediate();
                                 return MergingSucc::False;
                             }
                             IntrinsicResult::Fallback(instance) => {
@@ -1194,21 +1227,24 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
         // We still need to call `make_return_dest` even if there's no `target`, since
         // `fn_abi.ret` could be `PassMode::Indirect`, even if it is uninhabited,
         // and `make_return_dest` adds the return-place indirect pointer to `llargs`.
-        let destination = match kind {
+        let (destination, return_slot) = match kind {
             CallKind::Normal => {
-                let return_dest = self.make_return_dest(bx, destination, &fn_abi.ret, &mut llargs);
-                target.map(|target| (return_dest, target))
+                let (return_dest, return_slot) =
+                    self.make_return_dest(bx, destination, &fn_abi.ret);
+                (target.map(|target| (return_dest, target)), return_slot)
             }
             CallKind::Tail => {
-                if fn_abi.ret.is_indirect() {
-                    match self.make_return_dest(bx, destination, &fn_abi.ret, &mut llargs) {
-                        ReturnDest::Nothing => {}
+                let return_slot = if fn_abi.ret.is_indirect() {
+                    match self.make_return_dest(bx, destination, &fn_abi.ret) {
+                        (ReturnDest::Nothing, return_slot) => return_slot,
                         _ => bug!(
                             "tail calls to functions with indirect returns cannot store into a destination"
                         ),
                     }
-                }
-                None
+                } else {
+                    ReturnSlot::Direct
+                };
+                (None, return_slot)
             }
         };
 
@@ -1222,7 +1258,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
             (args, None)
         };
 
-        // Special logic for tail calls with `PassMode::Indirect { on_stack: false, .. }` arguments.
+        // Special logic for tail calls with `PassMode::Indirect { mode: IndirectMode::Pointer, .. }` arguments.
         //
         // Normally an indirect argument that is allocated in the caller's stack frame
         // would be passed as a pointer into the callee's stack frame.
@@ -1247,10 +1283,17 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
         let mut tail_call_temporaries = vec![];
         if kind == CallKind::Tail {
             tail_call_temporaries = vec![None; first_args.len()];
-            // Copy the arguments that use `PassMode::Indirect { on_stack: false , ..}`
+            // Copy the arguments that use `PassMode::Indirect { mode: IndirectMode::Pointer , ..}`
             // to temporary stack allocations. See the comment above.
             for (i, arg) in first_args.iter().enumerate() {
-                if !matches!(fn_abi.args[i].mode, PassMode::Indirect { on_stack: false, .. }) {
+                if matches!(fn_abi.args[i].mode, PassMode::IndirectUnsized { .. }) {
+                    bug!("extern \"tail\" arguments must not be unsized");
+                }
+
+                if !matches!(
+                    fn_abi.args[i].mode,
+                    PassMode::Indirect { mode: IndirectMode::Pointer, .. }
+                ) {
                     continue;
                 }
 
@@ -1318,10 +1361,11 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                 }
             }
 
-            let by_move = if let PassMode::Indirect { on_stack: false, .. } = fn_abi.args[i].mode
+            let by_move = if let PassMode::Indirect { mode: IndirectMode::Pointer, .. } =
+                fn_abi.args[i].mode
                 && kind == CallKind::Tail
             {
-                // Special logic for tail calls with `PassMode::Indirect { on_stack: false, .. }` arguments.
+                // Special logic for tail calls with `PassMode::Indirect { mode: IndirectMode::Pointer, .. }` arguments.
                 //
                 // Normally an indirect argument that is allocated in the caller's stack frame
                 // would be passed as a pointer into the callee's stack frame.
@@ -1433,6 +1477,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
             bx,
             fn_abi,
             fn_ptr,
+            return_slot,
             &llargs,
             destination,
             unwind,
@@ -1479,13 +1524,17 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                 }
                 mir::InlineAsmOperand::Const { ref value } => {
                     let const_value = self.eval_mir_constant(value);
-                    let string = common::asm_const_to_str(
-                        bx.tcx(),
-                        span,
-                        const_value,
-                        bx.layout_of(value.ty()),
-                    );
-                    InlineAsmOperandRef::Const { string }
+                    let mir::ConstValue::Scalar(scalar) = const_value else {
+                        span_bug!(
+                            span,
+                            "expected Scalar for promoted asm const, but got {:#?}",
+                            const_value
+                        )
+                    };
+                    InlineAsmOperandRef::Const {
+                        value: common::asm_const_ptr_clean(bx.tcx(), scalar),
+                        ty: value.ty(),
+                    }
                 }
                 mir::InlineAsmOperand::SymFn { ref value } => {
                     let const_ = self.monomorphize(value.const_);
@@ -1497,13 +1546,30 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                             args.no_bound_vars().unwrap(),
                         )
                         .unwrap();
-                        InlineAsmOperandRef::SymFn { instance }
+
+                        InlineAsmOperandRef::Const {
+                            value: Scalar::from_pointer(
+                                bx.tcx().reserve_and_set_fn_alloc(instance, CTFE_ALLOC_SALT).into(),
+                                bx,
+                            ),
+                            ty: Ty::new_fn_ptr(bx.tcx(), const_.ty().fn_sig(bx.tcx())),
+                        }
                     } else {
                         span_bug!(span, "invalid type for asm sym (fn)");
                     }
                 }
                 mir::InlineAsmOperand::SymStatic { def_id } => {
-                    InlineAsmOperandRef::SymStatic { def_id }
+                    if bx.tcx().is_thread_local_static(def_id) {
+                        InlineAsmOperandRef::SymThreadLocalStatic { def_id }
+                    } else {
+                        InlineAsmOperandRef::Const {
+                            value: Scalar::from_pointer(
+                                bx.tcx().reserve_and_set_static_alloc(def_id).into(),
+                                bx,
+                            ),
+                            ty: bx.tcx().static_ptr_ty(def_id, bx.typing_env()),
+                        }
+                    }
                 }
                 mir::InlineAsmOperand::Label { target_index } => {
                     InlineAsmOperandRef::Label { label: self.llbb(targets[target_index]) }
@@ -1615,8 +1681,8 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                 MergingSucc::False
             }
 
-            mir::TerminatorKind::Goto { target } => {
-                helper.funclet_br(self, bx, target, mergeable_succ(), &terminator.attributes)
+            mir::TerminatorKind::Goto { target, ref loop_hint_attrs } => {
+                helper.funclet_br(self, bx, target, mergeable_succ(), loop_hint_attrs)
             }
 
             mir::TerminatorKind::SwitchInt { ref discr, ref targets } => {
@@ -1730,22 +1796,166 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
         }
     }
 
+    /// When using CMSE, values that cross the secure boundary from secure to non-secure mode can
+    /// contain stale secure data in their padding bytes. This function clears that data. This is
+    /// required when a value is:
+    ///
+    /// - passed to an `extern "cmse-nonsecure-call"` function
+    /// - returned from an `extern "cmse-nonsecure-entry"` function
+    ///
+    /// This function clears both:
+    ///
+    /// - variant-independent padding, bytes that are padding for all valid values of the type
+    /// - variant-dependent padding, bytes that are padding for some but not all values of the type
+    ///
+    /// Clearing variant-dependent padding requires looking at the data at runtime to determine what
+    /// bytes to clear.
+    fn clear_padding_cmse(
+        &mut self,
+        bx: &mut Bx,
+        base_ptr: Bx::Value,
+        limit: Size,
+        layout: TyAndLayout<'tcx>,
+    ) {
+        // First clear variant-independent padding, a series of memsets.
+        let variant_independent = layout.variant_independent_padding_ranges(self.cx);
+        self.zero_byte_ranges(bx, base_ptr, Size::ZERO, limit, &variant_independent);
+
+        // Then clear the extra padding of the active variant of any (nested) enum.
+        self.clear_variant_dependent_padding(bx, base_ptr, Size::ZERO, limit, layout);
+    }
+
+    fn clear_variant_dependent_padding(
+        &mut self,
+        bx: &mut Bx,
+        base_ptr: Bx::Value,
+        base_offset: Size,
+        limit: Size,
+        layout: TyAndLayout<'tcx>,
+    ) {
+        let cx = self.cx;
+
+        if !layout.has_variant_dependent_padding(cx) {
+            return;
+        }
+
+        // Recurse into aggregate fields/elements to reach any nested enums.
+        match layout.fields {
+            FieldsShape::Array { stride, count } => {
+                let elem = layout.field(cx, 0);
+                if elem.has_variant_dependent_padding(cx) {
+                    for idx in 0..count {
+                        let off = base_offset + idx * stride;
+                        self.clear_variant_dependent_padding(bx, base_ptr, off, limit, elem);
+                    }
+                }
+            }
+            FieldsShape::Arbitrary { .. } => {
+                for i in 0..layout.fields.count() {
+                    let field = layout.field(cx, i);
+                    if field.has_variant_dependent_padding(cx) {
+                        let off = base_offset + layout.fields.offset(i);
+                        self.clear_variant_dependent_padding(bx, base_ptr, off, limit, field);
+                    }
+                }
+            }
+            FieldsShape::Primitive | FieldsShape::Union(_) => { /* nothing to visit */ }
+        }
+
+        // If this is not a multi-variant enum, we're done.
+        let Variants::Multiple { ref variants, .. } = layout.variants else {
+            return;
+        };
+
+        // Collect variants that will need padding cleared.
+        let mut work = Vec::with_capacity(variants.len());
+        for i in 0..variants.len() {
+            let idx = VariantIdx::from_usize(i);
+            let variant = layout.for_variant(cx, idx);
+
+            // Don't consider uninhabited variants.
+            if variant.is_uninhabited() {
+                continue;
+            }
+
+            let variant_dependent = layout.variant_dependent_padding_ranges(cx, idx);
+            let has_nested_variant_dependent = (0..variant.fields.count())
+                .any(|i| variant.field(cx, i).has_variant_dependent_padding(cx));
+
+            if !variant_dependent.is_empty() || has_nested_variant_dependent {
+                work.push((idx, variant, variant_dependent));
+            }
+        }
+
+        if work.is_empty() {
+            return;
+        }
+
+        // Build the switch and clear the appropriate padding for each variant.
+        let root_block = bx.llbb();
+        let join_block = bx.append_sibling_block("cmse_pad_join");
+        let mut cases = Vec::with_capacity(work.len());
+
+        for (idx, variant, variant_dependent) in work.into_iter() {
+            let Some(discr) = layout.ty.discriminant_for_variant(bx.tcx(), idx) else {
+                bug!("multi-variant layout on a type without discriminants");
+            };
+
+            let variant_block = bx.append_sibling_block("cmse_pad_variant");
+            bx.switch_to_block(variant_block);
+
+            // Clear the padding of this variant.
+            self.zero_byte_ranges(bx, base_ptr, base_offset, limit, &variant_dependent);
+
+            // Recurse into the fields.
+            for i in 0..variant.fields.count() {
+                let field = variant.field(cx, i);
+                let off = base_offset + variant.fields.offset(i);
+                self.clear_variant_dependent_padding(bx, base_ptr, off, limit, field);
+            }
+
+            bx.br(join_block);
+            cases.push((discr.val, variant_block));
+        }
+
+        // Construct the dispatch.
+        bx.switch_to_block(root_block);
+
+        let discr_ty = layout.ty.discriminant_ty(bx.tcx());
+        let enum_ptr = bx.inbounds_ptradd(base_ptr, bx.const_usize(base_offset.bytes()));
+        let operand = OperandRef {
+            val: OperandValue::Ref(PlaceValue::new_sized(enum_ptr, layout.align.abi)),
+            layout,
+            move_annotation: None,
+        };
+        let discr = operand.codegen_get_discr(self, bx, discr_ty);
+
+        // Default to the join block (for variants without variant-dependent padding).
+        bx.switch(discr, join_block, cases.into_iter());
+
+        bx.switch_to_block(join_block);
+    }
+
     fn zero_byte_ranges(
         &mut self,
         bx: &mut Bx,
         ptr: Bx::Value,
+        offset: Size,
         limit: Size,
         ranges: &[Range<Size>],
     ) {
         let zero = bx.const_u8(0);
 
         for range in ranges {
-            let end = cmp::min(range.end, limit);
+            let start = range.start + offset;
+            let end = range.end + offset;
+
+            let end = cmp::min(end, limit);
             if range.start >= end {
                 continue;
             }
-            let offset = bx.const_usize(range.start.bytes());
-            let len = bx.const_usize((end - range.start).bytes());
+            let offset = bx.const_usize(start.bytes());
+            let len = bx.const_usize((end - start).bytes());
             let ptr = bx.inbounds_ptradd(ptr, offset);
             bx.memset(ptr, zero, len, Align::ONE, MemFlags::empty());
         }
@@ -1763,9 +1973,10 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
     ) {
         match arg.mode {
             PassMode::Ignore => return,
-            PassMode::Cast { pad_i32: true, .. } => {
+            PassMode::Cast { pad_i32_count, .. } => {
                 // Fill padding with undef value, where applicable.
-                llargs.push(bx.const_undef(bx.reg_backend_type(&Reg::i32())));
+                let undef = bx.const_undef(bx.reg_backend_type(&Reg::i32()));
+                llargs.extend(std::iter::repeat_n(undef, usize::from(pad_i32_count)));
             }
             PassMode::Pair(..) => match op.val {
                 Pair(a, b) => {
@@ -1775,7 +1986,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                 }
                 _ => bug!("codegen_argument: {:?} invalid for pair argument", op),
             },
-            PassMode::Indirect { attrs: _, meta_attrs: Some(_), on_stack: _ } => match op.val {
+            PassMode::IndirectUnsized { attrs: _, meta_attrs: _ } => match op.val {
                 Ref(PlaceValue { llval: a, llextra: Some(b), .. }) => {
                     llargs.push(a);
                     llargs.push(b);
@@ -1809,10 +2020,15 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                     (scratch.val.llval, scratch.val.align, true)
                 }
                 PassMode::Direct(_) => (op.immediate(), arg.layout.align.abi, false),
-                PassMode::Ignore | PassMode::Pair(..) => unreachable!("handled above"),
+                PassMode::Ignore | PassMode::Pair(..) | PassMode::IndirectUnsized { .. } => {
+                    unreachable!("handled above")
+                }
             },
             Ref(op_place_val) => match arg.mode {
-                PassMode::Indirect { attrs, on_stack, .. } => {
+                PassMode::Indirect { attrs, mode, .. } => {
+                    if mode == IndirectMode::AmdgpuKernelArg {
+                        bug!("{op:?} passed as amdgpu kernel argument with abi {arg:?}");
+                    }
                     // For `foo(packed.large_field)`, and types with <4 byte alignment on x86,
                     // alignment requirements may be higher than the type's alignment, so copy
                     // to a higher-aligned alloca.
@@ -1821,7 +2037,9 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                         None => arg.layout.align.abi,
                     };
                     // Copy to an alloca when the argument is neither by-val nor by-move.
-                    if op_place_val.align < required_align || (!on_stack && !by_move) {
+                    if op_place_val.align < required_align
+                        || (mode == IndirectMode::Pointer && !by_move)
+                    {
                         let scratch = PlaceValue::alloca(bx, arg.layout.size, required_align);
                         bx.lifetime_start(scratch.llval, arg.layout.size);
                         op.store_with_annotation(bx, scratch.with_type(arg.layout));
@@ -1831,11 +2049,15 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                         (op_place_val.llval, op_place_val.align, true)
                     }
                 }
+                PassMode::IndirectUnsized { .. } => unreachable!("handled above"),
                 _ => (op_place_val.llval, op_place_val.align, true),
             },
             ZeroSized => match arg.mode {
-                PassMode::Indirect { on_stack, .. } => {
-                    if on_stack {
+                PassMode::Indirect { mode, .. } => {
+                    if mode == IndirectMode::AmdgpuKernelArg {
+                        bug!("{op:?} passed as amdgpu kernel argument with abi {arg:?}");
+                    }
+                    if mode == IndirectMode::OnStack {
                         // It doesn't seem like any target can have `byval` ZSTs, so this assert
                         // is here to replace a would-be untested codepath.
                         bug!("ZST {op:?} passed on stack with abi {arg:?}");
@@ -1852,7 +2074,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
 
         if by_ref && !arg.is_indirect() {
             // Have to load the argument, maybe while casting it.
-            if let PassMode::Cast { cast, pad_i32: _ } = &arg.mode {
+            if let PassMode::Cast { cast, pad_i32_count: _ } = &arg.mode {
                 // The ABI mandates that the value is passed as a different struct representation.
                 // Spill and reload it from the stack to convert from the Rust representation to
                 // the ABI representation.
@@ -1880,18 +2102,13 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                 );
 
                 // The arguments of an `extern "cmse-nonsecure-call"` function cross the secure
-                // boundary. Zero padding bytes so information does not leak.
-                //
-                // This only zeroes "guaranteed" padding. There may be more bytes that are
-                // padding for some but not all variants of this type; those are not zeroed.
-                //
-                // Passing an argument with value-dependent padding will instead trigger a lint.
+                // boundary. Clear any padding bytes so information does not leak.
                 if conv == CanonAbi::Arm(ArmCall::CCmseNonSecureCall) {
-                    self.zero_byte_ranges(
+                    self.clear_padding_cmse(
                         bx,
                         llscratch,
                         Size::from_bytes(copy_bytes),
-                        &arg.layout.padding_ranges(bx.cx()),
+                        arg.layout,
                     );
                 }
 
@@ -2008,7 +2225,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
     // FIXME(eddyb) rename this to `eh_pad_for_uncached`.
     fn landing_pad_for_uncached(&mut self, bb: mir::BasicBlock) -> Bx::BasicBlock {
         let llbb = self.llbb(bb);
-        if base::wants_new_eh_instructions(self.cx.sess()) {
+        if base::wants_new_eh_instructions(&self.cx.sess().target) {
             let cleanup_bb = Bx::append_block(self.cx, self.llfn, &format!("funclet_{bb:?}"));
             let mut cleanup_bx = Bx::build(self.cx, cleanup_bb);
             let funclet = cleanup_bx.cleanup_pad(None, &[]);
@@ -2052,7 +2269,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
         // what outer catch_pad it is contained in.
         debug_assert!(
             outer_catchpad_bb.is_some()
-                == (base::wants_wasm_eh(self.cx.tcx().sess)
+                == (base::wants_wasm_eh(&self.cx.tcx().sess.target)
                     && reason == UnwindTerminateReason::InCleanup)
         );
 
@@ -2082,7 +2299,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
         let funclet;
         let llbb;
         let mut bx;
-        if base::wants_new_eh_instructions(self.cx.sess()) {
+        if base::wants_new_eh_instructions(&self.cx.sess().target) {
             // This is a basic block that we're aborting the program for,
             // notably in an `extern` function. These basic blocks are inserted
             // so that we assert that `extern` functions do indeed not panic,
@@ -2148,7 +2365,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
             // The `null` in first argument here is actually a RTTI type
             // descriptor for the C++ personality function, but `catch (...)`
             // has no type so it's null.
-            let args = if base::wants_msvc_seh(self.cx.sess()) {
+            let args = if base::wants_msvc_seh(&self.cx.sess().target) {
                 // This bitmask is a single `HT_IsStdDotDot` flag, which
                 // represents that this is a C++-style `catch (...)` block that
                 // only captures programmatic exceptions, not all SEH
@@ -2187,11 +2404,20 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
         let (fn_abi, fn_ptr, instance) =
             common::build_langcall(&bx, self.mir.span, reason.lang_item());
         if is_call_from_compiler_builtins_to_upstream_monomorphization(bx.tcx(), instance) {
-            bx.abort();
+            bx.abort_immediate();
         } else {
             let fn_ty = bx.fn_decl_backend_type(fn_abi);
 
-            let llret = bx.call(fn_ty, None, Some(fn_abi), fn_ptr, &[], funclet.as_ref(), None);
+            let llret = bx.call(
+                fn_ty,
+                None,
+                Some(fn_abi),
+                fn_ptr,
+                ReturnSlot::Direct,
+                &[],
+                funclet.as_ref(),
+                None,
+            );
             bx.apply_attrs_to_cleanup_callsite(llret);
         }
 
@@ -2227,11 +2453,10 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
         bx: &mut Bx,
         dest: mir::Place<'tcx>,
         fn_ret: &ArgAbi<'tcx, Ty<'tcx>>,
-        llargs: &mut Vec<Bx::Value>,
-    ) -> ReturnDest<'tcx, Bx::Value> {
+    ) -> (ReturnDest<'tcx, Bx::Value>, ReturnSlot<Bx::Value>) {
         // If the return is ignored, we can just return a do-nothing `ReturnDest`.
         if fn_ret.is_ignore() {
-            return ReturnDest::Nothing;
+            return (ReturnDest::Nothing, ReturnSlot::Direct);
         }
         let dest = if let Some(index) = dest.as_local() {
             match self.locals[index] {
@@ -2245,10 +2470,12 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                         // but the calling convention has an indirect return.
                         let tmp = PlaceRef::alloca(bx, fn_ret.layout);
                         tmp.storage_live(bx);
-                        llargs.push(tmp.val.llval);
-                        ReturnDest::IndirectOperand(tmp, index)
+                        (
+                            ReturnDest::IndirectOperand(tmp, index),
+                            ReturnSlot::Indirect(tmp.val.llval),
+                        )
                     } else {
-                        ReturnDest::DirectOperand(index)
+                        (ReturnDest::DirectOperand(index), ReturnSlot::Direct)
                     };
                 }
                 LocalRef::Operand(_) => {
@@ -2268,10 +2495,9 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                 // to create a temporary.
                 span_bug!(self.mir.span, "can't directly store to unaligned value");
             }
-            llargs.push(dest.val.llval);
-            ReturnDest::Nothing
+            (ReturnDest::Nothing, ReturnSlot::Indirect(dest.val.llval))
         } else {
-            ReturnDest::Store(dest)
+            (ReturnDest::Store(dest), ReturnSlot::Direct)
         }
     }
 

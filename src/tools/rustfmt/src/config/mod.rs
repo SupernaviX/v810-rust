@@ -65,6 +65,9 @@ create_config! {
         doc comments.";
     doc_comment_code_block_width: DocCommentCodeBlockWidth, false, "Maximum width for code \
         snippets in doc comments. No effect unless format_code_in_doc_comments = true";
+    doc_comment_code_block_small_heuristics: DocUseSmallHeuristics, false,
+        "Value for use_small_heuristics for code blocks in doc comments. \
+        No effect unless format_code_in_doc_comments = true";
     comment_width: CommentWidth, false,
         "Maximum length of comments. No effect unless wrap_comments = true";
     normalize_comments: NormalizeComments, false, "Convert /* */ comments to // comments where \
@@ -78,7 +81,7 @@ create_config! {
         "Format the bodies of declarative macro definitions";
     skip_macro_invocations: SkipMacroInvocations, false,
         "Skip formatting the bodies of macros invoked with the following names.";
-    hex_literal_case: HexLiteralCaseConfig, false, "Format hexadecimal integer literals";
+    hex_literal_case: HexLiteralCaseConfig, true, "Format hexadecimal integer literals";
     float_literal_trailing_zero: FloatLiteralTrailingZeroConfig, false,
         "Add or remove trailing zero in floating-point literals";
 
@@ -351,50 +354,7 @@ impl Config {
         style_edition: Option<StyleEdition>,
         version: Option<Version>,
     ) -> Result<(Config, Option<PathBuf>), Error> {
-        /// Try to find a project file in the given directory and its parents.
-        /// Returns the path of the nearest project file if one exists,
-        /// or `None` if no project file was found.
-        fn resolve_project_file(dir: &Path) -> Result<Option<PathBuf>, Error> {
-            let mut current = if dir.is_relative() {
-                env::current_dir()?.join(dir)
-            } else {
-                dir.to_path_buf()
-            };
-
-            current = fs::canonicalize(current)?;
-
-            loop {
-                match get_toml_path(&current) {
-                    Ok(Some(path)) => return Ok(Some(path)),
-                    Err(e) => return Err(e),
-                    _ => (),
-                }
-
-                // If the current directory has no parent, we're done searching.
-                if !current.pop() {
-                    break;
-                }
-            }
-
-            // If nothing was found, check in the home directory.
-            if let Some(home_dir) = dirs::home_dir() {
-                if let Some(path) = get_toml_path(&home_dir)? {
-                    return Ok(Some(path));
-                }
-            }
-
-            // If none was found there either, check in the user's configuration directory.
-            if let Some(mut config_dir) = dirs::config_dir() {
-                config_dir.push("rustfmt");
-                if let Some(path) = get_toml_path(&config_dir)? {
-                    return Ok(Some(path));
-                }
-            }
-
-            Ok(None)
-        }
-
-        match resolve_project_file(dir)? {
+        match resolve_project_file(dir).or_else(|_| config_from_user_dirs())? {
             None => Ok((
                 Config::default_for_possible_style_edition(style_edition, edition, version),
                 None,
@@ -450,6 +410,53 @@ impl Config {
             }
         }
     }
+}
+
+/// Looks for a configuration file in the given directory and its parents.
+///
+/// Returns the path of the configuration file nearest to that directory if one exists, or `None` if
+/// none was found.
+fn resolve_project_file(dir: &Path) -> Result<Option<PathBuf>, Error> {
+    let mut current = if dir.is_relative() {
+        env::current_dir()?.join(dir)
+    } else {
+        dir.to_path_buf()
+    };
+
+    current = fs::canonicalize(current)?;
+
+    loop {
+        match get_toml_path(&current) {
+            Ok(Some(path)) => return Ok(Some(path)),
+            Err(e) => return Err(e),
+            _ => (),
+        }
+
+        // If the current directory has no parent, we're done searching.
+        if !current.pop() {
+            break Ok(None);
+        }
+    }
+}
+
+/// Looks for a configuration file in the user's home directory and configuration directory.
+///
+/// Returns the path of the first configuration file found in that order, or `None` if none was
+/// found.
+fn config_from_user_dirs() -> Result<Option<PathBuf>, Error> {
+    for dir in [
+        dirs::home_dir(),
+        dirs::config_dir().map(|d| d.join("rustfmt")),
+    ]
+    .iter()
+    .flatten()
+    {
+        if let Some(path) = get_toml_path(&dir)? {
+            return Ok(Some(path));
+        }
+    }
+
+    Ok(None)
 }
 
 /// Loads a config by checking the client-supplied options and if appropriate, the
@@ -531,14 +538,7 @@ fn config_path(options: &dyn CliOptions) -> Result<Option<PathBuf>, Error> {
     // If a config file cannot be found from the given path, return error.
     match options.config_path() {
         Some(path) if !path.exists() => config_path_not_found(path.to_str().unwrap()),
-        Some(path) if path.is_dir() => {
-            let config_file_path = get_toml_path(path)?;
-            if config_file_path.is_some() {
-                Ok(config_file_path)
-            } else {
-                config_path_not_found(path.to_str().unwrap())
-            }
-        }
+        Some(path) if path.is_dir() => resolve_project_file(path),
         Some(path) => Ok(Some(
             // Canonicalize only after checking above that the `path.exists()`.
             path.canonicalize()?,
@@ -699,6 +699,23 @@ mod test {
     }
 
     #[test]
+    fn test_adjust_max_width() {
+        // Regression tests for #7147, where we didn't handle overflows / integral cast outside of
+        // range properly.
+
+        // Reduce with huge amount saturates to zero instead of wraparound.
+        let mut config = Config::default();
+        config.reduce_max_width(usize::MAX);
+        assert_eq!(config.max_width(), 0);
+
+        // Increase with huge amount saturates instead of wraparound.
+        let mut config = Config::default();
+        config.set().max_width(usize::MAX - 1);
+        config.increase_max_width(2);
+        assert_eq!(config.max_width(), usize::MAX);
+    }
+
+    #[test]
     fn test_config_used_to_toml() {
         let config = Config::default();
 
@@ -772,6 +789,7 @@ single_line_let_else_max_width = 50
 wrap_comments = false
 format_code_in_doc_comments = false
 doc_comment_code_block_width = 100
+doc_comment_code_block_small_heuristics = "Inherit"
 comment_width = 80
 normalize_comments = false
 normalize_doc_attributes = false
@@ -864,6 +882,7 @@ single_line_let_else_max_width = 50
 wrap_comments = false
 format_code_in_doc_comments = false
 doc_comment_code_block_width = 100
+doc_comment_code_block_small_heuristics = "Inherit"
 comment_width = 80
 normalize_comments = false
 normalize_doc_attributes = false

@@ -1,9 +1,8 @@
-use clippy_utils::res::{MaybeDef, MaybeTypeckRes};
+use clippy_utils::res::{MaybeDef as _, MaybeTypeckRes as _};
 use rustc_errors::Applicability;
 use rustc_hir::intravisit::{Visitor, walk_expr};
 use rustc_hir::{Block, BlockCheckMode, Closure, Expr, ExprKind, Stmt, StmtKind, TyKind};
-use rustc_lint::{LateContext, LateLintPass};
-use rustc_session::declare_lint_pass;
+use rustc_lint::{LateContext, LateLintPass, declare_lint_pass};
 use rustc_span::Span;
 
 use clippy_utils::diagnostics::span_lint_and_then;
@@ -102,7 +101,7 @@ fn check_expr(cx: &LateContext<'_>, expr: &Expr<'_>, outer_span: Span) {
         }
 
         let mut ret_collector = RetCollector::default();
-        ret_collector.visit_expr(body.value);
+        ret_collector.visit_expr(&body.value);
 
         // Skip the lint if `return` is used in `Loop` in order not to suggest using `'label`.
         if ret_collector.ret_in_loop {
@@ -180,8 +179,8 @@ fn is_let_desugar(block: &Block<'_>) -> bool {
 /// NOTE: The functionality of this type is similar to
 /// [`clippy_utils::visitors::find_all_ret_expressions`], but we can't use
 /// `find_all_ret_expressions` instead of this type. The reasons are:
-/// 1. `find_all_ret_expressions` passes the argument of `ExprKind::Ret` to a callback, but what we
-///    need here is `ExprKind::Ret` itself.
+/// 1. `find_all_ret_expressions` passes the argument of `ExprKind::Ret` to a callback, but what we need here is
+///    `ExprKind::Ret` itself.
 /// 2. We can't trace current loop depth with `find_all_ret_expressions`.
 #[derive(Default)]
 struct RetCollector {

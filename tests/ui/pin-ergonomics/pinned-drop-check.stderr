@@ -1,24 +1,28 @@
 error[E0201]: duplicate definitions with name `pin_drop`:
   --> $DIR/pinned-drop-check.rs:196:9
    |
+LL |     impl Drop for Foo {
 LL |         fn drop(&pin mut self) {}
    |         ------------------------- previous definition here
 LL |         fn pin_drop(&pin mut self) {}
    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ duplicate definition
    |
   --> $SRC_DIR/core/src/ops/drop.rs:LL:COL
+  ::: $SRC_DIR/core/src/ops/drop.rs:LL:COL
    |
    = note: item in trait
 
 error[E0201]: duplicate definitions with name `pin_drop`:
   --> $DIR/pinned-drop-check.rs:201:9
    |
+LL |     impl Drop for Bar {
 LL |         fn drop(&pin mut self) {}
    |         ------------------------- previous definition here
 LL |         fn pin_drop(&pin mut self) {}
    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ duplicate definition
    |
   --> $SRC_DIR/core/src/ops/drop.rs:LL:COL
+  ::: $SRC_DIR/core/src/ops/drop.rs:LL:COL
    |
    = note: item in trait
 
@@ -71,12 +75,18 @@ error[E0046]: not all trait items implemented, missing one of: `drop`, `pin_drop
    |
 LL |     impl Drop for Foo {}
    |     ^^^^^^^^^^^^^^^^^ missing one of `drop`, `pin_drop` in implementation
+   |
+   = help: implement the missing item: `fn drop(&mut self) { todo!() }`
+   = help: implement the missing item: `fn pin_drop(self: Pin<&mut Self>) { todo!() }`
 
 error[E0046]: not all trait items implemented, missing one of: `drop`, `pin_drop`
   --> $DIR/pinned-drop-check.rs:60:5
    |
 LL |     impl Drop for Bar {}
    |     ^^^^^^^^^^^^^^^^^ missing one of `drop`, `pin_drop` in implementation
+   |
+   = help: implement the missing item: `fn drop(&mut self) { todo!() }`
+   = help: implement the missing item: `fn pin_drop(self: Pin<&mut Self>) { todo!() }`
 
 error: `Bar` must implement `pin_drop`
   --> $DIR/pinned-drop-check.rs:87:9

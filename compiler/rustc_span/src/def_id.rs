@@ -4,7 +4,7 @@ use std::hash::{BuildHasherDefault, Hash, Hasher};
 use rustc_data_structures::AtomicRef;
 use rustc_data_structures::fingerprint::Fingerprint;
 use rustc_data_structures::stable_hash::{
-    RawDefId, RawDefPathHash, StableHash, StableHashCtxt, StableHasher, StableOrd, ToStableHashKey,
+    RawDefId, StableHash, StableHashCtxt, StableHasher, StableOrd, ToStableHashKey,
 };
 use rustc_data_structures::unhash::Unhasher;
 use rustc_hashes::Hash64;
@@ -12,7 +12,7 @@ use rustc_index::Idx;
 use rustc_macros::{BlobDecodable, Decodable, Encodable, StableHash};
 use rustc_serialize::{Decodable, Encodable};
 
-use crate::{SpanDecoder, SpanEncoder, Symbol};
+use crate::{BlobDecoder, SpanEncoder, Symbol};
 
 pub type StableCrateIdMap =
     indexmap::IndexMap<StableCrateId, CrateNum, BuildHasherDefault<Unhasher>>;
@@ -115,16 +115,6 @@ impl DefPathHash {
     #[inline]
     pub fn new(stable_crate_id: StableCrateId, local_hash: Hash64) -> DefPathHash {
         DefPathHash(Fingerprint::new(stable_crate_id.0, local_hash))
-    }
-
-    #[inline]
-    pub fn to_raw_def_path_hash(self) -> RawDefPathHash {
-        RawDefPathHash(self.0.to_le_bytes())
-    }
-
-    #[inline]
-    pub fn from_raw_def_path_hash(RawDefPathHash(a): RawDefPathHash) -> DefPathHash {
-        DefPathHash(Fingerprint::from_le_bytes(a))
     }
 }
 
@@ -409,14 +399,14 @@ impl fmt::Debug for LocalDefId {
 }
 
 impl<E: SpanEncoder> Encodable<E> for LocalDefId {
-    fn encode(&self, s: &mut E) {
-        self.to_def_id().encode(s);
+    fn encode(&self, e: &mut E) {
+        e.encode_local_def_id(*self);
     }
 }
 
-impl<D: SpanDecoder> Decodable<D> for LocalDefId {
+impl<D: BlobDecoder> Decodable<D> for LocalDefId {
     fn decode(d: &mut D) -> LocalDefId {
-        DefId::decode(d).expect_local()
+        d.decode_local_def_id()
     }
 }
 
@@ -453,7 +443,7 @@ impl ToStableHashKey for DefId {
 
     #[inline]
     fn to_stable_hash_key<Hcx: StableHashCtxt>(&self, hcx: &mut Hcx) -> DefPathHash {
-        DefPathHash::from_raw_def_path_hash(hcx.def_path_hash(self.to_raw_def_id()))
+        DefPathHash(hcx.def_path_hash(self.to_raw_def_id()))
     }
 }
 

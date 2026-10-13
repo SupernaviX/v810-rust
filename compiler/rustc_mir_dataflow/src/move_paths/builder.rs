@@ -2,8 +2,9 @@ use std::mem;
 
 use rustc_index::IndexVec;
 use rustc_middle::mir::*;
+use rustc_middle::ty::consts::ConstExt;
 use rustc_middle::ty::{self, Ty, TyCtxt, TypeVisitableExt};
-use rustc_middle::{bug, span_bug};
+use rustc_span::{bug, span_bug};
 use smallvec::{SmallVec, smallvec};
 use tracing::debug;
 
@@ -23,7 +24,7 @@ struct MoveDataBuilder<'a, 'tcx, F> {
 impl<'a, 'tcx, F: Fn(Ty<'tcx>) -> bool> MoveDataBuilder<'a, 'tcx, F> {
     fn new(body: &'a Body<'tcx>, tcx: TyCtxt<'tcx>, filter: F) -> Self {
         let mut move_paths = IndexVec::new();
-        let mut path_map = IndexVec::new();
+        let mut move_out_path_map = IndexVec::new();
         let mut init_path_map = IndexVec::new();
 
         let locals = body
@@ -36,7 +37,7 @@ impl<'a, 'tcx, F: Fn(Ty<'tcx>) -> bool> MoveDataBuilder<'a, 'tcx, F> {
                 if filter(l.ty) {
                     Some(new_move_path(
                         &mut move_paths,
-                        &mut path_map,
+                        &mut move_out_path_map,
                         &mut init_path_map,
                         None,
                         Place::from(i),
@@ -52,15 +53,15 @@ impl<'a, 'tcx, F: Fn(Ty<'tcx>) -> bool> MoveDataBuilder<'a, 'tcx, F> {
             loc: Location::START,
             tcx,
             data: MoveData {
-                moves: IndexVec::new(),
-                loc_map: LocationMap::new(body),
+                move_outs: IndexVec::new(),
+                move_out_loc_map: LocationMap::new(body),
                 rev_lookup: MovePathLookup {
                     locals,
                     projections: Default::default(),
                     un_derefer: Default::default(),
                 },
                 move_paths,
-                path_map,
+                move_out_path_map,
                 inits: IndexVec::new(),
                 init_loc_map: LocationMap::new(body),
                 init_path_map,
@@ -72,7 +73,7 @@ impl<'a, 'tcx, F: Fn(Ty<'tcx>) -> bool> MoveDataBuilder<'a, 'tcx, F> {
 
 fn new_move_path<'tcx>(
     move_paths: &mut IndexVec<MovePathIndex, MovePath<'tcx>>,
-    path_map: &mut IndexVec<MovePathIndex, SmallVec<[MoveOutIndex; 4]>>,
+    move_out_path_map: &mut IndexVec<MovePathIndex, SmallVec<[MoveOutIndex; 4]>>,
     init_path_map: &mut IndexVec<MovePathIndex, SmallVec<[InitIndex; 4]>>,
     parent: Option<MovePathIndex>,
     place: Place<'tcx>,
@@ -85,7 +86,7 @@ fn new_move_path<'tcx>(
         move_paths[move_path].next_sibling = next_sibling;
     }
 
-    let path_map_ent = path_map.push(smallvec![]);
+    let path_map_ent = move_out_path_map.push(smallvec![]);
     assert_eq!(path_map_ent, move_path);
 
     let init_path_map_ent = init_path_map.push(smallvec![]);
@@ -279,7 +280,7 @@ impl<'a, 'tcx, F: Fn(Ty<'tcx>) -> bool> MoveDataBuilder<'a, 'tcx, F> {
                 base = *data.rev_lookup.projections.entry((base, move_elem)).or_insert_with(|| {
                     new_move_path(
                         &mut data.move_paths,
-                        &mut data.path_map,
+                        &mut data.move_out_path_map,
                         &mut data.init_path_map,
                         Some(base),
                         place_ref.project_deeper(&[elem], tcx),
@@ -305,12 +306,12 @@ impl<'a, 'tcx, F: Fn(Ty<'tcx>) -> bool> MoveDataBuilder<'a, 'tcx, F> {
         mk_place: impl FnOnce(TyCtxt<'tcx>) -> Place<'tcx>,
     ) -> MovePathIndex {
         let MoveDataBuilder {
-            data: MoveData { rev_lookup, move_paths, path_map, init_path_map, .. },
+            data: MoveData { rev_lookup, move_paths, move_out_path_map, init_path_map, .. },
             tcx,
             ..
         } = self;
         *rev_lookup.projections.entry((base, elem)).or_insert_with(move || {
-            new_move_path(move_paths, path_map, init_path_map, Some(base), mk_place(*tcx))
+            new_move_path(move_paths, move_out_path_map, init_path_map, Some(base), mk_place(*tcx))
         })
     }
 
@@ -323,7 +324,7 @@ impl<'a, 'tcx, F: Fn(Ty<'tcx>) -> bool> MoveDataBuilder<'a, 'tcx, F> {
     fn finalize(self) -> MoveData<'tcx> {
         debug!("{}", {
             debug!("moves for {:?}:", self.body.span);
-            for (j, mo) in self.data.moves.iter_enumerated() {
+            for (j, mo) in self.data.move_outs.iter_enumerated() {
                 debug!("    {:?} = {:?}", j, mo);
             }
             debug!("move paths for {:?}:", self.body.span);
@@ -448,7 +449,7 @@ impl<'a, 'tcx, F: Fn(Ty<'tcx>) -> bool> MoveDataBuilder<'a, 'tcx, F> {
     fn gather_terminator(&mut self, term: &Terminator<'tcx>) {
         debug!("gather_terminator({:?}, {:?})", self.loc, term);
         match term.kind {
-            TerminatorKind::Goto { target: _ }
+            TerminatorKind::Goto { target: _, .. }
             | TerminatorKind::FalseEdge { .. }
             | TerminatorKind::FalseUnwind { .. } => {}
             // In some sense returning moves the return place into the current
@@ -553,13 +554,13 @@ impl<'a, 'tcx, F: Fn(Ty<'tcx>) -> bool> MoveDataBuilder<'a, 'tcx, F> {
     }
 
     fn record_move(&mut self, place: Place<'tcx>, path: MovePathIndex) {
-        let move_out = self.data.moves.push(MoveOut { path, source: self.loc });
+        let move_out = self.data.move_outs.push(MoveOut { path, source: self.loc });
         debug!(
             "gather_move({:?}, {:?}): adding move {:?} of {:?}",
             self.loc, place, move_out, path
         );
-        self.data.path_map[path].push(move_out);
-        self.data.loc_map[self.loc].push(move_out);
+        self.data.move_out_path_map[path].push(move_out);
+        self.data.move_out_loc_map[self.loc].push(move_out);
     }
 
     fn gather_init(&mut self, place: PlaceRef<'tcx>, kind: InitKind) {

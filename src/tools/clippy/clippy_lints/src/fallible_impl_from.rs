@@ -1,11 +1,10 @@
 use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::macros::{is_panic, root_macro_call_first_node};
 use clippy_utils::method_chain_args;
-use clippy_utils::res::MaybeDef;
+use clippy_utils::res::MaybeDef as _;
 use rustc_hir as hir;
-use rustc_lint::{LateContext, LateLintPass};
+use rustc_lint::{LateContext, LateLintPass, declare_lint_pass};
 use rustc_middle::ty;
-use rustc_session::declare_lint_pass;
 use rustc_span::{Span, sym};
 
 declare_clippy_lint! {
@@ -106,7 +105,7 @@ fn lint_impl_body(cx: &LateContext<'_>, item_def_id: hir::OwnerId, impl_span: Sp
             typeck_results: cx.tcx.typeck(impl_item_def_id),
             result: Vec::new(),
         };
-        fpu.visit_expr(body.value);
+        fpu.visit_expr(&body.value);
 
         // if we've found one, lint
         if !fpu.result.is_empty() {

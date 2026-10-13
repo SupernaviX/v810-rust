@@ -1,8 +1,9 @@
 use crate::alloc::Allocator;
 use crate::boxed::Box;
 use crate::io::{
-    self, BorrowedCursor, Cursor, ErrorKind, IoSlice, IoSliceMut, Read, WriteThroughCursor,
-    slice_write, slice_write_all, slice_write_all_vectored, slice_write_vectored,
+    self, BorrowedCursor, BufRead, Cursor, ErrorKind, IoSlice, IoSliceMut, Read,
+    WriteThroughCursor, slice_write, slice_write_all, slice_write_all_vectored,
+    slice_write_vectored,
 };
 use crate::string::String;
 use crate::vec::Vec;
@@ -103,6 +104,19 @@ where
     }
 }
 
+#[stable(feature = "rust1", since = "1.0.0")]
+impl<T> BufRead for Cursor<T>
+where
+    T: AsRef<[u8]>,
+{
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        Ok(Cursor::split(self).1)
+    }
+    fn consume(&mut self, amt: usize) {
+        self.set_position(self.position() + amt as u64);
+    }
+}
+
 /// Reserves the required space, and pads the vec with 0s if necessary.
 fn reserve_and_pad<A: Allocator>(
     pos_mut: &mut u64,
@@ -141,7 +155,7 @@ fn reserve_and_pad<A: Allocator>(
         // to eliminate that extra branch
         let spare = vec.spare_capacity_mut();
         debug_assert!(spare.len() >= diff);
-        // Safety: we have allocated enough capacity for this.
+        // SAFETY: we have allocated enough capacity for this.
         // And we are only writing, not reading
         unsafe {
             spare.get_unchecked_mut(..diff).fill(core::mem::MaybeUninit::new(0));
@@ -162,6 +176,7 @@ where
     A: Allocator,
 {
     debug_assert!(vec.capacity() >= pos + buf.len());
+    // SAFETY: Upheld by caller.
     unsafe { vec.as_mut_ptr().add(pos).copy_from(buf.as_ptr(), buf.len()) };
     pos + buf.len()
 }
@@ -185,7 +200,7 @@ where
     let mut pos = reserve_and_pad(pos_mut, vec, buf_len)?;
 
     // Write the buf then progress the vec forward if necessary
-    // Safety: we have ensured that the capacity is available
+    // SAFETY: we have ensured that the capacity is available
     // and that all bytes get written up to pos
     unsafe {
         pos = vec_write_all_unchecked(pos, vec, buf);
@@ -223,8 +238,8 @@ where
     let buf_len = bufs.iter().fold(0usize, |a, b| a.saturating_add(b.len()));
     let mut pos = reserve_and_pad(pos_mut, vec, buf_len)?;
 
-    // Write the buf then progress the vec forward if necessary
-    // Safety: we have ensured that the capacity is available
+    // Write the buf then progress the vec forward if necessary.
+    // SAFETY: We have ensured that the capacity is available
     // and that all bytes get written up to the last pos
     unsafe {
         for buf in bufs {

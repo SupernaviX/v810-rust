@@ -1,13 +1,15 @@
 use std::ffi::OsStr;
+use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
+use crate::build_sysroot::{SysrootConfig, SysrootKind};
 use crate::path::{Dirs, RelPath};
 use crate::prepare::{GitRepo, apply_patches};
 use crate::rustc_info::get_default_sysroot;
 use crate::shared_utils::rustflags_from_env;
 use crate::utils::{CargoProject, Compiler, LogGroup, ensure_empty_dir, spawn_and_wait};
-use crate::{CodegenBackend, SysrootKind, build_sysroot, config};
+use crate::{CodegenBackend, build_sysroot, config};
 
 static BUILD_EXAMPLE_OUT_DIR: RelPath = RelPath::build("example");
 
@@ -86,9 +88,27 @@ const BASE_SYSROOT_SUITE: &[TestCase] = &[
         &[],
     ),
     TestCase::build_bin_and_run("aot.float-minmax-pass", "example/float-minmax-pass.rs", &[]),
+    TestCase::custom("aot.powi_libcall_signature", &|runner| {
+        let mut cmd = runner.rustc_command(["example/powi-libcall-signature.rs"]);
+        let output = cmd.output().unwrap();
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+
+        assert!(!output.status.success(), "expected compilation to fail, got success");
+        assert!(
+            combined.contains("attempt to declare `__powisf2`"),
+            "expected signature mismatch error, got:\n{combined}"
+        );
+        assert!(
+            !combined.contains("internal compiler error") && !combined.contains("panicked at"),
+            "expected graceful error, not ICE:\n{combined}"
+        );
+    }),
     TestCase::build_bin_and_run("aot.issue-72793", "example/issue-72793.rs", &[]),
     TestCase::build_bin("aot.issue-59326", "example/issue-59326.rs"),
-    TestCase::build_bin_and_run("aot.neon", "example/neon.rs", &[]),
     TestCase::build_bin_and_run("aot.gen_block_iterate", "example/gen_block_iterate.rs", &[]),
     TestCase::build_bin_and_run("aot.raw-dylib", "example/raw-dylib.rs", &[]),
     TestCase::custom("test.sysroot", &|runner| {
@@ -146,9 +166,9 @@ static REGEX: CargoProject = CargoProject::new(REGEX_REPO.source_dir(), "regex_t
 pub(crate) static GRAVIOLA_REPO: GitRepo = GitRepo::github(
     "ctz",
     "graviola",
-    "c779b83cfd7114c4802293700c92cfb5e05cb4b7",
+    "7763d0cc617d6f5f66c3bc0fe9b3d8581d781b6a", // v0.4.1
     &["thirdparty/cavp", "thirdparty/wycheproof"],
-    "e0925ceb21a56101",
+    "7fa5a75b9fb1ac40",
     "graviola",
 );
 
@@ -161,6 +181,12 @@ static PORTABLE_SIMD: CargoProject = CargoProject::new(PORTABLE_SIMD_SRC, "porta
 static SYSROOT_TESTS_SRC: RelPath = RelPath::build("sysroot_tests");
 
 static SYSROOT_TESTS: CargoProject = CargoProject::new(SYSROOT_TESTS_SRC, "sysroot_tests_target");
+
+static STDARCH_SRC: RelPath = RelPath::build("stdarch");
+
+static STDARCH: CargoProject = CargoProject::new(STDARCH_SRC, "stdarch_target");
+static STDARCH_RUST_PROGRAMS: CargoProject =
+    CargoProject::new(RelPath::build("stdarch/rust_programs"), "stdarch_rust_programs_target");
 
 const EXTENDED_SYSROOT_SUITE: &[TestCase] = &[
     TestCase::custom("test.rust-random/rand", &|runner| {
@@ -213,7 +239,7 @@ const EXTENDED_SYSROOT_SUITE: &[TestCase] = &[
         }
     }),
     TestCase::custom("test.graviola", &|runner| {
-        let (arch, _) = runner.target_compiler.triple.split_once('-').unwrap();
+        let (arch, _) = runner.target_compiler.target.split_once('-').unwrap();
 
         if !["aarch64", "x86_64"].contains(&arch) {
             eprintln!("Skipping `graviola` tests: unsupported target");
@@ -231,16 +257,7 @@ const EXTENDED_SYSROOT_SUITE: &[TestCase] = &[
             test_cmd.env("GRAVIOLA_CPU_DISABLE_avx512bw", "1");
             test_cmd.env("GRAVIOLA_CPU_DISABLE_avx512vl", "1");
 
-            test_cmd.args([
-                "-p",
-                "graviola",
-                "--lib",
-                "--",
-                "-q",
-                // FIXME: Disable AVX-512 until intrinsics are supported.
-                "--skip",
-                "check_counter512",
-            ]);
+            test_cmd.args(["-p", "graviola", "--lib", "--", "-q"]);
             spawn_and_wait(test_cmd);
         } else {
             eprintln!("Cross-Compiling: Not running tests");
@@ -267,22 +284,132 @@ const EXTENDED_SYSROOT_SUITE: &[TestCase] = &[
         if runner.is_native {
             let mut test_cmd = PORTABLE_SIMD.test(&runner.target_compiler, &runner.dirs);
             // FIXME remove --tests once examples work: https://github.com/rust-lang/portable-simd/issues/470
-            test_cmd.arg("-q").arg("--tests");
+            // FIXME missing arm64 intrinsics for swizzle_dyn
+            test_cmd.arg("-q").arg("--tests").arg("--").arg("--skip").arg("swizzle_dyn");
             spawn_and_wait(test_cmd);
         }
+    }),
+    TestCase::custom("test.stdarch-core", &|runner| {
+        let target = runner.target_compiler.target.as_str();
+        let (arch, _) = target.split_once('-').unwrap();
+
+        // FIXME: Add support for remaining architectures.
+        if !["aarch64"].contains(&arch) {
+            eprintln!("Skipping `stdarch-core` tests: unsupported target");
+            return;
+        }
+
+        apply_patches(
+            &runner.dirs,
+            "stdarch",
+            &runner.stdlib_source.join("library/stdarch"),
+            &STDARCH_SRC.to_path(&runner.dirs),
+        );
+
+        STDARCH.clean(&runner.dirs);
+
+        let skip = format!("build_system/stdarch_skip/{arch}_core.txt");
+        let skip = fs::read_to_string(runner.dirs.source_dir.join(skip)).unwrap_or_default();
+
+        let skip_functions = skip
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        if runner.is_native {
+            let mut test_cmd = STDARCH.test(&runner.target_compiler, &runner.dirs);
+
+            test_cmd.env("TARGET", target);
+            test_cmd.env("STDARCH_TEST_SKIP_FUNCTION", &skip_functions);
+
+            test_cmd.args(["-p", "core_arch", "--tests", "--", "-q"]);
+            spawn_and_wait(test_cmd);
+        } else {
+            eprintln!("Cross-Compiling: Not running tests");
+            let mut build_cmd = STDARCH.build(&runner.target_compiler, &runner.dirs);
+
+            build_cmd.env("TARGET", target);
+
+            build_cmd.args(["-p", "core_arch", "--tests"]);
+            spawn_and_wait(build_cmd);
+        }
+    }),
+    TestCase::custom("test.stdarch-intrinsics", &|runner| {
+        let target = runner.target_compiler.target.as_str();
+        let (arch, _) = target.split_once('-').unwrap();
+
+        // FIXME: Add support for remaining architectures.
+        let input = match arch {
+            "aarch64" => "intrinsics_data/arm_intrinsics.json",
+            _ => {
+                eprintln!("Skipping `stdarch-intrinsics` tests: unsupported target");
+                return;
+            }
+        };
+
+        apply_patches(
+            &runner.dirs,
+            "stdarch",
+            &runner.stdlib_source.join("library/stdarch"),
+            &STDARCH_SRC.to_path(&runner.dirs),
+        );
+
+        STDARCH_RUST_PROGRAMS.clean(&runner.dirs);
+
+        if !runner.is_native {
+            eprintln!("Cross-Compiling: Not running tests");
+            return;
+        }
+
+        let cc = if target.contains("apple") { "clang" } else { "gcc" };
+
+        let mut generate_cmd = STDARCH.run(&runner.target_compiler, &runner.dirs);
+        generate_cmd.current_dir(STDARCH.source_dir(&runner.dirs));
+        generate_cmd.args([
+            "-p",
+            "intrinsic-test",
+            "--",
+            input,
+            "--target",
+            target,
+            "--cc-arg-style",
+            cc,
+            "--skip",
+            &format!("crates/intrinsic-test/missing_{arch}_common.txt"),
+            "--skip",
+            &format!("crates/intrinsic-test/missing_{arch}_{cc}.txt"),
+        ]);
+
+        for skip in [
+            format!("build_system/stdarch_skip/{arch}_intrinsics_common.txt"),
+            format!("build_system/stdarch_skip/{arch}_intrinsics_{cc}.txt"),
+        ] {
+            let skip = runner.dirs.source_dir.join(skip);
+
+            if skip.exists() {
+                generate_cmd.arg("--skip").arg(skip);
+            }
+        }
+
+        spawn_and_wait(generate_cmd);
+
+        let mut test_cmd = STDARCH_RUST_PROGRAMS.test(&runner.target_compiler, &runner.dirs);
+        test_cmd.args(["--workspace", "--tests", "--no-fail-fast", "--", "-q"]);
+        spawn_and_wait(test_cmd);
     }),
 ];
 
 pub(crate) fn run_tests(
     dirs: &Dirs,
-    sysroot_kind: SysrootKind,
+    sysroot_config: &SysrootConfig,
     use_unstable_features: bool,
-    panic_unwind_support: bool,
     skip_tests: &[&str],
     cg_clif_dylib: &CodegenBackend,
     bootstrap_host_compiler: &Compiler,
     rustup_toolchain_name: Option<&str>,
-    target_triple: String,
+    target_tuple: String,
 ) {
     let stdlib_source =
         get_default_sysroot(&bootstrap_host_compiler.rustc).join("lib/rustlib/src/rust");
@@ -291,21 +418,20 @@ pub(crate) fn run_tests(
     if config::get_bool("testsuite.no_sysroot") && !skip_tests.contains(&"testsuite.no_sysroot") {
         let target_compiler = build_sysroot::build_sysroot(
             dirs,
-            SysrootKind::None,
+            &SysrootConfig { sysroot_kind: SysrootKind::None, ..*sysroot_config },
             cg_clif_dylib,
             bootstrap_host_compiler,
             rustup_toolchain_name,
-            target_triple.clone(),
-            panic_unwind_support,
+            target_tuple.clone(),
         );
 
         let runner = TestRunner::new(
             dirs.clone(),
             target_compiler,
             use_unstable_features,
-            panic_unwind_support,
+            sysroot_config.panic_unwind_support,
             skip_tests,
-            bootstrap_host_compiler.triple == target_triple,
+            bootstrap_host_compiler.target == target_tuple,
             stdlib_source.clone(),
         );
 
@@ -325,21 +451,20 @@ pub(crate) fn run_tests(
     if run_base_sysroot || run_extended_sysroot {
         let target_compiler = build_sysroot::build_sysroot(
             dirs,
-            sysroot_kind,
+            sysroot_config,
             cg_clif_dylib,
             bootstrap_host_compiler,
             rustup_toolchain_name,
-            target_triple.clone(),
-            panic_unwind_support,
+            target_tuple.clone(),
         );
 
         let mut runner = TestRunner::new(
             dirs.clone(),
             target_compiler,
             use_unstable_features,
-            panic_unwind_support,
+            sysroot_config.panic_unwind_support,
             skip_tests,
-            bootstrap_host_compiler.triple == target_triple,
+            bootstrap_host_compiler.target == target_tuple,
             stdlib_source,
         );
 
@@ -384,7 +509,7 @@ impl<'a> TestRunner<'a> {
         target_compiler.rustdocflags.extend(rustflags_from_env("RUSTDOCFLAGS"));
 
         let jit_supported =
-            use_unstable_features && is_native && !target_compiler.triple.contains("windows");
+            use_unstable_features && is_native && !target_compiler.target.contains("windows");
 
         Self {
             is_native,
@@ -462,12 +587,15 @@ impl<'a> TestRunner<'a> {
         cmd.arg(BUILD_EXAMPLE_OUT_DIR.to_path(&self.dirs));
         cmd.arg("-Cdebuginfo=2");
         cmd.arg("--target");
-        cmd.arg(&self.target_compiler.triple);
+        cmd.arg(&self.target_compiler.target);
         if !self.panic_unwind_support {
             cmd.arg("-Cpanic=abort");
         }
         cmd.arg("--check-cfg=cfg(jit)");
+        cmd.arg("--check-cfg=cfg(target_has_reliable_f128)");
         cmd.arg("--edition=2024");
+        // implicitly passed when building inside the rust repo
+        cmd.arg("-Zforce-unstable-if-unmarked");
         cmd.args(args);
         cmd
     }

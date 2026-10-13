@@ -1,6 +1,5 @@
 use rustc_hir::{BinOpKind, Body, Expr, ExprKind, ImplItemKind, ItemKind, Node, TraitFn, TraitItem, TraitItemKind};
-use rustc_lint::{LateContext, LateLintPass};
-use rustc_session::declare_lint_pass;
+use rustc_lint::{LateContext, LateLintPass, declare_lint_pass};
 
 mod cmp_null;
 mod mut_from_ref;
@@ -150,7 +149,7 @@ impl<'tcx> LateLintPass<'tcx> for Ptr {
         }
     }
 
-    fn check_body(&mut self, cx: &LateContext<'tcx>, body: &Body<'tcx>) {
+    fn check_body(&mut self, cx: &LateContext<'tcx>, body: &'tcx Body<'tcx>) {
         let mut parents = cx.tcx.hir_parent_iter(body.value.hir_id);
         let (item_id, sig, is_trait_item) = match parents.next() {
             Some((_, Node::Item(i))) => {

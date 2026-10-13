@@ -1,8 +1,9 @@
 use super::FORMAT_COLLECT;
 use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::macros::{is_format_macro, root_macro_call_first_node};
-use clippy_utils::res::MaybeDef;
-use rustc_hir::{Expr, ExprKind, LangItem};
+use clippy_utils::res::MaybeDef as _;
+use rustc_attr_ir::lang_items::LangItem;
+use rustc_hir::{Expr, ExprKind};
 use rustc_lint::LateContext;
 use rustc_span::Span;
 
@@ -20,7 +21,7 @@ pub(super) fn check(cx: &LateContext<'_>, expr: &Expr<'_>, map_arg: &Expr<'_>, m
     if cx.typeck_results().expr_ty(expr).is_lang_item(cx, LangItem::String)
         && let ExprKind::Closure(closure) = map_arg.kind
         && let body = cx.tcx.hir_body(closure.body)
-        && let Some(value) = peel_non_expn_blocks(body.value)
+        && let Some(value) = peel_non_expn_blocks(&body.value)
         && let Some(mac) = root_macro_call_first_node(cx, value)
         && is_format_macro(cx, mac.def_id)
     {

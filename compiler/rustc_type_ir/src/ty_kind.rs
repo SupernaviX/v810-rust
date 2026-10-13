@@ -18,11 +18,9 @@ use self::TyKind::*;
 pub use self::closure::*;
 use crate::inherent::*;
 use crate::ty::AliasTy;
-#[cfg(feature = "nightly")]
-use crate::visit::TypeVisitable;
 use crate::{
-    self as ty, BoundVarIndexKind, FloatTy, FreeAliasTy, InherentAliasTy, IntTy, Interner,
-    OpaqueAliasTy, ProjectionAliasTy, UintTy, Unnormalized,
+    self as ty, BoundVarIndexKind, Const, FloatTy, FreeAliasTy, InherentAliasTy, IntTy, Interner,
+    OpaqueAliasTy, ProjectionAliasTy, Region, UintTy, Unnormalized,
 };
 
 mod closure;
@@ -114,6 +112,16 @@ impl<I: Interner> AliasTyKind<I> {
 /// with `IsRigid::Yes`. At this point we no longer have to try and renormalize this alias
 /// later on.
 ///
+/// Rigidness becomes outdated when the surrounding typing mode or param env changes,
+/// because further normalization might be possible.
+/// We should also note that rigidness can be shared within some typing mode groups
+/// if the param env is the same, e.g., `Typeck/PostTypeckUntilBorrowck` and
+/// `PostAnalysis/Codegen`.
+///
+/// We always reveal auto traits for rigid aliases and this can cause query cycle in
+/// `TypingMode::ErasedNotCoherence`. Thus we don't allow incorrectly marked rigid local
+/// opaques. We achieve this by immediately bailing out when normalizing local opaques.
+///
 /// FIXME(#155345): Alias handling is currently still in flux for the new trait
 /// solver and this is currently somewhat messy. Please reach out on
 /// #t-types/trait-system-refactor-initiative if you encounter this and it isn't
@@ -179,7 +187,7 @@ pub enum TyKind<I: Interner> {
     Str,
 
     /// An array with the given length. Written as `[T; N]`.
-    Array(I::Ty, I::Const),
+    Array(I::Ty, Const<I>),
 
     /// A pattern newtype.
     ///
@@ -198,7 +206,7 @@ pub enum TyKind<I: Interner> {
 
     /// A reference; a pointer with an associated lifetime. Written as
     /// `&'a mut T` or `&'a T`.
-    Ref(I::Region, I::Ty, Mutability),
+    Ref(Region<I>, I::Ty, Mutability),
 
     /// The anonymous type of a function declaration/definition.
     ///
@@ -242,7 +250,7 @@ pub enum TyKind<I: Interner> {
     UnsafeBinder(UnsafeBinderInner<I>),
 
     /// A trait object. Written as `dyn for<'b> Trait<'b, Assoc = u32> + Send + 'a`.
-    Dynamic(I::BoundExistentialPredicates, I::Region),
+    Dynamic(I::BoundExistentialPredicates, Region<I>),
 
     /// The anonymous type of a closure. Used to represent the type of `|a| a`.
     ///
@@ -251,7 +259,9 @@ pub enum TyKind<I: Interner> {
     /// `ClosureArgs` for more details.
     Closure(I::ClosureId, I::GenericArgs),
 
-    /// The anonymous type of a closure. Used to represent the type of `async |a| a`.
+    /// The anonymous type of an async closure. Used to represent the type of `async |a| a`.
+    ///
+    /// This type itself is not a coroutine, it just represents a closure that returns one.
     ///
     /// Coroutine-closure args contain both the - potentially instantiated - generic
     /// parameters of its parent and some synthetic parameters. See the documentation
@@ -485,13 +495,7 @@ impl<I: Interner> fmt::Debug for TyKind<I> {
 impl<I: Interner> AliasTy<I> {
     pub fn new_from_args(interner: I, kind: AliasTyKind<I>, args: I::GenericArgs) -> AliasTy<I> {
         if cfg!(debug_assertions) {
-            let def_id = match kind {
-                AliasTyKind::Projection { def_id } => def_id.into(),
-                AliasTyKind::Inherent { def_id } => def_id.into(),
-                AliasTyKind::Opaque { def_id } => def_id.into(),
-                AliasTyKind::Free { def_id } => def_id.into(),
-            };
-            interner.debug_assert_args_compatible(def_id, args);
+            interner.debug_assert_alias_term_args_compatible(kind.into(), args);
         }
         AliasTy { kind, args, _use_alias_new_instead: () }
     }
@@ -553,7 +557,10 @@ impl<I: Interner> ProjectionAliasTy<I> {
         kind: I::TraitAssocTyId,
         args: I::GenericArgs,
     ) -> Self {
-        interner.debug_assert_args_compatible(kind.into(), args);
+        interner.debug_assert_alias_term_args_compatible(
+            ty::AliasTermKind::ProjectionTy { def_id: kind },
+            args,
+        );
         Self { kind, args, _use_alias_new_instead: () }
     }
 
@@ -624,7 +631,10 @@ impl<I: Interner> InherentAliasTy<I> {
         kind: I::InherentAssocTyId,
         args: I::GenericArgs,
     ) -> Self {
-        interner.debug_assert_args_compatible(kind.into(), args);
+        interner.debug_assert_alias_term_args_compatible(
+            ty::AliasTermKind::InherentTy { def_id: kind },
+            args,
+        );
         Self { kind, args, _use_alias_new_instead: () }
     }
 
@@ -639,7 +649,10 @@ impl<I: Interner> InherentAliasTy<I> {
 
 impl<I: Interner> OpaqueAliasTy<I> {
     pub fn new_opaque_from_args(interner: I, kind: I::OpaqueTyId, args: I::GenericArgs) -> Self {
-        interner.debug_assert_args_compatible(kind.into(), args);
+        interner.debug_assert_alias_term_args_compatible(
+            ty::AliasTermKind::OpaqueTy { def_id: kind },
+            args,
+        );
         Self { kind, args, _use_alias_new_instead: () }
     }
 
@@ -654,7 +667,10 @@ impl<I: Interner> OpaqueAliasTy<I> {
 
 impl<I: Interner> FreeAliasTy<I> {
     pub fn new_free_from_args(interner: I, kind: I::FreeTyAliasId, args: I::GenericArgs) -> Self {
-        interner.debug_assert_args_compatible(kind.into(), args);
+        interner.debug_assert_alias_term_args_compatible(
+            ty::AliasTermKind::FreeTy { def_id: kind },
+            args,
+        );
         Self { kind, args, _use_alias_new_instead: () }
     }
 
@@ -1243,7 +1259,7 @@ impl<I: Interner> fmt::Debug for FnSig<I> {
                 write!(f, ", ")?;
             }
             if Some(i) == fn_sig_kind.splatted().map(usize::from) {
-                write!(f, "#[splat] ")?;
+                write!(f, "#[rustc_splat] ")?;
             }
             write!(f, "{ty:?}")?;
         }
@@ -1296,35 +1312,6 @@ impl<I: Interner> Deref for UnsafeBinderInner<I> {
 
     fn deref(&self) -> &Self::Target {
         &self.0
-    }
-}
-
-#[cfg(feature = "nightly")]
-impl<I: Interner, E: rustc_serialize::Encoder> rustc_serialize::Encodable<E>
-    for UnsafeBinderInner<I>
-where
-    I::Ty: rustc_serialize::Encodable<E>,
-    I::BoundVarKinds: rustc_serialize::Encodable<E>,
-{
-    fn encode(&self, e: &mut E) {
-        self.bound_vars().encode(e);
-        self.as_ref().skip_binder().encode(e);
-    }
-}
-
-#[cfg(feature = "nightly")]
-impl<I: Interner, D: rustc_serialize::Decoder> rustc_serialize::Decodable<D>
-    for UnsafeBinderInner<I>
-where
-    I::Ty: TypeVisitable<I> + rustc_serialize::Decodable<D>,
-    I::BoundVarKinds: rustc_serialize::Decodable<D>,
-{
-    fn decode(decoder: &mut D) -> Self {
-        let bound_vars = rustc_serialize::Decodable::decode(decoder);
-        UnsafeBinderInner(ty::Binder::bind_with_vars(
-            rustc_serialize::Decodable::decode(decoder),
-            bound_vars,
-        ))
     }
 }
 
@@ -1404,6 +1391,10 @@ impl<I: Interner> FnHeader<I> {
 
     pub fn abi(self) -> ExternAbi {
         self.fn_sig_kind.abi()
+    }
+
+    pub fn splatted(self) -> Option<u8> {
+        self.fn_sig_kind.splatted()
     }
 
     /// Create a new safe FnHeader with the `extern "Rust"` ABI, that isn't C-style variadic or splatted.

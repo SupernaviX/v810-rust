@@ -5,17 +5,16 @@ use clippy_utils::diagnostics::{span_lint_and_sugg, span_lint_and_then};
 use clippy_utils::eager_or_lazy::switch_to_eager_eval;
 use clippy_utils::macros::matching_root_macro_call;
 use clippy_utils::msrvs::{self, Msrv};
-use clippy_utils::res::MaybeResPath;
+use clippy_utils::res::MaybeResPath as _;
 use clippy_utils::source::{snippet, str_literal_to_char_literal};
 use clippy_utils::sym;
 use clippy_utils::visitors::{Descend, for_each_expr};
-use itertools::Itertools;
+use itertools::Itertools as _;
 use rustc_ast::{BinOpKind, LitKind};
 use rustc_errors::Applicability;
 use rustc_hir::{Expr, ExprKind, PatExprKind, PatKind};
-use rustc_lint::{LateContext, LateLintPass};
+use rustc_lint::{LateContext, LateLintPass, impl_lint_pass};
 use rustc_middle::ty;
-use rustc_session::impl_lint_pass;
 use rustc_span::{Span, Symbol};
 
 declare_clippy_lint! {
@@ -83,7 +82,7 @@ pub struct StringPatterns {
 
 impl StringPatterns {
     pub fn new(conf: &'static Conf) -> Self {
-        Self { msrv: conf.msrv }
+        Self { msrv: conf.msrv.into() }
     }
 }
 
@@ -147,7 +146,7 @@ fn check_manual_pattern_char_comparison(cx: &LateContext<'_>, method_arg: &Expr<
 
         // We want to retrieve all the comparisons done.
         // They are ordered in a nested way and so we need to traverse the AST to collect them all.
-        if for_each_expr(cx.tcx, body.value, |sub_expr| -> ControlFlow<(), Descend> {
+        if for_each_expr(cx.tcx, &body.value, |sub_expr| -> ControlFlow<(), Descend> {
             match sub_expr.kind {
                 ExprKind::Binary(op, left, right) if op.node == BinOpKind::Eq => {
                     if left.res_local_id() == Some(binding)

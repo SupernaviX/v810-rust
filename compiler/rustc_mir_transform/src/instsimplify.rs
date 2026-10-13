@@ -1,15 +1,17 @@
 //! Performs various peephole optimizations.
 
 use rustc_abi::{ExternAbi, Integer};
-use rustc_hir::{LangItem, find_attr};
+use rustc_attr_ir::find_attr;
+use rustc_attr_ir::lang_items::LangItem;
 use rustc_index::IndexVec;
-use rustc_middle::bug;
 use rustc_middle::mir::visit::MutVisitor;
 use rustc_middle::mir::*;
+use rustc_middle::ty::consts::ConstExt;
 use rustc_middle::ty::layout::{IntegerExt, ValidityRequirement};
 use rustc_middle::ty::{self, GenericArgsRef, Ty, TyCtxt, layout};
-use rustc_span::{Symbol, sym};
+use rustc_span::{Symbol, bug, sym};
 
+use crate::PassPolicy;
 use crate::simplify::simplify_duplicate_switch_targets;
 
 pub(super) enum InstSimplify {
@@ -25,8 +27,8 @@ impl<'tcx> crate::MirPass<'tcx> for InstSimplify {
         }
     }
 
-    fn is_enabled(&self, sess: &rustc_session::Session) -> bool {
-        sess.mir_opt_level() > 0
+    fn policy(&self, ctx: &crate::PassCtx<'_>) -> PassPolicy {
+        PassPolicy::optional(ctx.mir_opt_level() >= 1)
     }
 
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
@@ -61,10 +63,6 @@ impl<'tcx> crate::MirPass<'tcx> for InstSimplify {
             ctx.simplify_nounwind_call(terminator);
             simplify_duplicate_switch_targets(terminator);
         }
-    }
-
-    fn is_required(&self) -> bool {
-        false
     }
 }
 
@@ -258,7 +256,7 @@ impl<'tcx> InstSimplifyContext<'_, 'tcx> {
                 ),
             ))),
         ));
-        terminator.kind = TerminatorKind::Goto { target: *destination_block };
+        terminator.kind = TerminatorKind::goto(*destination_block);
     }
 
     /// Simplify `size_of_val` and `align_of_val` if we don't actually need
@@ -316,7 +314,7 @@ impl<'tcx> InstSimplifyContext<'_, 'tcx> {
                     Rvalue::Use(const_op, WithRetag::Yes),
                 ))),
             ));
-            terminator.kind = TerminatorKind::Goto { target: *destination_block };
+            terminator.kind = TerminatorKind::goto(*destination_block);
         }
     }
 
@@ -373,7 +371,7 @@ impl<'tcx> InstSimplifyContext<'_, 'tcx> {
                     Rvalue::BinaryOp(BinOp::Eq, Box::new((lhs_op, rhs_op))),
                 ))),
             ));
-            terminator.kind = TerminatorKind::Goto { target: *destination_block };
+            terminator.kind = TerminatorKind::goto(*destination_block);
         }
     }
 
@@ -423,7 +421,7 @@ impl<'tcx> InstSimplifyContext<'_, 'tcx> {
             }
             Some(false) => {
                 // If we know the assert does not panic, turn the call into a Goto
-                terminator.kind = TerminatorKind::Goto { target: target_block };
+                terminator.kind = TerminatorKind::goto(target_block);
             }
         }
     }

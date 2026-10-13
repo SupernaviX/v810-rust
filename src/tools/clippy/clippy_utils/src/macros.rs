@@ -1,4 +1,4 @@
-#![allow(clippy::similar_names)] // `expr` and `expn`
+#![expect(clippy::similar_names)] // `expr` and `expn`
 
 use std::cell::Cell;
 use std::sync::{Arc, OnceLock};
@@ -10,7 +10,7 @@ use arrayvec::ArrayVec;
 use rustc_ast::{FormatArgs, FormatArgument, FormatPlaceholder};
 use rustc_data_structures::fx::FxHashMap;
 use rustc_hir::{self as hir, Expr, ExprKind, HirId, Node, QPath};
-use rustc_lint::{LateContext, LintContext};
+use rustc_lint::{LateContext, LintContext as _};
 use rustc_span::def_id::DefId;
 use rustc_span::hygiene::{self, MacroKind, SyntaxContext};
 use rustc_span::{BytePos, ExpnData, ExpnId, ExpnKind, Span, SpanData, Symbol};
@@ -459,6 +459,24 @@ impl FormatArgsStorage {
         debug_assert!(self.0.get().is_some(), "`FormatArgsStorage` not yet populated");
 
         self.0.get()?.get(&format_args_expr.span.with_parent(None))
+    }
+
+    /// Returns AST [`FormatArgs`] nodes if there are any nested inside `parent_format_args`.
+    pub fn get_nested(&self, parent_format_args: &FormatArgs) -> Vec<&FormatArgs> {
+        let mut nested = Vec::new();
+        let Some(format_args_map) = self.0.get() else {
+            return nested;
+        };
+
+        for arg in parent_format_args.arguments.all_args() {
+            if matches!(arg.expr.kind, rustc_ast::ExprKind::FormatArgs(_))
+                && let Some(format_args) = format_args_map.get(&arg.expr.span.with_parent(None))
+            {
+                nested.push(format_args);
+            }
+        }
+
+        nested
     }
 
     /// Should only be called by `FormatArgsCollector`

@@ -3,8 +3,7 @@ use clippy_utils::diagnostics::span_lint_and_help;
 use clippy_utils::msrvs::{self, Msrv};
 use clippy_utils::{is_empty_block, sym};
 use rustc_hir::{ImplItemKind, Item, ItemKind};
-use rustc_lint::{LateContext, LateLintPass};
-use rustc_session::impl_lint_pass;
+use rustc_lint::{LateContext, LateLintPass, impl_lint_pass};
 
 declare_clippy_lint! {
     /// ### What it does
@@ -45,7 +44,7 @@ pub struct ManualNoopWaker {
 
 impl ManualNoopWaker {
     pub fn new(conf: &'static Conf) -> Self {
-        Self { msrv: conf.msrv }
+        Self { msrv: conf.msrv.into() }
     }
 }
 
@@ -65,7 +64,7 @@ impl<'tcx> LateLintPass<'tcx> for ManualNoopWaker {
 
                 if let ImplItemKind::Fn(_, body_id) = &impl_item.kind {
                     let body = cx.tcx.hir_body(*body_id);
-                    if !is_empty_block(body.value) {
+                    if !is_empty_block(&body.value) {
                         return;
                     }
                 }

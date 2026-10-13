@@ -3,11 +3,13 @@ use std::assert_matches;
 use itertools::Itertools as _;
 use rustc_abi::{self as abi, BackendRepr, FIRST_VARIANT};
 use rustc_index::IndexVec;
+use rustc_middle::mir;
 use rustc_middle::ty::adjustment::PointerCoercion;
+use rustc_middle::ty::consts::ConstExt;
 use rustc_middle::ty::layout::{HasTyCtxt, HasTypingEnv, LayoutOf, TyAndLayout};
 use rustc_middle::ty::{self, Instance, Mutability, Ty, TyCtxt};
-use rustc_middle::{bug, mir, span_bug};
 use rustc_session::config::OptLevel;
+use rustc_span::{bug, span_bug};
 use tracing::{debug, instrument};
 
 use super::FunctionCx;
@@ -91,6 +93,11 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
         true
     }
 
+    fn is_entirely_uninit_const(&self, operand: &mir::Operand<'tcx>) -> bool {
+        let mir::Operand::Constant(const_op) = operand else { return false };
+        self.eval_mir_constant(const_op).all_bytes_uninit(self.cx.tcx())
+    }
+
     #[instrument(level = "trace", skip(self, bx))]
     pub(crate) fn codegen_rvalue(
         &mut self,
@@ -100,11 +107,8 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
     ) {
         match *rvalue {
             mir::Rvalue::Use(ref operand, with_retag) => {
-                if let mir::Operand::Constant(const_op) = operand {
-                    let val = self.eval_mir_constant(&const_op);
-                    if val.all_bytes_uninit(self.cx.tcx()) {
-                        return;
-                    }
+                if self.is_entirely_uninit_const(operand) {
+                    return;
                 }
                 let cg_operand = self.codegen_operand(bx, operand);
                 // Crucially, we do *not* use `OperandValue::Ref` for types with
@@ -196,19 +200,16 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
 
                 // When the element is a const with all bytes uninit, emit a single memset that
                 // writes undef to the entire destination.
-                if let mir::Operand::Constant(const_op) = elem {
-                    let val = self.eval_mir_constant(const_op);
-                    if val.all_bytes_uninit(self.cx.tcx()) {
-                        let size = bx.const_usize(dest.layout.size.bytes());
-                        bx.memset(
-                            dest.val.llval,
-                            bx.const_undef(bx.type_i8()),
-                            size,
-                            dest.val.align,
-                            MemFlags::empty(),
-                        );
-                        return;
-                    }
+                if self.is_entirely_uninit_const(elem) {
+                    let size = bx.const_usize(dest.layout.size.bytes());
+                    bx.memset(
+                        dest.val.llval,
+                        bx.const_undef(bx.type_i8()),
+                        size,
+                        dest.val.align,
+                        MemFlags::empty(),
+                    );
+                    return;
                 }
 
                 let cg_elem = self.codegen_operand(bx, elem);
@@ -270,6 +271,11 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                     assert_eq!(operands.len(), 1);
                 }
                 for (i, operand) in operands.iter_enumerated() {
+                    // Do not generate stores for entirely uninit constant fields, for the same
+                    // reason as in `Rvalue::Use` above.
+                    if self.is_entirely_uninit_const(operand) {
+                        continue;
+                    }
                     let op = self.codegen_operand(bx, operand);
                     // Do not generate stores and GEPis for zero-sized fields.
                     if !op.layout.is_zst() {
@@ -615,7 +621,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                             bug!("Unsupported cast of {operand:?} to {cast:?}");
                         })
                     }
-                    mir::CastKind::Transmute | mir::CastKind::Subtype => {
+                    mir::CastKind::Transmute | mir::CastKind::BoxDerefTransmute | mir::CastKind::Subtype => {
                         self.codegen_transmute_operand(bx, operand, cast)
                     }
                 };
@@ -775,6 +781,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                         fn_attrs.as_deref(),
                         Some(fn_abi),
                         fn_ptr,
+                        ReturnSlot::Direct,
                         &[],
                         None,
                         Some(instance),
@@ -827,8 +834,8 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                     Err(super::place::UninhabitedVariantError) => {
                         // Like codegen_set_discr we use a sound abort, but could
                         // potentially `unreachable` or just return the poison for
-                        // more optimizability, if that turns out to be helpful.
-                        bx.abort();
+                        // optimizability, if that turns out to be helpful.
+                        bx.abort_immediate();
                         let val = OperandValue::poison(bx, layout);
                         OperandRef { val, layout, move_annotation: None }
                     }

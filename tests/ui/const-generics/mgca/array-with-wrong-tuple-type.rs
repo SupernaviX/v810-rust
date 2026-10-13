@@ -1,5 +1,10 @@
-#![feature(adt_const_params, min_generic_const_args, unsized_const_params)]
-#![allow(incomplete_features)]
+#![feature(
+    adt_const_params,
+    gca_adts,
+    gca_macroless_args,
+    gca_min_const_items,
+    unsized_const_params
+)]
 
 use std::marker::ConstParamTy;
 
@@ -8,7 +13,6 @@ struct A;
 
 fn takes_tuple<const N: [(u32, u32); 1]>() {}
 fn takes_nested_tuple<const N: [(u32, (u32, u32)); 1]>() {}
-
 
 fn main() {
     takes_tuple::<{ [A] }>();

@@ -1,10 +1,10 @@
 use crate::get_enclosing_block;
 use crate::msrvs::Msrv;
 use crate::qualify_min_const_fn::is_stable_const_fn_at;
-use crate::res::MaybeResPath;
+use crate::res::MaybeResPath as _;
 use crate::ty::needs_ordered_drop;
 use core::ops::ControlFlow;
-use rustc_ast::visit::{VisitorResult, try_visit};
+use rustc_ast::visit::{VisitorResult as _, try_visit};
 use rustc_hir::def::{CtorKind, DefKind, Res};
 use rustc_hir::intravisit::{self, Visitor, walk_block, walk_expr, walk_qpath};
 use rustc_hir::{
@@ -299,7 +299,7 @@ where
 
 /// Checks if the given resolved path is used in the given body.
 pub fn is_res_used(cx: &LateContext<'_>, res: Res, body: BodyId) -> bool {
-    for_each_expr(cx.tcx, cx.tcx.hir_body(body).value, |e| {
+    for_each_expr(cx.tcx, &cx.tcx.hir_body(body).value, |e| {
         if let ExprKind::Path(p) = &e.kind
             && cx.qpath_res(p, e.hir_id) == res
         {
@@ -364,8 +364,8 @@ fn is_const_evaluatable_helper<'tcx>(tcx: TyCtxt<'tcx>, typeck: &'tcx TypeckResu
             if matches!(
                 typeck.qpath_res(p, e.hir_id),
                 Res::Def(
-                    DefKind::Const { .. }
-                        | DefKind::AssocConst { .. }
+                    DefKind::Const
+                        | DefKind::AssocConst
                         | DefKind::AnonConst
                         | DefKind::ConstParam
                         | DefKind::Ctor(..)

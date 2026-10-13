@@ -1,10 +1,10 @@
 use clippy_utils::diagnostics::span_lint_and_sugg;
 use clippy_utils::is_none_expr;
-use clippy_utils::res::{MaybeDef, MaybeQPath};
+use clippy_utils::res::{MaybeDef as _, MaybeQPath as _};
 use clippy_utils::source::snippet;
+use rustc_attr_ir::lang_items::LangItem::OptionSome;
 use rustc_errors::Applicability;
 use rustc_hir as hir;
-use rustc_hir::LangItem::OptionSome;
 use rustc_lint::LateContext;
 use rustc_span::symbol::sym;
 
@@ -61,7 +61,7 @@ pub(super) fn check<'tcx>(
         if let hir::ExprKind::Closure(&hir::Closure { body, fn_decl_span, .. }) = map_arg.kind
             && let arg_snippet = snippet(cx, fn_decl_span, "..")
             && let body = cx.tcx.hir_body(body)
-            && let Some((func, [arg_char])) = reduce_unit_expression(body.value)
+            && let Some((func, [arg_char])) = reduce_unit_expression(&body.value)
             && let Some(id) = func.res(cx).opt_def_id().map(|ctor_id| cx.tcx.parent(ctor_id))
             && Some(id) == cx.tcx.lang_items().option_some_variant()
         {

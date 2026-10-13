@@ -1,12 +1,18 @@
 cfg_select! {
     any(
-        target_os = "linux", target_os = "android",
+        target_os = "linux",
+        target_os = "android",
         target_os = "hurd",
-        target_os = "dragonfly", target_os = "freebsd",
-        target_os = "openbsd", target_os = "netbsd",
-        target_os = "solaris", target_os = "illumos",
-        target_os = "haiku", target_os = "nto",
-        target_os = "qnx", target_os = "cygwin",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "solaris",
+        target_os = "illumos",
+        target_os = "haiku",
+        target_os = "nto",
+        target_os = "qnx",
+        target_os = "cygwin",
     ) => {
         use libc::MSG_NOSIGNAL;
     }
@@ -44,7 +50,8 @@ use crate::time::Duration;
 ///
 /// # Examples
 ///
-/// ```no_run
+#[cfg_attr(target_family = "unix", doc = "```no_run")]
+#[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
 /// use std::os::unix::net::UnixStream;
 /// use std::io::prelude::*;
 ///
@@ -93,7 +100,8 @@ impl UnixStream {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixStream;
     ///
     /// let socket = match UnixStream::connect("/tmp/sock") {
@@ -121,7 +129,8 @@ impl UnixStream {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::{UnixListener, UnixStream};
     ///
     /// fn main() -> std::io::Result<()> {
@@ -137,7 +146,7 @@ impl UnixStream {
     ///     };
     ///     Ok(())
     /// }
-    /// ````
+    /// ```
     #[stable(feature = "unix_socket_abstract", since = "1.70.0")]
     pub fn connect_addr(socket_addr: &SocketAddr) -> io::Result<UnixStream> {
         unsafe {
@@ -157,7 +166,8 @@ impl UnixStream {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixStream;
     ///
     /// let (sock1, sock2) = match UnixStream::pair() {
@@ -183,12 +193,13 @@ impl UnixStream {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixStream;
     ///
     /// fn main() -> std::io::Result<()> {
     ///     let socket = UnixStream::connect("/tmp/sock")?;
-    ///     let sock_copy = socket.try_clone().expect("Couldn't clone socket");
+    ///     let sock_copy = socket.try_clone().expect("`UnixStream::try_clone` should not fail");
     ///     Ok(())
     /// }
     /// ```
@@ -201,12 +212,13 @@ impl UnixStream {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixStream;
     ///
     /// fn main() -> std::io::Result<()> {
     ///     let socket = UnixStream::connect("/tmp/sock")?;
-    ///     let addr = socket.local_addr().expect("Couldn't get local address");
+    ///     let addr = socket.local_addr().expect("`UnixStream::local_addr` should not fail");
     ///     Ok(())
     /// }
     /// ```
@@ -219,12 +231,13 @@ impl UnixStream {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixStream;
     ///
     /// fn main() -> std::io::Result<()> {
     ///     let socket = UnixStream::connect("/tmp/sock")?;
-    ///     let addr = socket.peer_addr().expect("Couldn't get peer address");
+    ///     let addr = socket.peer_addr().expect("`UnixStream::peer_addr` should not fail");
     ///     Ok(())
     /// }
     /// ```
@@ -237,13 +250,14 @@ impl UnixStream {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// #![feature(peer_credentials_unix_socket)]
     /// use std::os::unix::net::UnixStream;
     ///
     /// fn main() -> std::io::Result<()> {
     ///     let socket = UnixStream::connect("/tmp/sock")?;
-    ///     let peer_cred = socket.peer_cred().expect("Couldn't get peer credentials");
+    ///     let peer_cred = socket.peer_cred().expect("`UnixStream::peer_cred` should not fail");
     ///     Ok(())
     /// }
     /// ```
@@ -274,13 +288,14 @@ impl UnixStream {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixStream;
     /// use std::time::Duration;
     ///
     /// fn main() -> std::io::Result<()> {
     ///     let socket = UnixStream::connect("/tmp/sock")?;
-    ///     socket.set_read_timeout(Some(Duration::new(1, 0))).expect("Couldn't set read timeout");
+    ///     socket.set_read_timeout(Some(Duration::new(1, 0))).expect("`UnixStream::set_read_timeout` should not fail");
     ///     Ok(())
     /// }
     /// ```
@@ -288,7 +303,8 @@ impl UnixStream {
     /// An [`Err`] is returned if the zero [`Duration`] is passed to this
     /// method:
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::io;
     /// use std::os::unix::net::UnixStream;
     /// use std::time::Duration;
@@ -316,14 +332,15 @@ impl UnixStream {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixStream;
     /// use std::time::Duration;
     ///
     /// fn main() -> std::io::Result<()> {
     ///     let socket = UnixStream::connect("/tmp/sock")?;
     ///     socket.set_write_timeout(Some(Duration::new(1, 0)))
-    ///         .expect("Couldn't set write timeout");
+    ///         .expect("`UnixStream::connect` should not fail");
     ///     Ok(())
     /// }
     /// ```
@@ -331,7 +348,8 @@ impl UnixStream {
     /// An [`Err`] is returned if the zero [`Duration`] is passed to this
     /// method:
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::io;
     /// use std::os::unix::net::UnixStream;
     /// use std::time::Duration;
@@ -353,13 +371,14 @@ impl UnixStream {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixStream;
     /// use std::time::Duration;
     ///
     /// fn main() -> std::io::Result<()> {
     ///     let socket = UnixStream::connect("/tmp/sock")?;
-    ///     socket.set_read_timeout(Some(Duration::new(1, 0))).expect("Couldn't set read timeout");
+    ///     socket.set_read_timeout(Some(Duration::new(1, 0))).expect("`UnixStream::set_read_timeout` should not fail");
     ///     assert_eq!(socket.read_timeout()?, Some(Duration::new(1, 0)));
     ///     Ok(())
     /// }
@@ -373,14 +392,15 @@ impl UnixStream {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixStream;
     /// use std::time::Duration;
     ///
     /// fn main() -> std::io::Result<()> {
     ///     let socket = UnixStream::connect("/tmp/sock")?;
     ///     socket.set_write_timeout(Some(Duration::new(1, 0)))
-    ///         .expect("Couldn't set write timeout");
+    ///         .expect("`UnixStream::set_write_timeout` should not fail");
     ///     assert_eq!(socket.write_timeout()?, Some(Duration::new(1, 0)));
     ///     Ok(())
     /// }
@@ -394,12 +414,13 @@ impl UnixStream {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixStream;
     ///
     /// fn main() -> std::io::Result<()> {
     ///     let socket = UnixStream::connect("/tmp/sock")?;
-    ///     socket.set_nonblocking(true).expect("Couldn't set nonblocking");
+    ///     socket.set_nonblocking(true).expect("`UnixStream::set_nonblocking` should not fail");
     ///     Ok(())
     /// }
     /// ```
@@ -437,7 +458,8 @@ impl UnixStream {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixStream;
     ///
     /// fn main() -> std::io::Result<()> {
@@ -464,13 +486,14 @@ impl UnixStream {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// use std::os::unix::net::UnixStream;
     /// use std::net::Shutdown;
     ///
     /// fn main() -> std::io::Result<()> {
     ///     let socket = UnixStream::connect("/tmp/sock")?;
-    ///     socket.shutdown(Shutdown::Both).expect("shutdown function failed");
+    ///     socket.shutdown(Shutdown::Both).expect("`UnixStream::shutdown` should not fail");
     ///     Ok(())
     /// }
     /// ```
@@ -488,7 +511,8 @@ impl UnixStream {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    #[cfg_attr(target_family = "unix", doc = "```no_run")]
+    #[cfg_attr(not(target_family = "unix"), doc = "```ignore (needs unix)")]
     /// #![feature(unix_socket_peek)]
     ///
     /// use std::os::unix::net::UnixStream;
@@ -496,7 +520,7 @@ impl UnixStream {
     /// fn main() -> std::io::Result<()> {
     ///     let socket = UnixStream::connect("/tmp/sock")?;
     ///     let mut buf = [0; 10];
-    ///     let len = socket.peek(&mut buf).expect("peek failed");
+    ///     let len = socket.peek(&mut buf).expect("`UnixStream::peek` should not fail");
     ///     Ok(())
     /// }
     /// ```
@@ -624,7 +648,7 @@ impl io::Read for UnixStream {
 
     #[inline]
     fn is_read_vectored(&self) -> bool {
-        io::Read::is_read_vectored(&&*self)
+        io::Read::is_read_vectored(&self)
     }
 }
 
@@ -660,7 +684,7 @@ impl io::Write for UnixStream {
 
     #[inline]
     fn is_write_vectored(&self) -> bool {
-        io::Write::is_write_vectored(&&*self)
+        io::Write::is_write_vectored(&self)
     }
 
     fn flush(&mut self) -> io::Result<()> {

@@ -2,22 +2,30 @@
 //! structures into the THIR. The `builder` is generally ignorant of the tcx,
 //! etc., and instead goes through the `Cx` for most of its work.
 
+use rustc_attr_ir::find_attr;
+use rustc_attr_ir::lang_items::LangItem;
 use rustc_data_structures::steal::Steal;
 use rustc_errors::ErrorGuaranteed;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, LocalDefId};
-use rustc_hir::lang_items::LangItem;
-use rustc_hir::{self as hir, HirId, find_attr};
-use rustc_middle::bug;
+use rustc_hir::{self as hir, HirId};
 use rustc_middle::thir::*;
 use rustc_middle::ty::{self, TyCtxt};
+use rustc_span::bug;
 
 /// Query implementation for [`TyCtxt::thir_body`].
 pub(crate) fn thir_body<'tcx>(
     tcx: TyCtxt<'tcx>,
     owner_def: LocalDefId,
 ) -> Result<(&'tcx Steal<Thir<'tcx>>, ExprId), ErrorGuaranteed> {
-    debug_assert!(!tcx.is_type_const(owner_def.to_def_id()), "thir_body queried for type_const");
+    if cfg!(debug_assertions)
+        && matches!(tcx.def_kind(owner_def), DefKind::Const | DefKind::AssocConst)
+    {
+        debug_assert!(
+            tcx.const_of_item(owner_def.to_def_id()).is_none(),
+            "thir_body queried for directly represented const item: {owner_def:?}"
+        );
+    }
 
     let body = tcx.hir_body_owned_by(owner_def);
     let mut cx: ThirBuildCx<'tcx> = ThirBuildCx::new(tcx, owner_def);
@@ -45,7 +53,7 @@ pub(crate) fn thir_body<'tcx>(
         }
     }
 
-    let expr = cx.mirror_expr(body.value);
+    let expr = cx.mirror_expr(&body.value);
     Ok((tcx.alloc_steal_thir(cx.thir), expr))
 }
 

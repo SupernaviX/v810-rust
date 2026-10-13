@@ -1,10 +1,13 @@
+use clap::Parser;
 use std::collections::HashSet;
 use std::env;
 use std::fmt;
 use std::fs::File;
 use std::io::prelude::*;
 use std::io::{self, BufReader};
+use std::path::Path;
 use std::path::PathBuf;
+use stdarch_gen_common::{GeneratorCtx, Mode, run_generator};
 
 /// Complete lines of generated source.
 ///
@@ -148,8 +151,8 @@ fn gen_spec(in_file: String, ext_name: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn gen_bind(in_file: String, ext_name: &str) -> io::Result<()> {
-    let f = File::open(in_file.clone()).unwrap_or_else(|_| panic!("Failed to open {in_file}"));
+fn gen_bind(path: &Path, filename: &str, ext_name: &str, out_path: &Path) -> io::Result<()> {
+    let f = File::open(path).unwrap_or_else(|_| panic!("Failed to open {path:?}"));
     let f = BufReader::new(f);
 
     let target: TargetFeature = TargetFeature::new(ext_name);
@@ -164,21 +167,21 @@ fn gen_bind(in_file: String, ext_name: &str) -> io::Result<()> {
     out.push_str(&format!(
         r#"// This code is automatically generated. DO NOT MODIFY.
 //
-// Instead, modify `{in_file}` and run the following command to re-generate this file:
+// Instead, modify `crates/stdarch-gen-loongarch/{filename}` and run the following command to re-generate this file:
 //
 // ```
-// OUT_DIR=`pwd`/crates/core_arch cargo run -p stdarch-gen-loongarch -- {in_file}
+// OUT_DIR=`pwd`/crates/core_arch cargo run -p stdarch-gen-loongarch -- crates/stdarch-gen-loongarch/{filename}
 // ```
 
 use crate::mem::transmute;
 use super::super::*;
-"#
+"#,
     ));
 
     out.push_str(
         r#"
 #[allow(improper_ctypes)]
-unsafe extern "unadjusted" {
+unsafe extern "llvm-intrinsic" {
 "#,
     );
 
@@ -241,13 +244,7 @@ unsafe extern "unadjusted" {
     out.push_str("}\n");
     out.push_str(&function_str);
 
-    let out_path: PathBuf =
-        PathBuf::from(env::var("OUT_DIR").unwrap_or("crates/core_arch".to_string()))
-            .join("src")
-            .join("loongarch64")
-            .join(ext_name);
-    std::fs::create_dir_all(&out_path)?;
-
+    std::fs::create_dir_all(out_path)?;
     let mut file = File::create(out_path.join("generated.rs"))?;
     file.write_all(out.as_bytes())?;
     Ok(())
@@ -862,7 +859,7 @@ union v4df
     out.push('\n');
     out.push_str("int main(int argc, char *argv[])\n");
     out.push_str("{\n");
-    out.push_str("    printf(\"// This code is automatically generated. DO NOT MODIFY.\\n\");\n");
+    out.push_str("    printf(\"// Auto-generated tests. DO NOT MODIFY.\\n\");\n");
     out.push_str("    printf(\"// See crates/stdarch-gen-loongarch/README.md\\n\\n\");\n");
     out.push_str("    printf(\"use crate::{\\n\");\n");
     out.push_str("    printf(\"    core_arch::{loongarch64::*, simd::*},\\n\");\n");
@@ -1604,28 +1601,67 @@ static void {current_name}(void)
     (impl_function, call_function)
 }
 
-pub fn main() -> io::Result<()> {
-    let args: Vec<String> = env::args().collect();
-    let in_file = args.get(1).cloned().expect("Input file missing!");
-    let in_file_path = PathBuf::from(&in_file);
-    let in_file_name = in_file_path
-        .file_name()
-        .unwrap()
-        .to_os_string()
-        .into_string()
-        .unwrap();
+/// Runs the check/bless harness for `lsx`/`lasx` when invoked with
+/// no args or a bare ext name.
+#[derive(clap::Parser, Debug)]
+struct Args {
+    /// Either:
+    /// - The extension (lsx/lasx) to generate, or:
+    /// - A path to a <extension>intrin.h file to generate the spec file from. Optionally followed
+    ///   by "test".
+    arguments: Vec<String>,
+    /// Generation mode.
+    #[arg(long, env = "STDARCH_GEN_MODE")]
+    mode: Option<Mode>,
+    /// Path to a rustfmt binary that will be used to reformat the generated code.
+    /// If unset, it will just use "rustfmt" from the environment.
+    #[arg(long)]
+    rustfmt_path: Option<PathBuf>,
+}
 
-    let ext_name = if in_file_name.starts_with("lasx") {
-        "lasx"
-    } else {
-        "lsx"
-    };
+pub fn main() -> Result<(), String> {
+    let args = Args::parse();
 
-    if in_file_name.ends_with(".h") {
-        gen_spec(in_file, ext_name)
-    } else if args.get(2).is_some() {
-        gen_test(in_file, ext_name)
+    let crate_dir =
+        PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"));
+    let core_arch_src = crate_dir.join("../core_arch/src");
+    let mode = args.mode.unwrap_or_default();
+    let ctx = GeneratorCtx::new(args.rustfmt_path);
+
+    let arguments = &args.arguments;
+    if arguments.len() == 1 && (arguments[0] == "lsx" || arguments[0] == "lasx") {
+        let extension = arguments[0].as_str();
+        let filename = format!("{extension}.spec");
+        let path = crate_dir.join(&filename);
+        let committed = core_arch_src.join("loongarch64").join(extension);
+        run_generator(&ctx, &committed, mode, |out_dir| {
+            gen_bind(&path, &filename, extension, out_dir)
+        })
+        .map_err(|e| e.to_string())?;
     } else {
-        gen_bind(in_file, ext_name)
+        let in_file = arguments[0].clone();
+        let in_file_name = PathBuf::from(&in_file)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let ext_name = if in_file_name.starts_with("lasx") {
+            "lasx"
+        } else {
+            "lsx"
+        };
+        if in_file_name.ends_with(".h") {
+            return gen_spec(in_file, ext_name).map_err(|e| e.to_string());
+        }
+        if arguments.last().map(|s| s.as_str()) == Some("test") {
+            return gen_test(in_file, ext_name).map_err(|e| e.to_string());
+        }
+        // Note: this does not apply rustfmt formatting
+        let out_path = PathBuf::from(env::var("OUT_DIR").unwrap_or("crates/core_arch".to_string()))
+            .join("src")
+            .join("loongarch64")
+            .join(ext_name);
+        gen_bind(Path::new(&in_file), &in_file_name, ext_name, &out_path).map_err(|e| e.to_string())?;
     }
+    Ok(())
 }

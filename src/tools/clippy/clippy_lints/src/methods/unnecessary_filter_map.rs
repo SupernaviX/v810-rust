@@ -1,13 +1,12 @@
 use super::utils::clone_or_copy_needed;
 use clippy_utils::diagnostics::span_lint;
-use clippy_utils::res::{MaybeDef, MaybeQPath, MaybeResPath, MaybeTypeckRes};
+use clippy_utils::res::{MaybeDef as _, MaybeResPath as _, MaybeTypeckRes as _};
 use clippy_utils::ty::{is_copy, option_arg_ty};
 use clippy_utils::usage::mutated_variables;
 use clippy_utils::visitors::{Descend, for_each_expr_without_closures};
-use clippy_utils::{as_some_expr, sym};
+use clippy_utils::{as_some_expr, is_none_expr, sym};
 use core::ops::ControlFlow;
 use rustc_hir as hir;
-use rustc_hir::LangItem::{OptionNone, OptionSome};
 use rustc_lint::LateContext;
 use rustc_span::Span;
 use std::fmt::Display;
@@ -28,12 +27,12 @@ pub(super) fn check<'tcx>(
     if let hir::ExprKind::Closure(&hir::Closure { body, .. }) = arg.kind {
         let body = cx.tcx.hir_body(body);
         let arg_id = body.params[0].pat.hir_id;
-        let mutates_arg = mutated_variables(body.value, cx).is_none_or(|used_mutably| used_mutably.contains(&arg_id));
-        let (clone_or_copy_needed, _) = clone_or_copy_needed(cx, body.params[0].pat, body.value);
+        let mutates_arg = mutated_variables(&body.value, cx).is_none_or(|used_mutably| used_mutably.contains(&arg_id));
+        let (clone_or_copy_needed, _) = clone_or_copy_needed(cx, body.params[0].pat, &body.value);
 
-        let (mut found_mapping, mut found_filtering) = check_expression(cx, arg_id, body.value);
+        let (mut found_mapping, mut found_filtering) = check_expression(cx, arg_id, &body.value);
 
-        let _: Option<!> = for_each_expr_without_closures(body.value, |e| {
+        let _: Option<!> = for_each_expr_without_closures(&body.value, |e| {
             if let hir::ExprKind::Ret(Some(e)) = &e.kind {
                 let (found_mapping_res, found_filtering_res) = check_expression(cx, arg_id, e);
                 found_mapping |= found_mapping_res;
@@ -47,7 +46,7 @@ pub(super) fn check<'tcx>(
         let sugg = if !found_filtering {
             // Check if the closure is .filter_map(|x| Some(x))
             if kind.is_filter_map()
-                && let Some(arg) = as_some_expr(cx, body.value)
+                && let Some(arg) = as_some_expr(cx, &body.value)
                 && let hir::ExprKind::Path(_) = arg.kind
             {
                 span_lint(
@@ -63,7 +62,7 @@ pub(super) fn check<'tcx>(
                 Kind::FindMap => "map(..).next()",
             }
         } else if !found_mapping && !mutates_arg && (!clone_or_copy_needed || is_copy(cx, in_ty)) {
-            let ty = cx.typeck_results().expr_ty(body.value);
+            let ty = cx.typeck_results().expr_ty(&body.value);
             if option_arg_ty(cx, ty).is_some_and(|t| t == in_ty) {
                 match kind {
                     Kind::FilterMap => "filter(..)",
@@ -111,25 +110,18 @@ impl Display for Kind {
 // returns (found_mapping, found_filtering)
 fn check_expression<'tcx>(cx: &LateContext<'tcx>, arg_id: hir::HirId, expr: &'tcx hir::Expr<'_>) -> (bool, bool) {
     match expr.kind {
-        hir::ExprKind::Path(ref path)
-            if cx
-                .qpath_res(path, expr.hir_id)
-                .ctor_parent(cx)
-                .is_lang_item(cx, OptionNone) =>
-        {
+        hir::ExprKind::Path(_) if is_none_expr(cx, expr) => {
             // None
             (false, true)
         },
-        hir::ExprKind::Call(func, args) => {
-            if func.res(cx).ctor_parent(cx).is_lang_item(cx, OptionSome) {
-                if args[0].res_local_id() == Some(arg_id) {
-                    // Some(arg_id)
-                    return (false, false);
-                }
+        hir::ExprKind::Call(..) if let Some(found_arg) = as_some_expr(cx, expr) => {
+            if found_arg.res_local_id() == Some(arg_id) {
+                // Some(arg_id)
+                (false, false)
+            } else {
                 // Some(not arg_id)
-                return (true, false);
+                (true, false)
             }
-            (true, true)
         },
         hir::ExprKind::MethodCall(segment, recv, [arg], _)
             if segment.ident.name == sym::then_some

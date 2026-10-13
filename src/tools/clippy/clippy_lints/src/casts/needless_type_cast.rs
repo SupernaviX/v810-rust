@@ -8,7 +8,7 @@ use rustc_errors::Applicability;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::{BlockCheckMode, Body, Expr, ExprKind, HirId, LetStmt, PatKind, StmtKind, UnsafeSource};
 use rustc_lint::LateContext;
-use rustc_middle::ty::{Ty, TypeVisitableExt};
+use rustc_middle::ty::{Ty, TypeVisitableExt as _};
 use rustc_span::Span;
 
 use super::NEEDLESS_TYPE_CAST;
@@ -24,10 +24,10 @@ struct UsageInfo<'a> {
     in_generic_context: bool,
 }
 
-pub(super) fn check<'a>(cx: &LateContext<'a>, body: &Body<'a>) {
+pub(super) fn check<'a>(cx: &LateContext<'a>, body: &'a Body<'a>) {
     let mut bindings: FxHashMap<HirId, BindingInfo<'a>> = FxHashMap::default();
 
-    for_each_expr_without_closures(body.value, |expr| {
+    for_each_expr_without_closures(&body.value, |expr| {
         match expr.kind {
             ExprKind::Block(block, _) => {
                 for stmt in block.stmts {
@@ -246,10 +246,10 @@ fn can_coerce_to_target_type(expr: &Expr<'_>) -> bool {
     }
 }
 
-fn check_binding_usages<'a>(cx: &LateContext<'a>, body: &Body<'a>, hir_id: HirId, binding_info: &BindingInfo<'a>) {
+fn check_binding_usages<'a>(cx: &LateContext<'a>, body: &'a Body<'a>, hir_id: HirId, binding_info: &BindingInfo<'a>) {
     let mut usages = Vec::new();
 
-    for_each_expr(cx.tcx, body.value, |expr| {
+    for_each_expr(cx.tcx, &body.value, |expr| {
         if let ExprKind::Path(ref qpath) = expr.kind
             && !expr.span.from_expansion()
             && let Res::Local(id) = cx.qpath_res(qpath, expr.hir_id)

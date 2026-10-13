@@ -40,6 +40,7 @@ struct FdIdWith<T: ?Sized> {
 /// globally unique ID of this file description.
 #[repr(transparent)]
 #[derive(CoercePointee, Debug)]
+// Sadly `CoercePointee` does not let us keep the `FdId` *outside* the `Rc`.
 pub struct FileDescriptionRef<T: ?Sized>(Rc<FdIdWith<T>>);
 
 impl<T: ?Sized> Clone for FileDescriptionRef<T> {
@@ -89,13 +90,17 @@ impl<T: ?Sized> WeakFileDescriptionRef<T> {
     pub fn upgrade(&self) -> Option<FileDescriptionRef<T>> {
         self.0.upgrade().map(FileDescriptionRef)
     }
+
+    /// Returns whether the file description that this weak reference points to
+    /// has been closed, i.e., there are no more strong references.
+    pub fn is_closed(&self) -> bool {
+        self.0.strong_count() == 0
+    }
 }
 
-impl<T> VisitProvenance for WeakFileDescriptionRef<T> {
+impl<T> VisitProvenance for FileDescriptionRef<T> {
     fn visit_provenance(&self, _visit: &mut VisitWith<'_>) {
-        // A weak reference can never be the only reference to some pointer or place.
-        // Since the actual file description is tracked by strong ref somewhere,
-        // it is ok to make this a NOP operation.
+        // All our FileDescription instances do not have any provenance.
     }
 }
 
@@ -104,42 +109,16 @@ impl<T> VisitProvenance for WeakFileDescriptionRef<T> {
 /// but that does not allow upcasting.
 pub trait FileDescriptionExt: 'static {
     fn into_rc_any(self: FileDescriptionRef<Self>) -> Rc<dyn Any>;
-
-    /// We wrap the regular `close` function generically, so both handle `Rc::into_inner`
-    /// and epoll interest management.
-    fn close_ref<'tcx>(
-        self: FileDescriptionRef<Self>,
-        communicate_allowed: bool,
-        ecx: &mut MiriInterpCx<'tcx>,
-    ) -> InterpResult<'tcx, io::Result<()>>;
 }
 
 impl<T: FileDescription + 'static> FileDescriptionExt for T {
     fn into_rc_any(self: FileDescriptionRef<Self>) -> Rc<dyn Any> {
         self.0
     }
-
-    fn close_ref<'tcx>(
-        self: FileDescriptionRef<Self>,
-        communicate_allowed: bool,
-        ecx: &mut MiriInterpCx<'tcx>,
-    ) -> InterpResult<'tcx, io::Result<()>> {
-        match Rc::into_inner(self.0) {
-            Some(fd) => {
-                // There might have been readiness watchers interested in this FD. Remove them.
-                ecx.machine.readiness_interests.remove_watchers_for_fd(fd.id);
-
-                fd.inner.destroy(fd.id, communicate_allowed, ecx)
-            }
-            None => {
-                // Not the last reference.
-                interp_ok(Ok(()))
-            }
-        }
-    }
 }
 
 pub type DynFileDescriptionRef = FileDescriptionRef<dyn FileDescription>;
+pub type WeakDynFileDescriptionRef = WeakFileDescriptionRef<dyn FileDescription>;
 
 impl FileDescriptionRef<dyn FileDescription> {
     pub fn downcast<T: FileDescription + 'static>(self) -> Option<FileDescriptionRef<T>> {
@@ -202,24 +181,9 @@ pub trait FileDescription: std::fmt::Debug + FileDescriptionExt {
         throw_unsup_format!("cannot seek on {}", self.name());
     }
 
-    /// Destroys the file description. Only called when the last duplicate file descriptor is closed.
-    ///
-    /// `self_addr` is the address that this file description used to be stored at.
-    fn destroy<'tcx>(
-        self,
-        _self_id: FdId,
-        _communicate_allowed: bool,
-        _ecx: &mut MiriInterpCx<'tcx>,
-    ) -> InterpResult<'tcx, io::Result<()>>
-    where
-        Self: Sized,
-    {
-        throw_unsup_format!("cannot close {}", self.name());
-    }
-
     /// Returns the metadata for this FD, if available.
     /// This is either host metadata, or a non-file-backed-FD type.
-    /// The latter is for new represented as a string storing a `libc` name so we only
+    /// The latter is for now represented as a string storing the `libc` name of the mode so we only
     /// support that kind of metadata on Unix targets.
     fn metadata<'tcx>(&self) -> InterpResult<'tcx, Either<io::Result<fs::Metadata>, &'static str>> {
         throw_unsup_format!("obtaining metadata is only supported on file-backed file descriptors");
@@ -231,34 +195,36 @@ pub trait FileDescription: std::fmt::Debug + FileDescriptionExt {
         false
     }
 
-    fn as_unix<'tcx>(
-        self: FileDescriptionRef<Self>,
-        _ecx: &MiriInterpCx<'tcx>,
-    ) -> FileDescriptionRef<dyn UnixFileDescription> {
-        panic!("Not a unix file descriptor: {}", self.name());
+    /// Converts this FD into a unix file description. Must succeed for all FD types that can be
+    /// created on Unix targets!
+    fn as_unix(self: FileDescriptionRef<Self>) -> FileDescriptionRef<dyn UnixFileDescription> {
+        panic!("Not a unix file description: {}", self.name());
     }
 
-    /// Implementation of fcntl(F_GETFL) for this FD.
-    fn get_flags<'tcx>(&self, _ecx: &mut MiriInterpCx<'tcx>) -> InterpResult<'tcx, Scalar> {
-        throw_unsup_format!("fcntl: {} is not supported for F_GETFL", self.name());
-    }
-
-    /// Implementation of fcntl(F_SETFL) for this FD.
-    fn set_flags<'tcx>(
-        &self,
-        _flag: i32,
-        _ecx: &mut MiriInterpCx<'tcx>,
-    ) -> InterpResult<'tcx, Scalar> {
-        throw_unsup_format!("fcntl: {} is not supported for F_SETFL", self.name());
+    /// Get the `ReadinessWatched` of the file description.
+    fn readiness_watched(&self) -> Option<&ReadinessWatched> {
+        None
     }
 
     /// Get the current I/O readiness of the file description.
-    fn readiness<'tcx>(&self) -> InterpResult<'tcx, Readiness> {
-        throw_unsup_format!("{}: this file description doesn't support I/O readiness", self.name());
+    fn readiness(&self) -> Readiness {
+        panic!("FD type {} implements `readiness_watched` but not `readiness`", self.name());
     }
 }
 
-impl FileDescription for io::Stdin {
+#[derive(Debug)]
+pub struct Stdin {
+    stdin: io::Stdin,
+    watched: ReadinessWatched,
+}
+
+impl Stdin {
+    fn new() -> Self {
+        Self { stdin: io::stdin(), watched: ReadinessWatched::default() }
+    }
+}
+
+impl FileDescription for Stdin {
     fn name(&self) -> &'static str {
         "stdin"
     }
@@ -276,26 +242,46 @@ impl FileDescription for io::Stdin {
             helpers::isolation_abort_error("`read` from stdin")?;
         }
 
-        let mut stdin = &*self;
-        let result = ecx.read_from_host(|buf| stdin.read(buf), len, ptr)?;
+        // FIXME: this can block on the host, halting the entire interpreter.
+        let result = ecx.read_from_host(|buf| (&mut &self.stdin).read(buf), len, ptr)?;
         finish.call(ecx, result)
     }
 
-    fn destroy<'tcx>(
-        self,
-        _self_id: FdId,
-        _communicate_allowed: bool,
-        _ecx: &mut MiriInterpCx<'tcx>,
-    ) -> InterpResult<'tcx, io::Result<()>> {
-        interp_ok(Ok(()))
+    fn is_tty(&self, communicate_allowed: bool) -> bool {
+        communicate_allowed && self.stdin.is_terminal()
     }
 
-    fn is_tty(&self, communicate_allowed: bool) -> bool {
-        communicate_allowed && self.is_terminal()
+    fn readiness_watched(&self) -> Option<&ReadinessWatched> {
+        Some(&self.watched)
+    }
+
+    fn readiness(&self) -> Readiness {
+        // Stdin is readable (we never return EWOULDBLOCK above) and also writable (since that never
+        // blocks either). This matches what we see on Linux.
+        let mut readiness = Readiness::EMPTY;
+        readiness.readable = true;
+        readiness.writable = true;
+        readiness
+    }
+
+    fn as_unix(self: FileDescriptionRef<Self>) -> FileDescriptionRef<dyn UnixFileDescription> {
+        self
     }
 }
 
-impl FileDescription for io::Stdout {
+#[derive(Debug)]
+pub struct Stdout {
+    stdout: io::Stdout,
+    watched: ReadinessWatched,
+}
+
+impl Stdout {
+    fn new() -> Self {
+        Self { stdout: io::stdout(), watched: ReadinessWatched::default() }
+    }
+}
+
+impl FileDescription for Stdout {
     fn name(&self) -> &'static str {
         "stdout"
     }
@@ -309,7 +295,7 @@ impl FileDescription for io::Stdout {
         finish: DynMachineCallback<'tcx, Result<usize, IoError>>,
     ) -> InterpResult<'tcx> {
         // We allow writing to stdout even with isolation enabled.
-        let result = ecx.write_to_host(&*self, len, ptr)?;
+        let result = ecx.write_to_host(&self.stdout, len, ptr)?;
         // Stdout is buffered, flush to make sure it appears on the
         // screen.  This is the write() syscall of the interpreted
         // program, we want it to correspond to a write() syscall on
@@ -320,32 +306,41 @@ impl FileDescription for io::Stdout {
         finish.call(ecx, result)
     }
 
-    fn destroy<'tcx>(
-        self,
-        _self_id: FdId,
-        _communicate_allowed: bool,
-        _ecx: &mut MiriInterpCx<'tcx>,
-    ) -> InterpResult<'tcx, io::Result<()>> {
-        interp_ok(Ok(()))
+    fn is_tty(&self, communicate_allowed: bool) -> bool {
+        communicate_allowed && self.stdout.is_terminal()
     }
 
-    fn is_tty(&self, communicate_allowed: bool) -> bool {
-        communicate_allowed && self.is_terminal()
+    fn readiness_watched(&self) -> Option<&ReadinessWatched> {
+        Some(&self.watched)
+    }
+
+    fn readiness(&self) -> Readiness {
+        // stdout can always be written (we never return EWOULDBLOCK there) and never be read.
+        let mut readiness = Readiness::EMPTY;
+        readiness.writable = true;
+        readiness
+    }
+
+    fn as_unix(self: FileDescriptionRef<Self>) -> FileDescriptionRef<dyn UnixFileDescription> {
+        self
     }
 }
 
-impl FileDescription for io::Stderr {
+#[derive(Debug)]
+pub struct Stderr {
+    stderr: io::Stderr,
+    watched: ReadinessWatched,
+}
+
+impl Stderr {
+    fn new() -> Self {
+        Self { stderr: io::stderr(), watched: ReadinessWatched::default() }
+    }
+}
+
+impl FileDescription for Stderr {
     fn name(&self) -> &'static str {
         "stderr"
-    }
-
-    fn destroy<'tcx>(
-        self,
-        _self_id: FdId,
-        _communicate_allowed: bool,
-        _ecx: &mut MiriInterpCx<'tcx>,
-    ) -> InterpResult<'tcx, io::Result<()>> {
-        interp_ok(Ok(()))
     }
 
     fn write<'tcx>(
@@ -357,13 +352,73 @@ impl FileDescription for io::Stderr {
         finish: DynMachineCallback<'tcx, Result<usize, IoError>>,
     ) -> InterpResult<'tcx> {
         // We allow writing to stderr even with isolation enabled.
-        let result = ecx.write_to_host(&*self, len, ptr)?;
+        let result = ecx.write_to_host(&self.stderr, len, ptr)?;
         // No need to flush, stderr is not buffered.
         finish.call(ecx, result)
     }
 
     fn is_tty(&self, communicate_allowed: bool) -> bool {
-        communicate_allowed && self.is_terminal()
+        communicate_allowed && self.stderr.is_terminal()
+    }
+
+    fn readiness_watched(&self) -> Option<&ReadinessWatched> {
+        Some(&self.watched)
+    }
+
+    fn readiness(&self) -> Readiness {
+        // stderr can always be written (we never return EWOULDBLOCK there) and never be read.
+        let mut readiness = Readiness::EMPTY;
+        readiness.writable = true;
+        readiness
+    }
+
+    fn as_unix(self: FileDescriptionRef<Self>) -> FileDescriptionRef<dyn UnixFileDescription> {
+        self
+    }
+}
+
+/// Like /dev/null
+#[derive(Debug)]
+pub struct NullOutput {
+    watched: ReadinessWatched,
+}
+
+impl NullOutput {
+    fn new() -> Self {
+        Self { watched: ReadinessWatched::default() }
+    }
+}
+
+impl FileDescription for NullOutput {
+    fn name(&self) -> &'static str {
+        "null output"
+    }
+
+    fn write<'tcx>(
+        self: FileDescriptionRef<Self>,
+        _communicate_allowed: bool,
+        _ptr: Pointer,
+        len: usize,
+        ecx: &mut MiriInterpCx<'tcx>,
+        finish: DynMachineCallback<'tcx, Result<usize, IoError>>,
+    ) -> InterpResult<'tcx> {
+        // We just don't write anything, but report to the user that we did.
+        finish.call(ecx, Ok(len))
+    }
+
+    fn readiness_watched(&self) -> Option<&ReadinessWatched> {
+        Some(&self.watched)
+    }
+
+    fn readiness(&self) -> Readiness {
+        // null output can always be written (we never return EWOULDBLOCK there) and never be read.
+        let mut readiness = Readiness::EMPTY;
+        readiness.writable = true;
+        readiness
+    }
+
+    fn as_unix(self: FileDescriptionRef<Self>) -> FileDescriptionRef<dyn UnixFileDescription> {
+        self
     }
 }
 
@@ -390,7 +445,13 @@ impl FileDescription for FileHandle {
         assert!(communicate_allowed, "isolation should have prevented even opening a file");
 
         if !self.readable {
-            return finish.call(ecx, Err(ErrorKind::PermissionDenied.into()));
+            // Unix returns EBADF, Windows something that translates to `PermissionDenied`.
+            let err = if ecx.target_os_is_unix() {
+                LibcError("EBADF")
+            } else {
+                ErrorKind::PermissionDenied.into()
+            };
+            return finish.call(ecx, Err(err));
         }
 
         let mut file = &self.file;
@@ -409,13 +470,13 @@ impl FileDescription for FileHandle {
         assert!(communicate_allowed, "isolation should have prevented even opening a file");
 
         if !self.writable {
-            // Linux hosts return EBADF here which we can't translate via the platform-independent
-            // code since it does not map to any `io::ErrorKind` -- so if we don't do anything
-            // special, we'd throw an "unsupported error code" here. Windows returns something that
-            // gets translated to `PermissionDenied`. That seems like a good value so let's just use
-            // this everywhere, even if it means behavior on Unix targets does not match the real
-            // thing.
-            return finish.call(ecx, Err(ErrorKind::PermissionDenied.into()));
+            // Unix returns EBADF, Windows something that translates to `PermissionDenied`.
+            let err = if ecx.target_os_is_unix() {
+                LibcError("EBADF")
+            } else {
+                ErrorKind::PermissionDenied.into()
+            };
+            return finish.call(ecx, Err(err));
         }
         let result = ecx.write_to_host(&self.file, len, ptr)?;
         finish.call(ecx, result)
@@ -428,33 +489,6 @@ impl FileDescription for FileHandle {
     ) -> InterpResult<'tcx, io::Result<u64>> {
         assert!(communicate_allowed, "isolation should have prevented even opening a file");
         interp_ok((&mut &self.file).seek(offset))
-    }
-
-    fn destroy<'tcx>(
-        self,
-        _self_id: FdId,
-        communicate_allowed: bool,
-        _ecx: &mut MiriInterpCx<'tcx>,
-    ) -> InterpResult<'tcx, io::Result<()>> {
-        assert!(communicate_allowed, "isolation should have prevented even opening a file");
-        // We sync the file if it was opened in a mode different than read-only.
-        if self.writable {
-            // `File::sync_all` does the checks that are done when closing a file. We do this to
-            // to handle possible errors correctly.
-            let result = self.file.sync_all();
-            // Now we actually close the file and return the result.
-            drop(self.file);
-            interp_ok(result)
-        } else {
-            // We drop the file, this closes it but ignores any errors
-            // produced when closing it. This is done because
-            // `File::sync_all` cannot be done over files like
-            // `/dev/urandom` which are read-only. Check
-            // https://github.com/rust-lang/miri/issues/999#issuecomment-568920439
-            // for a deeper discussion.
-            drop(self.file);
-            interp_ok(Ok(()))
-        }
     }
 
     fn metadata<'tcx>(&self) -> InterpResult<'tcx, Either<io::Result<fs::Metadata>, &'static str>> {
@@ -472,21 +506,16 @@ impl FileDescription for FileHandle {
         true
     }
 
-    fn as_unix<'tcx>(
-        self: FileDescriptionRef<Self>,
-        ecx: &MiriInterpCx<'tcx>,
-    ) -> FileDescriptionRef<dyn UnixFileDescription> {
-        assert!(
-            ecx.target_os_is_unix(),
-            "unix file operations are only available for unix targets"
-        );
+    fn as_unix(self: FileDescriptionRef<Self>) -> FileDescriptionRef<dyn UnixFileDescription> {
         self
     }
 }
 
 #[derive(Debug)]
 pub struct DirHandle {
-    pub(crate) dir: Dir,
+    pub(super) dir: Dir,
+    #[cfg(bootstrap)]
+    pub(super) fallback: std::path::PathBuf,
 }
 
 impl FileDescription for DirHandle {
@@ -497,47 +526,47 @@ impl FileDescription for DirHandle {
     fn metadata<'tcx>(
         &self,
     ) -> InterpResult<'tcx, Either<io::Result<std::fs::Metadata>, &'static str>> {
+        #[cfg(bootstrap)]
         return interp_ok(Either::Left(self.dir.metadata()));
+        #[cfg(not(bootstrap))]
+        return interp_ok(Either::Left(self.dir.self_metadata()));
     }
 
-    fn destroy<'tcx>(
-        self,
-        _self_id: FdId,
+    fn read<'tcx>(
+        self: FileDescriptionRef<Self>,
         _communicate_allowed: bool,
-        _ecx: &mut MiriInterpCx<'tcx>,
-    ) -> InterpResult<'tcx, io::Result<()>> {
-        interp_ok(Ok(()))
-    }
-}
-
-/// Like /dev/null
-#[derive(Debug)]
-pub struct NullOutput;
-
-impl FileDescription for NullOutput {
-    fn name(&self) -> &'static str {
-        "stderr and stdout"
+        _ptr: Pointer,
+        _len: usize,
+        ecx: &mut MiriInterpCx<'tcx>,
+        finish: DynMachineCallback<'tcx, Result<usize, IoError>>,
+    ) -> InterpResult<'tcx> {
+        if ecx.target_os_is_unix() {
+            finish.call(ecx, Err(LibcError("EISDIR")))
+        } else {
+            // No idea what this should do on Windows.
+            throw_unsup_format!("reading directories is not supported on this target");
+        }
     }
 
     fn write<'tcx>(
         self: FileDescriptionRef<Self>,
         _communicate_allowed: bool,
         _ptr: Pointer,
-        len: usize,
+        _len: usize,
         ecx: &mut MiriInterpCx<'tcx>,
         finish: DynMachineCallback<'tcx, Result<usize, IoError>>,
     ) -> InterpResult<'tcx> {
-        // We just don't write anything, but report to the user that we did.
-        finish.call(ecx, Ok(len))
+        if ecx.target_os_is_unix() {
+            // Directories are opened for reading, so writing returns EBADF.
+            finish.call(ecx, Err(LibcError("EBADF")))
+        } else {
+            // No idea what this should do on Windows.
+            throw_unsup_format!("writing directories is not supported on this target");
+        }
     }
 
-    fn destroy<'tcx>(
-        self,
-        _self_id: FdId,
-        _communicate_allowed: bool,
-        _ecx: &mut MiriInterpCx<'tcx>,
-    ) -> InterpResult<'tcx, io::Result<()>> {
-        interp_ok(Ok(()))
+    fn as_unix(self: FileDescriptionRef<Self>) -> FileDescriptionRef<dyn UnixFileDescription> {
+        self
     }
 }
 
@@ -547,14 +576,14 @@ pub type FdNum = i32;
 /// The file descriptor table
 #[derive(Debug)]
 pub struct FdTable {
-    pub fds: BTreeMap<FdNum, DynFileDescriptionRef>,
+    fds: BTreeMap<FdNum, DynFileDescriptionRef>,
     /// Unique identifier for file description, used to differentiate between various file description.
     next_file_description_id: FdId,
 }
 
 impl VisitProvenance for FdTable {
     fn visit_provenance(&self, _visit: &mut VisitWith<'_>) {
-        // All our FileDescription instances do not have any tags.
+        // All our FileDescription instances do not have any provenance.
     }
 }
 
@@ -564,13 +593,13 @@ impl FdTable {
     }
     pub(crate) fn init(mute_stdout_stderr: bool) -> FdTable {
         let mut fds = FdTable::new();
-        fds.insert_new(io::stdin());
+        fds.insert_new(Stdin::new());
         if mute_stdout_stderr {
-            assert_eq!(fds.insert_new(NullOutput), 1);
-            assert_eq!(fds.insert_new(NullOutput), 2);
+            assert_eq!(fds.insert_new(NullOutput::new()), 1);
+            assert_eq!(fds.insert_new(NullOutput::new()), 2);
         } else {
-            assert_eq!(fds.insert_new(io::stdout()), 1);
-            assert_eq!(fds.insert_new(io::stderr()), 2);
+            assert_eq!(fds.insert_new(Stdout::new()), 1);
+            assert_eq!(fds.insert_new(Stderr::new()), 2);
         }
         fds
     }
@@ -588,6 +617,7 @@ impl FdTable {
         self.insert(fd_ref)
     }
 
+    /// Insert an alias to an existing file description to the FdTable.
     pub fn insert(&mut self, fd_ref: DynFileDescriptionRef) -> FdNum {
         self.insert_with_min_num(fd_ref, 0)
     }
@@ -598,29 +628,21 @@ impl FdTable {
         file_handle: DynFileDescriptionRef,
         min_fd_num: FdNum,
     ) -> FdNum {
-        // Find the lowest unused FD, starting from min_fd. If the first such unused FD is in
-        // between used FDs, the find_map combinator will return it. If the first such unused FD
-        // is after all other used FDs, the find_map combinator will return None, and we will use
-        // the FD following the greatest FD thus far.
-        let candidate_new_fd =
-            self.fds.range(min_fd_num..).zip(min_fd_num..).find_map(|((fd_num, _fd), counter)| {
-                if *fd_num != counter {
-                    // There was a gap in the fds stored, return the first unused one
-                    // (note that this relies on BTreeMap iterating in key order)
-                    Some(counter)
-                } else {
-                    // This fd is used, keep going
-                    None
-                }
-            });
-        let new_fd_num = candidate_new_fd.unwrap_or_else(|| {
-            // find_map ran out of BTreeMap entries before finding a free fd, use one plus the
-            // maximum fd in the map
-            self.fds.last_key_value().map(|(fd_num, _)| fd_num.strict_add(1)).unwrap_or(min_fd_num)
-        });
+        let mut candidate = min_fd_num;
+        for (&fd_num, _) in self.fds.range(min_fd_num..) {
+            if fd_num == candidate {
+                // This one is taken. Try the next one.
+                candidate = candidate.strict_add(1);
+            } else {
+                // We found a gap! Use this candidate.
+                break;
+            }
+        }
+        // If we exhaust the loop, the table is a solid block starting at `min_fd_num` until the
+        // end, and `candidate` is now the first number after that block -- exactly what we need.
 
-        self.fds.try_insert(new_fd_num, file_handle).unwrap();
-        new_fd_num
+        self.fds.try_insert(candidate, file_handle).unwrap();
+        candidate
     }
 
     pub fn get(&self, fd_num: FdNum) -> Option<DynFileDescriptionRef> {
@@ -675,5 +697,67 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let bytes = this.read_bytes_ptr_strip_provenance(ptr, Size::from_bytes(len))?;
         let result = file.write(bytes);
         interp_ok(result.map_err(IoError::HostError))
+    }
+}
+
+/// Open something for which we don't know ahead of time whether it is a file or a directory.
+///
+/// Note that on Windows hosts, `custom_flags` is ignored if `root` is `Some`!
+pub fn open_file_or_dir(
+    root: Option<&fs::Dir>,
+    path: &std::path::Path,
+    opts: &fs::OpenOptions,
+) -> io::Result<Either<fs::File, fs::Dir>> {
+    // On Unix, `open`/`openat` works for files and directories.
+    // On Windows, that fails with `PermissionDenied`, so we need to open an `fs::Dir` instead.
+    // (But that may succeed even on a file! So we still have to check the metadata.)
+    let file = match root {
+        Some(root) => root.open_file_with(path, opts),
+        None => opts.open(path),
+    };
+    #[cfg(windows)]
+    let file = file.or_else(|err| {
+        use std::os::windows::io::OwnedHandle;
+
+        if err.kind() == io::ErrorKind::PermissionDenied {
+            // Retry via `fs::Dir`. Opening a directory via `Dir::open_file` does not work so we
+            // have to use `open_dir`.
+            let dir = match root {
+                Some(root) => root.open_dir_with(path, opts),
+                None => Dir::open_with(path, opts),
+            };
+            match dir {
+                // Convert back to file so it always has the same type.
+                Ok(dir) => Ok(File::from(OwnedHandle::from(dir))),
+                Err(err2) => {
+                    // If this 2nd attempt says "not a directory", preserve the original error. It's
+                    // possible that we lost a race twice if this keeps being changed from directory
+                    // to file and back. However, in that case it was entirely non-existent for a
+                    // little while, so returning an error is still fine.
+                    Err(if err2.kind() == io::ErrorKind::NotADirectory { err } else { err2 })
+                }
+            }
+        } else {
+            Err(err)
+        }
+    });
+    let file = file?;
+
+    let metadata = file.metadata().expect("just-opened file/dir should have metadata");
+    if metadata.is_dir() {
+        assert!(!metadata.is_symlink()); // Rust makes this mutually exclusive with `is_dir`
+        // Convert to dir.
+        cfg_select! {
+            unix => {
+                use std::os::fd::OwnedFd;
+                Ok(Either::Right(OwnedFd::from(file).into()))
+            }
+            windows => {
+                use std::os::windows::io::OwnedHandle;
+                Ok(Either::Right(OwnedHandle::from(file).into()))
+            }
+        }
+    } else {
+        Ok(Either::Left(file))
     }
 }

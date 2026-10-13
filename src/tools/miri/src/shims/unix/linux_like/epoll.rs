@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use rustc_abi::FieldIdx;
 
-use crate::shims::files::{FdId, FileDescription, FileDescriptionRef};
+use crate::shims::files::{FileDescription, FileDescriptionRef};
 use crate::shims::unix::UnixFileDescription;
 use crate::*;
 
@@ -14,12 +14,6 @@ pub struct Epoll {
     /// Watcher used for registering interests in the global readiness
     /// interest table.
     watcher: Rc<ReadinessWatcher>,
-}
-
-impl VisitProvenance for Epoll {
-    fn visit_provenance(&self, _visit: &mut VisitWith<'_>) {
-        // No provenance anywhere in this type.
-    }
 }
 
 impl FileDescription for Epoll {
@@ -34,22 +28,7 @@ impl FileDescription for Epoll {
         interp_ok(Either::Right("S_IFREG"))
     }
 
-    fn destroy<'tcx>(
-        self,
-        _self_id: FdId,
-        _communicate_allowed: bool,
-        ecx: &mut MiriInterpCx<'tcx>,
-    ) -> InterpResult<'tcx, io::Result<()>> {
-        let watcher = Rc::into_inner(self.watcher)
-            .expect("Epoll instance should contain the only strong reference to the watcher");
-        watcher.destroy(ecx);
-        interp_ok(Ok(()))
-    }
-
-    fn as_unix<'tcx>(
-        self: FileDescriptionRef<Self>,
-        _ecx: &MiriInterpCx<'tcx>,
-    ) -> FileDescriptionRef<dyn UnixFileDescription> {
+    fn as_unix(self: FileDescriptionRef<Self>) -> FileDescriptionRef<dyn UnixFileDescription> {
         self
     }
 }
@@ -78,10 +57,8 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             );
         }
 
-        let fd = this
-            .machine
-            .fds
-            .insert_new(Epoll { watcher: Rc::new(this.machine.readiness_interests.new_watcher()) });
+        let fd =
+            this.machine.fds.insert_new(Epoll { watcher: Rc::new(ReadinessWatcher::default()) });
         interp_ok(Scalar::from_i32(fd))
     }
 
@@ -207,7 +184,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 }
             }
         } else if op == epoll_ctl_del {
-            if epfd.watcher.remove_interest(interest_key, this).is_none() {
+            if epfd.watcher.remove_interest(interest_key).is_none() {
                 // We did not have interest in this.
                 return this.set_errno_and_return_neg1_i32(LibcError("ENOENT"));
             };
@@ -418,8 +395,6 @@ trait EvalContextPrivExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 &slot,
             )?;
             num_of_events = num_of_events.strict_add(1);
-            // Synchronize receiving thread with the event of interest.
-            this.acquire_clock(interest.clock())?;
         }
         this.write_int(num_of_events, dest)?;
         interp_ok(num_of_events)

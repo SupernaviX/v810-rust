@@ -1,6 +1,7 @@
 use rand::RngCore;
 
 use super::Dir;
+use super::dirs::{HomeDirs, MediaDirs};
 use crate::fs::{self, File, FileTimes, OpenOptions, TryLockError, exists};
 use crate::io::prelude::*;
 use crate::io::{BorrowedBuf, ErrorKind, SeekFrom};
@@ -13,7 +14,7 @@ use crate::os::unix::fs::symlink as symlink_file;
 use crate::os::unix::fs::symlink as junction_point;
 #[cfg(windows)]
 use crate::os::windows::fs::{OpenOptionsExt, junction_point, symlink_dir, symlink_file};
-use crate::path::Path;
+use crate::path::{Path, PathBuf};
 use crate::sync::Arc;
 use crate::test_helpers::{TempDir, tmpdir};
 use crate::time::{Duration, Instant, SystemTime};
@@ -45,7 +46,7 @@ macro_rules! error_contains {
 // have permission, and return otherwise. This way, we still don't run these
 // tests most of the time, but at least we do if the user has the right
 // permissions.
-pub fn got_symlink_permission(tmpdir: &TempDir) -> bool {
+pub(crate) fn got_symlink_permission(tmpdir: &TempDir) -> bool {
     if cfg!(not(windows)) || env::var_os("CI").is_some() {
         return true;
     }
@@ -613,6 +614,103 @@ fn set_get_unix_permissions() {
     assert_eq!(mask & metadata1.permissions().mode(), 0o0777);
 }
 
+/// Test set_permissions_nofollow on a regular file.
+#[test]
+fn set_get_permissions_nofollows() {
+    let tmpdir = tmpdir();
+    let filename = tmpdir.join("set_get_unix_permissions_file");
+    check!(File::create(&filename));
+
+    let file_metadata = check!(fs::metadata(&filename));
+    assert!(!file_metadata.permissions().readonly());
+    let mut permission_bits = file_metadata.permissions();
+    permission_bits.set_readonly(true);
+    let result = fs::set_permissions_nofollow(&filename, permission_bits);
+
+    cfg_select! {
+        any(windows, unix, target_os = "uefi", target_os = "solid_asp3", target_os = "motor") => {
+            assert_eq!(result.unwrap(), ());
+            let metadata0 = check!(fs::metadata(&filename));
+            assert!(metadata0.permissions().readonly());
+
+            // Reset the read-only bit under Windows 7: avoids the
+            // `TempDir::drop` from crashing on a permission denial when
+            // trying to delete the file that has it.
+            #[cfg(all(windows, target_vendor = "win7"))]
+            {
+                let mut permission_bits = metadata0.permissions();
+                permission_bits.set_readonly(false);
+                check!(fs::set_permissions_nofollow(&filename, permission_bits));
+            }
+        }
+        _ => {
+            let error_kind = result.unwrap_err().kind();
+            assert_eq!(error_kind, crate::io::ErrorKind::Unsupported);
+        }
+    }
+}
+
+/// Test set_permissions_nofollow on a symlink.
+#[test]
+fn set_get_permissions_nofollows_symlink() {
+    let tmpdir = tmpdir();
+    let filename = tmpdir.join("set_get_unix_permissions_file");
+    let symlink_name = tmpdir.join("set_get_unix_permissions");
+    check!(File::create(&filename));
+    check!(symlink_file(&filename, &symlink_name));
+
+    let init_symlink_metadata = check!(fs::symlink_metadata(&symlink_name));
+    assert!(!init_symlink_metadata.permissions().readonly());
+    let init_target_metadata = check!(fs::metadata(&symlink_name));
+    assert!(!init_target_metadata.permissions().readonly());
+
+    // Set symlink permissions to readonly
+    let result = fs::set_permissions_nofollow(&symlink_name, {
+        let mut permissions = init_symlink_metadata.permissions();
+        permissions.set_readonly(true);
+        permissions
+    });
+
+    // This should not change the permissions of the target!
+    let after_target_metadata = check!(fs::metadata(&symlink_name));
+    assert_eq!(after_target_metadata.permissions(), init_target_metadata.permissions());
+
+    cfg_select! {
+        any(
+            windows,
+            target_os = "macos",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "dragonfly",
+            target_os = "nto",
+            target_os = "qnx"
+        ) => {
+            // On these systems, it's confirmed the symlink itself is marked readonly
+            // https://superuser.com/questions/1099634/change-permissions-symbolic-link-mac-os
+            assert_eq!(result.unwrap(), ());
+
+            let after_symlink_metadata = check!(fs::symlink_metadata(&symlink_name));
+            assert!(after_symlink_metadata.permissions().readonly());
+
+            // Reset the read-only bit under Windows 7: avoids the
+            // `TempDir::drop` from crashing on a permission denial when
+            // trying to delete the file that has it.
+            #[cfg(all(windows, target_vendor = "win7"))]
+            {
+                let mut symlink_permission_bits = after_symlink_metadata.permissions();
+                symlink_permission_bits.set_readonly(false);
+                check!(fs::set_permissions_nofollow(&symlink_name, symlink_permission_bits));
+            }
+        }
+        _ => {
+            // Everywhere else, this just fails.
+            let error_kind = result.unwrap_err().kind();
+            assert_eq!(error_kind, crate::io::ErrorKind::Unsupported);
+        }
+    }
+}
+
 #[test]
 #[cfg(windows)]
 fn file_test_io_seek_read_write() {
@@ -669,6 +767,273 @@ fn file_test_io_seek_read_write() {
 
 #[test]
 #[cfg(windows)]
+fn file_test_io_seek_read_exact_write_all() {
+    use crate::os::windows::fs::FileExt;
+
+    let tmpdir = tmpdir();
+    let filename = tmpdir.join("file_rt_io_file_test_seek_read_exact_write_all.txt");
+    let mut buf = [0; 256];
+    let write1 = "asdf";
+    let write2 = "qwer-";
+    let write3 = "-zxcv";
+    let content = "qwer-asdf-zxcv";
+    {
+        let oo = OpenOptions::new().create_new(true).write(true).read(true).clone();
+        let mut rw = check!(oo.open(&filename));
+        check!(rw.seek_write_all(write1.as_bytes(), 5));
+        assert_eq!(check!(rw.stream_position()), 9);
+        check!(rw.seek_read_exact(&mut buf[..write1.len()], 5));
+        assert_eq!(str::from_utf8(&buf[..write1.len()]), Ok(write1));
+        assert_eq!(check!(rw.stream_position()), 9);
+        assert_eq!(check!(rw.seek(SeekFrom::Start(0))), 0);
+        assert_eq!(check!(rw.write(write2.as_bytes())), write2.len());
+        assert_eq!(check!(rw.stream_position()), 5);
+        assert_eq!(check!(rw.read(&mut buf)), write1.len());
+        assert_eq!(str::from_utf8(&buf[..write1.len()]), Ok(write1));
+        assert_eq!(check!(rw.stream_position()), 9);
+        check!(rw.seek_read_exact(&mut buf[..write2.len()], 0));
+        assert_eq!(str::from_utf8(&buf[..write2.len()]), Ok(write2));
+        assert_eq!(check!(rw.stream_position()), 5);
+        check!(rw.seek_write_all(write3.as_bytes(), 9));
+        assert_eq!(check!(rw.stream_position()), 14);
+    }
+    {
+        let mut read = check!(File::open(&filename));
+        check!(read.seek_read_exact(&mut buf[..content.len()], 0));
+        assert_eq!(str::from_utf8(&buf[..content.len()]), Ok(content));
+        assert_eq!(check!(read.stream_position()), 14);
+        assert_eq!(check!(read.seek(SeekFrom::End(-5))), 9);
+        check!(read.seek_read_exact(&mut buf[..content.len()], 0));
+        assert_eq!(str::from_utf8(&buf[..content.len()]), Ok(content));
+        assert_eq!(check!(read.stream_position()), 14);
+        assert_eq!(check!(read.seek(SeekFrom::End(-5))), 9);
+        assert_eq!(check!(read.read(&mut buf)), write3.len());
+        assert_eq!(str::from_utf8(&buf[..write3.len()]), Ok(write3));
+        assert_eq!(check!(read.stream_position()), 14);
+        check!(read.seek_read_exact(&mut buf[..content.len()], 0));
+        assert_eq!(str::from_utf8(&buf[..content.len()]), Ok(content));
+        assert_eq!(check!(read.stream_position()), 14);
+        assert!(read.seek_read_exact(&mut buf, 14).is_err());
+        assert!(read.seek_read_exact(&mut buf, 15).is_err());
+    }
+    check!(fs::remove_file(&filename));
+}
+
+#[test]
+#[cfg(windows)]
+fn file_test_windows_fileext_trait_case_1() {
+    use crate::os::windows::fs::FileExt;
+
+    // Test when seek_read_exact(), seek_write_all() are called with empty buffers.
+    struct MockFile {}
+
+    impl FileExt for MockFile {
+        fn seek_read(&self, _buf: &mut [u8], _offset: u64) -> io::Result<usize> {
+            panic!("should not be called");
+        }
+
+        fn seek_write(&self, _buf: &[u8], _offset: u64) -> io::Result<usize> {
+            panic!("should not be called");
+        }
+    }
+
+    let mock_file = MockFile {};
+    check!(mock_file.seek_read_exact(&mut [], 0));
+    check!(mock_file.seek_write_all(&[], 0));
+    check!(mock_file.seek_read_exact(&mut [], 420));
+    check!(mock_file.seek_write_all(&[], 420));
+}
+
+#[test]
+#[cfg(windows)]
+fn file_test_windows_fileext_trait_case_2() {
+    use crate::os::windows::fs::FileExt;
+
+    // Test when seek_read(), seek_write() return Ok(0)
+    struct MockFile {
+        expected_offset: u64,
+    }
+
+    impl FileExt for MockFile {
+        fn seek_read(&self, _buf: &mut [u8], offset: u64) -> io::Result<usize> {
+            assert_eq!(offset, self.expected_offset);
+            Ok(0)
+        }
+
+        fn seek_write(&self, _buf: &[u8], offset: u64) -> io::Result<usize> {
+            assert_eq!(offset, self.expected_offset);
+            Ok(0)
+        }
+    }
+
+    {
+        let mock_file = MockFile { expected_offset: 0 };
+        let mut buf = [0; 256];
+        assert_eq!(
+            mock_file.seek_read_exact(&mut buf, 0).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        assert_eq!(mock_file.seek_write_all(&buf, 0).unwrap_err().kind(), io::ErrorKind::WriteZero);
+    }
+
+    {
+        let mock_file = MockFile { expected_offset: 420 };
+        let mut buf = [0; 256];
+        assert_eq!(
+            mock_file.seek_read_exact(&mut buf, 420).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        assert_eq!(
+            mock_file.seek_write_all(&buf, 420).unwrap_err().kind(),
+            io::ErrorKind::WriteZero
+        );
+    }
+}
+
+#[test]
+#[cfg(windows)]
+fn file_test_windows_fileext_trait_case_3() {
+    use crate::os::windows::fs::FileExt;
+
+    // Test that Err other than io::ErrorKind::Interrupted are propagated up.
+    struct MockFile {
+        expected_offset: u64,
+    }
+
+    impl FileExt for MockFile {
+        fn seek_read(&self, _buf: &mut [u8], offset: u64) -> io::Result<usize> {
+            assert_eq!(offset, self.expected_offset);
+            Err(io::Error::new(io::ErrorKind::PermissionDenied, "seek_read"))
+        }
+
+        fn seek_write(&self, _buf: &[u8], offset: u64) -> io::Result<usize> {
+            assert_eq!(offset, self.expected_offset);
+            Err(io::Error::new(io::ErrorKind::ConnectionRefused, "seek_write"))
+        }
+    }
+
+    {
+        let mock_file = MockFile { expected_offset: 0 };
+        let mut buf = [0; 256];
+        assert_eq!(
+            mock_file.seek_read_exact(&mut buf, 0).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            mock_file.seek_write_all(&buf, 0).unwrap_err().kind(),
+            io::ErrorKind::ConnectionRefused
+        );
+    }
+
+    {
+        let mock_file = MockFile { expected_offset: 420 };
+        let mut buf = [0; 256];
+        assert_eq!(
+            mock_file.seek_read_exact(&mut buf, 420).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            mock_file.seek_write_all(&buf, 420).unwrap_err().kind(),
+            io::ErrorKind::ConnectionRefused
+        );
+    }
+    // FIXME: Cover io::ErrorKind::Interrupted, but don't infinite loop ;)
+}
+
+#[test]
+#[cfg(windows)]
+fn file_test_windows_fileext_trait_case_4() {
+    use crate::os::windows::fs::FileExt;
+
+    const MSG: &[u8] =
+        b"The Rust programming language helps you write faster, more reliable software.";
+
+    // Test when the entire read or write is satisfied by only one call to seek_read() or
+    // seek_write(), respectively.
+    struct MockFile {
+        expected_offset: u64,
+    }
+
+    impl FileExt for MockFile {
+        fn seek_read(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+            assert_eq!(offset, self.expected_offset);
+            assert_eq!(buf.len(), MSG.len());
+            assert_eq!(buf, &[0; MSG.len()]);
+            buf.copy_from_slice(MSG);
+            Ok(MSG.len())
+        }
+
+        fn seek_write(&self, buf: &[u8], offset: u64) -> io::Result<usize> {
+            assert_eq!(offset, self.expected_offset);
+            assert_eq!(buf.len(), MSG.len());
+            assert_eq!(buf, MSG);
+            Ok(MSG.len())
+        }
+    }
+
+    {
+        let mock_file = MockFile { expected_offset: 0 };
+        let mut buf = [0; MSG.len()];
+        check!(mock_file.seek_read_exact(&mut buf, 0));
+        assert_eq!(&buf, MSG);
+        check!(mock_file.seek_write_all(&buf, 0));
+    }
+
+    {
+        let mock_file = MockFile { expected_offset: 420 };
+        let mut buf = [0; MSG.len()];
+        check!(mock_file.seek_read_exact(&mut buf, 420));
+        assert_eq!(&buf, MSG);
+        check!(mock_file.seek_write_all(&buf, 420));
+    }
+}
+
+#[test]
+#[cfg(windows)]
+fn file_test_windows_fileext_trait_case_5() {
+    use crate::os::windows::fs::FileExt;
+
+    const MSG: &[u8] =
+        b"Rust is for students and those who are interested in learning about systems concepts.";
+
+    // Test pathological case where seek_read(), seek_write() only do 1 byte per call, return Ok(1)
+    struct MockFile {
+        base_offset: u64,
+    }
+
+    impl FileExt for MockFile {
+        fn seek_read(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+            let offset = (offset - self.base_offset) as usize;
+            buf[0..1].copy_from_slice(&MSG[offset..offset + 1]);
+            Ok(1)
+        }
+
+        fn seek_write(&self, buf: &[u8], offset: u64) -> io::Result<usize> {
+            let offset = (offset - self.base_offset) as usize;
+            assert_eq!(buf[0..1], MSG[offset..offset + 1]);
+            Ok(1)
+        }
+    }
+
+    {
+        let mock_file = MockFile { base_offset: 0 };
+        let mut buf = [0; MSG.len()];
+        check!(mock_file.seek_read_exact(&mut buf, 0));
+        assert_eq!(&buf, MSG);
+        check!(mock_file.seek_write_all(&buf, 0));
+    }
+
+    {
+        let mock_file = MockFile { base_offset: 420 };
+        let mut buf = [0; MSG.len()];
+        check!(mock_file.seek_read_exact(&mut buf, 420));
+        assert_eq!(&buf, MSG);
+        check!(mock_file.seek_write_all(&buf, 420));
+    }
+}
+
+#[test]
+#[cfg(windows)]
 fn test_seek_read_buf() {
     use crate::os::windows::fs::FileExt;
 
@@ -696,6 +1061,43 @@ fn test_seek_read_buf() {
         // Seek read past eof
         check!(file.seek_read_buf(buf.clear().unfilled(), 10));
         assert_eq!(buf.filled(), b"");
+    }
+    check!(fs::remove_file(&filename));
+}
+
+#[test]
+#[cfg(windows)]
+fn test_seek_read_buf_exact() {
+    use crate::os::windows::fs::FileExt;
+
+    let tmpdir = tmpdir();
+    let filename = tmpdir.join("file_rt_io_file_test_seek_read_buf_exact.txt");
+    {
+        let oo = OpenOptions::new().create_new(true).write(true).read(true).clone();
+        let mut file = check!(oo.open(&filename));
+        check!(file.write_all(b"0123456789"));
+    }
+    {
+        let mut file = check!(File::open(&filename));
+        let mut buf: [MaybeUninit<u8>; 5] = [MaybeUninit::uninit(); 5];
+        let mut buf = BorrowedBuf::from(buf.as_mut_slice());
+
+        // Exact read
+        check!(file.seek_read_buf_exact(buf.unfilled(), 2));
+        assert_eq!(buf.filled(), b"23456");
+        assert_eq!(check!(file.stream_position()), 7);
+
+        // Already full
+        check!(file.seek_read_buf_exact(buf.unfilled(), 3));
+        assert_eq!(check!(file.stream_position()), 7);
+        check!(file.seek_read_buf_exact(buf.unfilled(), 10)); // No call to seek_read()
+        assert_eq!(buf.filled(), b"23456");
+        assert_eq!(check!(file.stream_position()), 7);
+
+        // Non-empty exact read past eof fails
+        let err = file.seek_read_buf_exact(buf.clear().unfilled(), 6).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
+        assert_eq!(check!(file.stream_position()), 10);
     }
     check!(fs::remove_file(&filename));
 }
@@ -878,6 +1280,10 @@ fn recursive_mkdir_slash() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "l4re",
+    ignore = "Path '.' in the file system root can not be resolved in L4Re"
+)]
 fn recursive_mkdir_dot() {
     check!(fs::create_dir_all(Path::new(".")));
 }
@@ -888,10 +1294,6 @@ fn recursive_mkdir_empty() {
 }
 
 #[test]
-#[cfg_attr(
-    all(windows, target_arch = "aarch64"),
-    ignore = "SymLinks not enabled on Arm64 Windows runners https://github.com/actions/partner-runner-images/issues/94"
-)]
 fn recursive_rmdir() {
     let tmpdir = tmpdir();
     let d1 = tmpdir.join("d1");
@@ -903,7 +1305,9 @@ fn recursive_rmdir() {
     check!(fs::create_dir_all(&d2));
     check!(check!(File::create(&canary)).write(b"foo"));
     check!(junction_point(&d2, &dt.join("d2")));
-    let _ = symlink_file(&canary, &d1.join("canary"));
+    if got_symlink_permission(&tmpdir) {
+        let _ = symlink_file(&canary, &d1.join("canary"));
+    }
     check!(fs::remove_dir_all(&d1));
 
     assert!(!d1.is_dir());
@@ -911,10 +1315,6 @@ fn recursive_rmdir() {
 }
 
 #[test]
-#[cfg_attr(
-    all(windows, target_arch = "aarch64"),
-    ignore = "SymLinks not enabled on Arm64 Windows runners https://github.com/actions/partner-runner-images/issues/94"
-)]
 fn recursive_rmdir_of_symlink() {
     // test we do not recursively delete a symlink but only dirs.
     let tmpdir = tmpdir();
@@ -1330,6 +1730,30 @@ fn fchmod_works() {
     check!(file.set_permissions(p));
 }
 
+#[cfg(not(target_os = "android"))]
+#[test]
+fn fchmodat_works() {
+    let tmpdir = tmpdir();
+    let file = tmpdir.join("in.txt");
+
+    check!(File::create(&file));
+    let attr = check!(fs::metadata(&file));
+    assert!(!attr.permissions().readonly());
+    let mut p = attr.permissions();
+    p.set_readonly(true);
+    check!(fs::set_permissions_nofollow(&file, p.clone()));
+    let attr = check!(fs::metadata(&file));
+    assert!(attr.permissions().readonly());
+
+    match fs::set_permissions_nofollow(&tmpdir.join("foo"), p.clone()) {
+        Ok(..) => panic!("wanted an error"),
+        Err(..) => {}
+    }
+
+    p.set_readonly(false);
+    check!(fs::set_permissions_nofollow(&file, p));
+}
+
 #[test]
 fn sync_doesnt_kill_anything() {
     let tmpdir = tmpdir();
@@ -1399,6 +1823,7 @@ fn open_flavors() {
 
     // This error string is set by std itself so we are not at the whim of the OS here.
     let invalid_options = "creating or truncating a file requires write or append access";
+    let append_truncate_error = "append and truncate cannot both be enabled";
 
     // Test various combinations of creation modes and access modes.
     //
@@ -1436,15 +1861,21 @@ fn open_flavors() {
 
     // append
     check!(c(&a).create_new(true).open(&tmpdir.join("d")));
-    error_contains!(c(&a).create(true).truncate(true).open(&tmpdir.join("d")), invalid_options);
-    error_contains!(c(&a).truncate(true).open(&tmpdir.join("d")), invalid_options);
+    error_contains!(
+        c(&a).create(true).truncate(true).open(&tmpdir.join("d")),
+        append_truncate_error
+    );
+    error_contains!(c(&a).truncate(true).open(&tmpdir.join("d")), append_truncate_error);
     check!(c(&a).create(true).open(&tmpdir.join("d")));
     check!(c(&a).open(&tmpdir.join("d")));
 
     // read-append
     check!(c(&ra).create_new(true).open(&tmpdir.join("e")));
-    error_contains!(c(&ra).create(true).truncate(true).open(&tmpdir.join("e")), invalid_options);
-    error_contains!(c(&ra).truncate(true).open(&tmpdir.join("e")), invalid_options);
+    error_contains!(
+        c(&ra).create(true).truncate(true).open(&tmpdir.join("e")),
+        append_truncate_error
+    );
+    error_contains!(c(&ra).truncate(true).open(&tmpdir.join("e")), append_truncate_error);
     check!(c(&ra).create(true).open(&tmpdir.join("e")));
     check!(c(&ra).open(&tmpdir.join("e")));
 
@@ -1495,6 +1926,14 @@ fn open_flavors() {
         check!(f.write("baz".as_bytes()));
     }
     assert_eq!(check!(fs::metadata(&tmpdir.join("h"))).len(), 9);
+}
+
+#[test]
+#[cfg(windows)]
+fn windows_access_mode_override() {
+    // ensure that using access_mode negates the need for using write or append
+    use crate::os::windows::fs::OpenOptionsExt;
+    File::options().create(true).access_mode(0).open(tmpdir().join("foo.txt")).unwrap();
 }
 
 #[test]
@@ -1691,10 +2130,6 @@ fn file_open_not_found() {
 }
 
 #[test]
-#[cfg_attr(
-    all(windows, target_arch = "aarch64"),
-    ignore = "SymLinks not enabled on Arm64 Windows runners https://github.com/actions/partner-runner-images/issues/94"
-)]
 fn create_dir_all_with_junctions() {
     let tmpdir = tmpdir();
     let target = tmpdir.join("target");
@@ -1721,6 +2156,25 @@ fn create_dir_all_with_junctions() {
     check!(fs::create_dir_all(&d));
     assert!(link.is_dir());
     assert!(d.exists());
+}
+
+#[test]
+#[cfg(windows)]
+fn junction_point_overlong_path() {
+    // Regression test: an `original` path long enough to exceed the inline
+    // reparse buffer used to be copied past the end of the stack array. It must
+    // now be rejected with a clean error instead of overflowing.
+    let tmpdir = tmpdir();
+    let link = tmpdir.join("junction");
+
+    // The `\\?\` prefix bypasses MAX_PATH normalization so the path is copied
+    // through verbatim. 20_000 code units lands in the old overflow window: it
+    // passed the previous `> u16::MAX` byte check yet exceeded the buffer.
+    let mut original = String::from(r"\\?\C:\");
+    original.push_str(&"a".repeat(20_000));
+
+    let err = junction_point(Path::new(&original), &link).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::InvalidInput);
 }
 
 #[test]
@@ -1991,6 +2445,7 @@ fn rename_directory() {
 }
 
 #[test]
+#[cfg_attr(target_os = "l4re", ignore = "futimens")]
 fn test_file_times() {
     #[cfg(target_vendor = "apple")]
     use crate::os::darwin::fs::FileTimesExt;
@@ -2019,7 +2474,8 @@ fn test_file_times() {
                     target_os = "android",
                     target_os = "redox",
                     target_os = "espidf",
-                    target_os = "horizon"
+                    target_os = "horizon",
+                    target_os = "l4re",
                 ))
             )
         )))]
@@ -2210,10 +2666,6 @@ fn test_rename_symlink() {
 
 #[test]
 #[cfg(windows)]
-#[cfg_attr(
-    all(windows, target_arch = "aarch64"),
-    ignore = "SymLinks not enabled on Arm64 Windows runners https://github.com/actions/partner-runner-images/issues/94"
-)]
 fn test_rename_junction() {
     let tmpdir = tmpdir();
     let original = tmpdir.join("original");
@@ -2236,7 +2688,6 @@ fn test_open_options_invalid_combinations() {
         (|| OO::new().create(true).read(true).clone(), "create without write"),
         (|| OO::new().create_new(true).read(true).clone(), "create_new without write"),
         (|| OO::new().truncate(true).read(true).clone(), "truncate without write"),
-        (|| OO::new().truncate(true).append(true).clone(), "truncate with append"),
     ];
 
     for (make_opts, desc) in test_cases {
@@ -2251,7 +2702,13 @@ fn test_open_options_invalid_combinations() {
             "{desc} - wrong error message"
         );
     }
+    let result = OO::new().truncate(true).append(true).open("nonexistent.txt");
 
+    assert!(result.is_err(), "truncate with append should fail");
+
+    let err = result.unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    assert_eq!(err.to_string(), "append and truncate cannot both be enabled");
     let result = OO::new().open("nonexistent.txt");
     assert!(result.is_err(), "no access mode should fail");
     let err = result.unwrap_err();
@@ -2558,10 +3015,23 @@ fn test_dir_read_file() {
 }
 
 #[test]
-fn test_dir_metadata() {
+fn test_dir_clone() {
+    let tmpdir = tmpdir();
+    let mut f = check!(File::create(tmpdir.join("foo.txt")));
+    check!(f.write_all(b"bar"));
+    drop(f);
+
+    let dir = check!(Dir::open(tmpdir.path()));
+    let dir2 = check!(dir.try_clone());
+    let f = check!(dir2.open_file("foo.txt"));
+    drop(f);
+}
+
+#[test]
+fn test_dir_self_metadata() {
     let tmpdir = tmpdir();
     let dir = check!(Dir::open(tmpdir.path()));
-    let metadata = check!(dir.metadata());
+    let metadata = check!(dir.self_metadata());
     assert!(metadata.is_dir());
 }
 
@@ -2603,4 +3073,139 @@ fn test_dir_rename_file() {
     let mut buf = [0u8; 3];
     check!(f.read_exact(&mut buf));
     assert_eq!(b"bar", &buf);
+}
+
+// FIXME: re-enable once QNX fixes TOCTOU bug for fs::remove_dir
+// Note that it may get fixed in QNX 8 in a future libc release
+// ... https://github.com/rust-lang/rust/issues/153781
+#[cfg_attr(any(target_os = "nto", target_os = "qnx"), ignore)]
+#[test]
+fn test_dir_remove_dir() {
+    let tmpdir = tmpdir();
+    check!(fs::create_dir(tmpdir.join("foo")));
+    let dir = check!(Dir::open(tmpdir.path()));
+    check!(dir.remove_dir("foo"));
+    assert!(!matches!(exists(tmpdir.join("foo")), Ok(true)));
+}
+
+#[test]
+fn test_dir_rename_dir() {
+    let tmpdir = tmpdir();
+    check!(fs::create_dir(tmpdir.join("foo")));
+    let dir = check!(Dir::open(tmpdir.path()));
+    check!(dir.rename("foo", &dir, "baz"));
+    let m = check!(tmpdir.join("baz").metadata());
+    assert!(m.is_dir());
+}
+
+#[test]
+fn test_dir_create_dir() {
+    let tmpdir = tmpdir();
+    let dir = check!(Dir::open(tmpdir.path()));
+    check!(dir.create_dir("foo"));
+    check!(Dir::open(tmpdir.join("foo")));
+}
+
+#[test]
+fn test_dir_open_dir() {
+    let tmpdir = tmpdir();
+    let dir1 = check!(Dir::open(tmpdir.path()));
+    check!(dir1.create_dir("foo"));
+    let dir2 = check!(Dir::open(tmpdir.path().join("foo")));
+    let mut f =
+        check!(dir2.open_file_with("bar.txt", &OpenOptions::new().create(true).write(true)));
+    check!(f.write(b"baz"));
+    check!(f.flush());
+    drop(f);
+    let dir3 = check!(dir1.open_dir("foo"));
+    let mut f = check!(dir3.open_file("bar.txt"));
+    let mut buf = [0u8; 3];
+    check!(f.read_exact(&mut buf));
+    assert_eq!(b"baz", &buf);
+}
+
+#[test]
+fn test_dir_metadata() {
+    let tmpdir = tmpdir();
+    let dir = check!(Dir::open(tmpdir.path()));
+    check!(dir.create_dir("subdir"));
+    // FIXME: `/` does not work as path separator on Windows.
+    let barpath = PathBuf::from("subdir").join("bar.txt");
+    drop(check!(dir.open_file_with(&barpath, &OpenOptions::new().create(true).write(true))));
+    check!(symlink_file(&tmpdir.join("subdir/bar.txt"), &tmpdir.join("link")));
+
+    let metadata = check!(dir.metadata(&barpath));
+    assert!(metadata.is_file());
+    let metadata = check!(dir.metadata("subdir"));
+    assert!(metadata.is_dir());
+    dir.metadata("does-not-exist").unwrap_err();
+
+    let metadata = check!(dir.metadata("link"));
+    assert!(metadata.is_file());
+    assert!(!metadata.is_symlink());
+    let metadata = check!(dir.symlink_metadata("link"));
+    assert!(!metadata.is_file());
+    assert!(metadata.is_symlink());
+}
+
+fn root_test_dir(what: &str) -> PathBuf {
+    crate::env::current_dir().unwrap().ancestors().last().unwrap().join(what)
+}
+
+#[test]
+fn test_home_dirs_field_hookup_matches() {
+    let mut dirs = HomeDirs::empty();
+
+    assert_eq!(dirs.config_home(), None);
+    assert_eq!(dirs.data_home(), None);
+    assert_eq!(dirs.state_home(), None);
+    assert_eq!(dirs.cache_home(), None);
+
+    let config = root_test_dir("config");
+    let data = root_test_dir("data");
+    let state = root_test_dir("state");
+    let cache = root_test_dir("cache");
+
+    dirs.set_config_home(config.clone());
+    dirs.set_data_home(data.clone());
+    dirs.set_state_home(state.clone());
+    dirs.set_cache_home(cache.clone());
+
+    assert_eq!(dirs.config_home(), Some(config.as_ref()));
+    assert_eq!(dirs.data_home(), Some(data.as_ref()));
+    assert_eq!(dirs.state_home(), Some(state.as_ref()));
+    assert_eq!(dirs.cache_home(), Some(cache.as_ref()));
+}
+
+#[test]
+fn test_media_dirs_field_hookup_matches() {
+    let mut dirs = MediaDirs::empty();
+
+    assert_eq!(dirs.desktop(), None);
+    assert_eq!(dirs.documents(), None);
+    assert_eq!(dirs.downloads(), None);
+    assert_eq!(dirs.music(), None);
+    assert_eq!(dirs.pictures(), None);
+    assert_eq!(dirs.videos(), None);
+
+    let desktop = root_test_dir("desktop");
+    let documents = root_test_dir("documents");
+    let downloads = root_test_dir("downloads");
+    let music = root_test_dir("music");
+    let pictures = root_test_dir("pictures");
+    let videos = root_test_dir("videos");
+
+    dirs.set_desktop(desktop.clone());
+    dirs.set_documents(documents.clone());
+    dirs.set_downloads(downloads.clone());
+    dirs.set_music(music.clone());
+    dirs.set_pictures(pictures.clone());
+    dirs.set_videos(videos.clone());
+
+    assert_eq!(dirs.desktop(), Some(desktop.as_ref()));
+    assert_eq!(dirs.documents(), Some(documents.as_ref()));
+    assert_eq!(dirs.downloads(), Some(downloads.as_ref()));
+    assert_eq!(dirs.music(), Some(music.as_ref()));
+    assert_eq!(dirs.pictures(), Some(pictures.as_ref()));
+    assert_eq!(dirs.videos(), Some(videos.as_ref()));
 }

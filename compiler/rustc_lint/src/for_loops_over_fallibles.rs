@@ -1,13 +1,14 @@
 use hir::{Expr, Pat};
-use rustc_hir::{self as hir, LangItem};
+use rustc_attr_ir::lang_items::LangItem;
+use rustc_hir as hir;
 use rustc_infer::infer::TyCtxtInferExt;
 use rustc_infer::traits::ObligationCause;
+use rustc_lint_defs::{declare_lint, declare_lint_pass};
 use rustc_middle::ty;
-use rustc_session::{declare_lint, declare_lint_pass};
 use rustc_span::{Span, sym};
 use rustc_trait_selection::traits::ObligationCtxt;
 
-use crate::lints::{
+use crate::diagnostics::{
     ForLoopsOverFalliblesDiag, ForLoopsOverFalliblesLoopSub, ForLoopsOverFalliblesQuestionMark,
     ForLoopsOverFalliblesSuggestion,
 };
@@ -164,7 +165,7 @@ fn suggest_question_mark<'tcx>(
     // Check that the function/closure/constant we are in has a `Result` type.
     // Otherwise suggesting using `?` may not be a good idea.
     {
-        let ty = cx.typeck_results().expr_ty(cx.tcx.hir_body(body_id).value);
+        let ty = cx.typeck_results().expr_ty(&cx.tcx.hir_body(body_id).value);
         let ty::Adt(ret_adt, ..) = ty.kind() else { return false };
         if !cx.tcx.is_diagnostic_item(sym::Result, ret_adt.did()) {
             return false;
@@ -187,5 +188,5 @@ fn suggest_question_mark<'tcx>(
         into_iterator_did,
     );
 
-    ocx.evaluate_obligations_error_on_ambiguity().is_empty()
+    ocx.evaluate_obligations_error_on_ambiguity().no_errors()
 }

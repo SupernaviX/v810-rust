@@ -41,6 +41,11 @@ const GATED_CFGS: &[GatedCfg] = &[
         Features::cfg_target_has_reliable_f16_f128,
     ),
     (
+        sym::target_has_reliable_f16b,
+        sym::cfg_target_has_reliable_f16b,
+        Features::cfg_target_has_reliable_f16b,
+    ),
+    (
         sym::target_has_reliable_f128,
         sym::cfg_target_has_reliable_f16_f128,
         Features::cfg_target_has_reliable_f16_f128,
@@ -54,20 +59,19 @@ const GATED_CFGS: &[GatedCfg] = &[
     (sym::target_object_format, sym::cfg_target_object_format, Features::cfg_target_object_format),
 ];
 
-/// Find a gated cfg determined by the `pred`icate which is given the cfg's name.
-pub fn find_gated_cfg(pred: impl Fn(Symbol) -> bool) -> Option<&'static GatedCfg> {
-    GATED_CFGS.iter().find(|(cfg_sym, ..)| pred(*cfg_sym))
+/// Find a gated cfg matching `name`.
+pub fn find_gated_cfg(name: Symbol) -> Option<&'static GatedCfg> {
+    GATED_CFGS.iter().find(|(cfg_sym, ..)| name == *cfg_sym)
 }
 
 #[derive(Clone, Debug, Copy)]
 pub enum AttributeStability {
-    /// An attribute that is unstable behind a specified feature fagte
+    /// An attribute that is unstable behind a specified feature gate.
     Unstable {
         /// The feature gate, for example `rustc_attrs` for rustc_* attributes.
         gate_name: Symbol,
-        /// Check function to be called during the `PostExpansionVisitor` pass, which will be one of the `Features::*` functions
-        gate_check: fn(&Features) -> bool,
-        /// Notes to be displayed when an attempt is made to use the attribute without its feature gate.
+        /// Notes to be displayed when an attempt is made to use the attribute without its feature
+        /// gate.
         notes: &'static [&'static str],
     },
     /// A stable attribute, can be used on all release channels
@@ -157,6 +161,7 @@ pub static BUILTIN_ATTRIBUTES: &[Symbol] = &[
     sym::force_target_feature,
     sym::sanitize,
     sym::coverage,
+    sym::optimize,
 
     sym::doc,
 
@@ -180,11 +185,11 @@ pub static BUILTIN_ATTRIBUTES: &[Symbol] = &[
     sym::marker,
     sym::thread_local,
     sym::no_core,
-    // RFC 2412
-    sym::optimize,
 
     sym::ffi_pure,
     sym::ffi_const,
+    sym::register_attribute_tool,
+    sym::register_lint_tool,
     sym::register_tool,
     // `#[cfi_encoding = ""]`
     sym::cfi_encoding,
@@ -209,16 +214,18 @@ pub static BUILTIN_ATTRIBUTES: &[Symbol] = &[
     // - https://github.com/rust-lang/rust/issues/130494
     sym::pin_v2,
 
-    // The `#[splat]` attribute is part of the `splat` experiment
+    // The `#[rustc_splat]` attribute is part of the `splat` experiment
     // that improves the ergonomics of function overloading, tracked in:
     //
     // - https://github.com/rust-lang/rust/issues/153629
-    sym::splat,
+    sym::rustc_splat,
 
-    // The `#[unroll]` attribute.
+    // The `#[rustc_unroll]` attribute.
     //
     // - https://github.com/rust-lang/rust/pull/156816
-    sym::unroll,
+    //
+    // FIXME(#159429): temporarily renamed to mitigate `#[unroll]` nameres ambiguity
+    sym::rustc_unroll,
 
     // `#[instrument_fn = "on|off"]` to insert or inhibit instrumentation function
     // calls inside a function, usually around the prologue.
@@ -259,8 +266,6 @@ pub static BUILTIN_ATTRIBUTES: &[Symbol] = &[
 
     sym::fundamental,
     sym::may_dangle,
-
-    sym::rustc_never_type_options,
 
     // ==========================================================================
     // Internal attributes: Runtime related:
@@ -327,6 +332,7 @@ pub static BUILTIN_ATTRIBUTES: &[Symbol] = &[
     // Internal attributes, Const related:
     // ==========================================================================
 
+    sym::rustc_always_gca,
     sym::rustc_promotable,
     sym::rustc_legacy_const_generics,
     // Do not const-check this function's body. It will always get replaced during CTFE via `hook_special_const_fn`.
@@ -360,15 +366,15 @@ pub static BUILTIN_ATTRIBUTES: &[Symbol] = &[
     sym::rustc_dyn_incompatible_trait,
     sym::rustc_has_incoherent_inherent_impls,
     sym::rustc_non_const_trait_method,
+    sym::rustc_panics_when_zero,
 
+    sym::rustc_canonical_symbol,
     sym::rustc_diagnostic_item,
     sym::prelude_import,
     sym::rustc_paren_sugar,
     sym::rustc_inherit_overflow_checks,
-    sym::rustc_reservation_impl,
-    sym::rustc_test_entrypoint_marker,
     sym::rustc_test_marker,
-    sym::rustc_unsafe_specialization_marker,
+    sym::rustc_allow_lifetime_dependent_specialization,
     sym::rustc_specialization_trait,
     sym::rustc_main,
     sym::rustc_skip_during_method_dispatch,
@@ -412,7 +418,7 @@ pub static BUILTIN_ATTRIBUTES: &[Symbol] = &[
     sym::rustc_mir,
     sym::custom_mir,
     sym::rustc_dump_item_bounds,
-    sym::rustc_dump_predicates,
+    sym::rustc_dump_clauses,
     sym::rustc_dump_def_parents,
     sym::rustc_dump_object_lifetime_defaults,
     sym::rustc_dump_vtable,
@@ -421,15 +427,15 @@ pub static BUILTIN_ATTRIBUTES: &[Symbol] = &[
 ];
 
 pub fn is_builtin_attr_name(name: Symbol) -> bool {
-    BUILTIN_ATTRIBUTE_MAP.get(&name).is_some()
+    BUILTIN_ATTRIBUTE_SET.contains(&name)
 }
 
-pub static BUILTIN_ATTRIBUTE_MAP: LazyLock<FxHashSet<Symbol>> = LazyLock::new(|| {
-    let mut map = FxHashSet::default();
+pub static BUILTIN_ATTRIBUTE_SET: LazyLock<FxHashSet<Symbol>> = LazyLock::new(|| {
+    let mut set = FxHashSet::default();
     for attr in BUILTIN_ATTRIBUTES.iter() {
-        if !map.insert(*attr) {
+        if !set.insert(*attr) {
             panic!("duplicate builtin attribute `{}`", attr);
         }
     }
-    map
+    set
 });

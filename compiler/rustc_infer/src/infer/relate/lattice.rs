@@ -22,10 +22,9 @@ use rustc_middle::traits::solve::Goal;
 use rustc_middle::ty::relate::combine::{combine_ty_args, super_combine_consts, super_combine_tys};
 use rustc_middle::ty::relate::{Relate, RelateResult, TypeRelation};
 use rustc_middle::ty::{self, Ty, TyCtxt, TyVar, TypeVisitableExt};
-use rustc_span::Span;
+use rustc_span::{Span, span_bug};
 use tracing::{debug, instrument};
 
-use super::StructurallyRelateAliases;
 use super::combine::PredicateEmittingRelation;
 use crate::infer::{DefineOpaqueTypes, InferCtxt, SubregionOrigin, TypeTrace};
 use crate::traits::{Obligation, PredicateObligations};
@@ -160,6 +159,19 @@ impl<'tcx> TypeRelation<TyCtxt<'tcx>> for LatticeOp<'_, 'tcx> {
                 Ok(v)
             }
 
+            (&ty::Alias(ty::IsRigid::No, _), _) | (_, &ty::Alias(ty::IsRigid::No, _))
+                if infcx.next_trait_solver() =>
+            {
+                // NOTE(khyperia): If this turns out to be possible, either the caller should
+                // normalize the alias, or we should normalize the alias here. See the PR that
+                // introduced this comment for how to do so, which normalizes aliases in other
+                // relations.
+                span_bug!(
+                    self.span(),
+                    "it should not be possible to encounter unnormalized aliases in lattice relation"
+                );
+            }
+
             (
                 &ty::Alias(_, ty::AliasTy { kind: ty::Opaque { def_id: a_def_id }, .. }),
                 &ty::Alias(_, ty::AliasTy { kind: ty::Opaque { def_id: b_def_id }, .. }),
@@ -263,10 +275,6 @@ impl<'tcx> PredicateEmittingRelation<InferCtxt<'tcx>> for LatticeOp<'_, 'tcx> {
         self.trace.span()
     }
 
-    fn structurally_relate_aliases(&self) -> StructurallyRelateAliases {
-        StructurallyRelateAliases::No
-    }
-
     fn param_env(&self) -> ty::ParamEnv<'tcx> {
         self.param_env
     }
@@ -289,10 +297,5 @@ impl<'tcx> PredicateEmittingRelation<InferCtxt<'tcx>> for LatticeOp<'_, 'tcx> {
                 goal.predicate,
             )
         }))
-    }
-
-    fn ambient_variance(&self) -> ty::Variance {
-        // FIXME(deferred_projection_equality): This isn't right, I think?
-        ty::Variance::Invariant
     }
 }

@@ -7,8 +7,10 @@
 //@check-pass
 
 #![allow(incomplete_features)]
-#![feature(adt_const_params,
-    min_generic_const_args,
+#![feature(
+    adt_const_params,
+    gca_min_const_items,
+    gca_macroless_args,
     generic_const_parameter_types,
     unsized_const_params
 )]

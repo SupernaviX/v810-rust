@@ -16,6 +16,8 @@ pub use unsupported_fs::{
     symlink, unlink,
 };
 
+pub use crate::sys::fs::common::{ExtraHomeDirs, ExtraMediaDirs};
+
 /// VEXos file descriptor.
 ///
 /// This stores an opaque pointer to a [FatFs file object structure] managed by VEXos
@@ -489,6 +491,10 @@ pub fn readdir(_p: &Path) -> io::Result<ReadDir> {
 }
 
 pub fn set_perm(_p: &Path, _perm: FilePermissions) -> io::Result<()> {
+    unsupported()
+}
+
+pub fn set_perm_nofollow(_p: &Path, _perm: FilePermissions) -> io::Result<()> {
     unsupported()
 }
 

@@ -19,9 +19,8 @@ tools = [
     "rust-analyzer",
     "rust-analyzer-proc-macro-srv",
     "analysis",
-    "src"
+    "rust-src"
 ]
-compiletest-use-stage0-libtest = false
 
 [install]
 prefix = "/home/simon/rust-v810"

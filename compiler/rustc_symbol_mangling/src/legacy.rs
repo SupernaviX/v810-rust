@@ -5,12 +5,13 @@ use rustc_data_structures::stable_hash::{StableHash, StableHasher};
 use rustc_hashes::Hash64;
 use rustc_hir::def_id::{CrateNum, DefId};
 use rustc_hir::definitions::{DefPathData, DisambiguatedDefPathData};
-use rustc_middle::bug;
+use rustc_middle::ty::consts::ConstExt;
 use rustc_middle::ty::print::{PrettyPrinter, Print, PrintError, Printer};
 use rustc_middle::ty::{
     self, GenericArg, GenericArgKind, Instance, ReifyReason, Ty, TyCtxt, TypeVisitableExt,
     Unnormalized,
 };
+use rustc_span::bug;
 use tracing::debug;
 
 pub(super) fn mangle<'tcx>(
@@ -35,6 +36,11 @@ pub(super) fn mangle<'tcx>(
             | DefPathData::SyntheticCoroutineBody => {
                 instance_ty = tcx.type_of(ty_def_id).instantiate_identity().skip_norm_wip();
                 debug!(?instance_ty);
+                break;
+            }
+            DefPathData::GlobalAsm => {
+                // `global_asm!` doesn't have a type.
+                instance_ty = tcx.types.unit;
                 break;
             }
             _ => {

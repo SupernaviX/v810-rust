@@ -1,13 +1,13 @@
 use rustc_ast::SyntheticAttr;
 use rustc_ast::attr::data_structures::CfgEntry;
-use rustc_hir::Attribute;
-use rustc_hir::attrs::AttributeKind;
+use rustc_attr_ir::{Attribute, AttributeKind};
 use rustc_span::Span;
 use thin_vec::ThinVec;
 
-/// This struct contains the state necessary to convert synthetic attributes to hir attributes
+/// Contains the state necessary to convert synthetic attributes to parsed attributes.
+///
 /// The only conversion that really happens here is that multiple synthetic attributes are
-/// merged into a single hir attribute, representing their combined state.
+/// merged into a single `rustc_attr_ir::attribute`, representing their combined state.
 /// FIXME: We should make this a nice and extendable system if this is going to be used more often
 #[derive(Default)]
 pub(crate) struct SyntheticAttrState {
@@ -15,9 +15,7 @@ pub(crate) struct SyntheticAttrState {
     cfg_trace: ThinVec<(CfgEntry, Span)>,
 
     /// Attribute state for `SyntheticAttr::CfgAttrTrace` attributes.
-    /// The arguments of these attributes is no longer relevant for any later passes, only their
-    /// presence. So we discard the arguments here.
-    cfg_attr_trace: bool,
+    cfg_attr_trace: ThinVec<(CfgEntry, Span)>,
 }
 
 impl SyntheticAttrState {
@@ -33,8 +31,10 @@ impl SyntheticAttrState {
                 cfg.lower_spans(lower_span);
                 self.cfg_trace.push((cfg, attr_span));
             }
-            SyntheticAttr::CfgAttrTrace => {
-                self.cfg_attr_trace = true;
+            SyntheticAttr::CfgAttrTrace(cfg) => {
+                let mut cfg = cfg.clone();
+                cfg.lower_spans(lower_span);
+                self.cfg_attr_trace.push((cfg, attr_span));
             }
         }
     }
@@ -43,8 +43,8 @@ impl SyntheticAttrState {
         if !self.cfg_trace.is_empty() {
             attributes.push(Attribute::Parsed(AttributeKind::CfgTrace(self.cfg_trace)));
         }
-        if self.cfg_attr_trace {
-            attributes.push(Attribute::Parsed(AttributeKind::CfgAttrTrace));
+        if !self.cfg_attr_trace.is_empty() {
+            attributes.push(Attribute::Parsed(AttributeKind::CfgAttrTrace(self.cfg_attr_trace)));
         }
     }
 }

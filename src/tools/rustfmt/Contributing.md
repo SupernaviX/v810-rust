@@ -9,6 +9,35 @@ or file new issues specifically to get help.
 All contributors are expected to follow our [Code of
 Conduct](CODE_OF_CONDUCT.md).
 
+
+## LLM policy
+
+rustfmt follows the same [LLM usage policy] as `rust-lang/rust`. Please read it before using LLM
+assistance when participating in `rust-lang/rustfmt`.
+
+[LLM usage policy]: https://forge.rust-lang.org/policies/llm-usage.html
+
+## Linting
+
+This project supports linting via
+[`clippy`](https://doc.rust-lang.org/stable/clippy/index.html). You can either
+run it directly, or use an integration through your editor.
+
+```
+# lint rustfmt-nightly (the package at the root of this repo)
+cargo clippy
+```
+
+To Lint a package outside of the root one you will need to do one of:
+
+```
+# pass the manifest path
+cargo clippy --manifest-path ./config_proc_macro/Config.toml
+# or run the command from within the package
+cd ./config_proc_macro
+cargo clippy
+```
+
 ## Test and file issues
 
 It would be really useful to have people use rustfmt on their projects and file
@@ -20,10 +49,17 @@ issues where it does something you don't expect.
 Having a strong test suite for a tool like this is essential. It is very easy
 to create regressions. Any tests you can add are very much appreciated.
 
-The tests can be run with `cargo test`. This does a number of things:
+The tests can be run with `cargo test --locked`. This does a number of things:
 * runs the unit tests for a number of internal functions;
 * makes sure that rustfmt run on every file in `./tests/source/` is equal to its
-  associated file in `./tests/target/`;
+  associated file in `./tests/target/`; this catches
+  * unexpected formatting differences from changes to rustfmt
+  * non-idempotency in formatting even when the file copy in `target/` is
+    already in the canonical expected format. That is, if `source_start` is
+    the starting formatting and `source_canonical` is the expected canonical
+    formatting, catch cases where there is a converging sequence
+    `source_start -> source_1 -> ... -> source_canonical` that takes multiple
+    rustfmt runs.
 * runs idempotence tests on the files in `./tests/target/`. These files should
   not be changed by rustfmt;
 * checks that rustfmt's code is not changed by running on itself. This ensures
@@ -55,6 +91,11 @@ file in the `./tests/config/` directory, so a test source file named `test-inden
 would need a configuration file named `test-indent.toml` in that directory. As an
 example, the `issue-1111.rs` test file is configured by the file
 `./tests/config/issue-1111.toml`.
+
+### Updating snapshots
+
+Some tests that test rustfmt-specific output (e.g. `--help` output and formatting-specific errors) use [insta](https://insta.rs/) to snapshot their output.
+To update these tests, install [`cargo-insta`](https://insta.rs/docs/cli/) and run `cargo insta test --review`.
 
 ## Debugging
 
@@ -107,6 +148,46 @@ If you want to test modified `cargo-fmt`, or run `rustfmt` on the whole project 
 
 ```
 RUSTFMT="./target/debug/rustfmt" cargo run --bin cargo-fmt -- --manifest-path path/to/project/you/want2test/Cargo.toml
+```
+
+#### Running a binary directly
+
+You may want to run one of the built binaries directly, for example to connect
+it to a debugger. Since `rustfmt` uses `rustc_driver` it needs to be linked
+against the version of that library for the current toolchain, without
+configuring anything you are likely to run into errors like:
+
+```
+./target/debug/rustfmt: error while loading shared libraries: librustc_driver-63b8deb6c23747dd.so: cannot open shared object file: No such file or directory
+```
+
+This library will be in the sysroot of the current toolchain, which will be
+printed by `rustc --print sysroot`, so we'll need to include that in the
+system's dynamic library search path. On GNU/Linux this can be done by setting
+the `LD_LIBRARY_PATH` variable, e.g. using Bash:
+
+```
+LD_LIBRARY_PATH="$(rustc --print sysroot)/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" ./target/debug/rustfmt
+```
+
+On MacOS there is the `DYLD_LIBRARY_PATH` variable, e.g. using Bash:
+
+```
+DYLD_LIBRARY_PATH="$(rustc --print sysroot)/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" ./target/debug/rustfmt
+```
+
+And under Windows the `PATH` environment variable, e.g. using Bash:
+
+```
+PATH="$(rustc --print sysroot)/bin${PATH:+:${PATH}}"
+```
+
+Continuing the GNU/Linux example, you can invoke a debugger, e.g. `rust-gdb`,
+like:
+
+```
+LD_LIBRARY_PATH="$(rustc --print sysroot)/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" rust-gdb --args ./target/debug/rustfmt --check some_file.rs
+
 ```
 
 ### Gate formatting changes
