@@ -1921,6 +1921,39 @@ impl Subdiagnostic for AddPreciseCapturingAndParams {
     }
 }
 
+pub(crate) struct AddPreciseCapturingNameLifetimesAndParams {
+    pub suggs: Vec<(Span, String)>,
+    pub apit_spans: Vec<Span>,
+}
+
+impl Subdiagnostic for AddPreciseCapturingNameLifetimesAndParams {
+    fn add_to_diag(self, diag: &mut Diag<'_>) {
+        diag.multipart_suggestion(
+            msg!("add a `use<...>` bound and name the elided lifetimes after turning all argument-position `impl Trait` into type parameters, noting that this possibly affects the API of this crate"),
+            self.suggs,
+            Applicability::MaybeIncorrect,
+        );
+        diag.span_note(
+            self.apit_spans,
+            msg!("argument-position `impl Trait` cannot be named in a `use<...>` bound and must be turned into type parameters"),
+        );
+    }
+}
+
+pub(crate) struct AddPreciseCapturingAndNameLifetimes {
+    pub suggs: Vec<(Span, String)>,
+}
+
+impl Subdiagnostic for AddPreciseCapturingAndNameLifetimes {
+    fn add_to_diag(self, diag: &mut Diag<'_>) {
+        diag.multipart_suggestion(
+            msg!("add `use<...>` bound and name the elided lifetimes to explicitly capture them"),
+            self.suggs,
+            Applicability::MachineApplicable,
+        );
+    }
+}
+
 /// Given a set of captured `DefId` for an RPIT (opaque_def_id) and a given
 /// function (fn_def_id), try to suggest adding `+ use<...>` to capture just
 /// the specified parameters. If one of those parameters is an APIT, then try

@@ -1,13 +1,12 @@
 use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::res::{MaybeDef as _, MaybeTypeckRes as _};
 use clippy_utils::source::snippet_with_applicability;
-use clippy_utils::std_or_core;
 use clippy_utils::sugg::Sugg;
 use clippy_utils::ty::{implements_trait, is_copy, peel_n_ty_refs};
 use rustc_data_structures::fx::FxHashMap;
 use rustc_errors::Applicability;
 use rustc_hir::{Closure, Expr, ExprKind, Mutability, Param, Pat, PatKind, Path, PathSegment, QPath};
-use rustc_lint::LateContext;
+use rustc_lint::{LateContext, std_or_core};
 use rustc_middle::ty::{self, GenericArgKind, Ty};
 use rustc_span::symbol::Ident;
 use rustc_span::{Span, sym};
@@ -256,7 +255,7 @@ fn detect_lint(cx: &LateContext<'_>, expr: &Expr<'_>, arg: &Expr<'_>) -> Option<
         && let ExprKind::MethodCall(method_path, left_expr, [right_expr], _) = closure_body.value.kind
         && method_path.ident.name == sym::cmp
         && let Some(ord_trait) = cx.tcx.get_diagnostic_item(sym::Ord)
-        && cx.ty_based_def(&closure_body.value).opt_parent(cx).opt_def_id() == Some(ord_trait)
+        && cx.ty_based_def(closure_body.value).opt_parent(cx).opt_def_id() == Some(ord_trait)
     {
         let (closure_body, closure_arg, reverse) =
             if mirrored_exprs(left_expr, right_expr, &binding_map, BindingSource::Left) {

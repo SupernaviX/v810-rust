@@ -26,10 +26,10 @@ use rustc_middle::mir::{
 };
 use rustc_middle::ty::print::PrintTraitRefExt as _;
 use rustc_middle::ty::{
-    self, PredicateKind, Ty, TyCtxt, TypeSuperVisitable, TypeVisitor, Upcast,
+    self, CallerBoundsIterator, PredicateKind, Ty, TyCtxt, TypeSuperVisitable, TypeVisitor, Upcast,
     suggest_constraining_type_params,
 };
-use rustc_mir_dataflow::move_paths::{Init, InitKind, InitLocation, MoveOutIndex, MovePathIndex};
+use rustc_mir_dataflow::move_paths::{Init, InitLocation, MoveOutIndex, MovePathIndex};
 use rustc_span::def_id::{DefId, LocalDefId};
 use rustc_span::hygiene::DesugaringKind;
 use rustc_span::{BytePos, ExpnKind, Ident, MacroKind, Span, Symbol, bug, kw, sym};
@@ -285,7 +285,7 @@ impl<'diag, 'tcx> MirBorrowckCtxt<'_, 'diag, 'tcx> {
             let place = &self.move_data.move_paths[mpi].place;
             let ty = place.ty(self.body, self.infcx.tcx).ty;
 
-            if self.infcx.param_env.caller_bounds().any(|c| {
+            if self.infcx.param_env.caller_bounds().all_clauses(self.infcx.tcx).iter().any(|c| {
                 c.as_trait_clause().is_some_and(|pred| {
                     pred.skip_binder().self_ty() == ty && self.infcx.tcx.is_fn_trait(pred.def_id())
                 })
@@ -408,7 +408,7 @@ impl<'diag, 'tcx> MirBorrowckCtxt<'_, 'diag, 'tcx> {
         }
         let tcx = self.infcx.tcx;
         if let Some(body) = tcx.hir_maybe_body_owned_by(self.mir_def_id()) {
-            let expr = &body.value;
+            let expr = body.value;
             let place = &self.move_data.move_paths[mpi].place;
             let span = place.as_local().map(|local| self.body.local_decls[local].source_info.span);
             let mut finder = ExpressionFinder {
@@ -1295,7 +1295,7 @@ impl<'diag, 'tcx> MirBorrowckCtxt<'_, 'diag, 'tcx> {
             // In practice unless there are more than one field with the same type, we'll be
             // suggesting a single field at a type, because we don't aggregate multiple borrow
             // checker errors involving the functional record update syntax into a single one.
-            let field_ty = field.ty(self.infcx.tcx, args).skip_norm_wip();
+            let field_ty = field.ty(self.infcx.tcx, *args).skip_norm_wip();
             let ident = field.ident(self.infcx.tcx);
             if field_ty == ty && fields.iter().all(|field| field.ident.name != ident.name) {
                 // Suggest adding field and cloning it.
@@ -1371,7 +1371,7 @@ impl<'diag, 'tcx> MirBorrowckCtxt<'_, 'diag, 'tcx> {
             && let Some(local_did) = def.did().as_local()
             && def.variants().iter().all(|variant| {
                 variant.fields.iter().all(|field| {
-                    self.implements_clone(field.ty(self.infcx.tcx, args).skip_norm_wip())
+                    self.implements_clone(field.ty(self.infcx.tcx, *args).skip_norm_wip())
                 })
             })
         {
@@ -2134,7 +2134,7 @@ impl<'diag, 'tcx> MirBorrowckCtxt<'_, 'diag, 'tcx> {
 
         let mut expr_finder = FindUselessClone::new(tcx, self.mir_def_id());
 
-        let body = &tcx.hir_body(body_id).value;
+        let body = tcx.hir_body(body_id).value;
         expr_finder.visit_expr(body);
 
         struct Holds<'tcx> {
@@ -2323,7 +2323,7 @@ impl<'diag, 'tcx> MirBorrowckCtxt<'_, 'diag, 'tcx> {
         let tcx = self.infcx.tcx;
         let body_id = tcx.hir_node(self.mir_hir_id()).body_id()?;
         let mut expr_finder = FindExprBySpan::new(span, tcx);
-        expr_finder.visit_expr(&tcx.hir_body(body_id).value);
+        expr_finder.visit_expr(tcx.hir_body(body_id).value);
         expr_finder.result
     }
 
@@ -2554,7 +2554,7 @@ impl<'diag, 'tcx> MirBorrowckCtxt<'_, 'diag, 'tcx> {
             }
         }
         let mut finder = ExprFinder { tcx, expr_span: span, issue_span, .. };
-        finder.visit_expr(&tcx.hir_body(body_id).value);
+        finder.visit_expr(tcx.hir_body(body_id).value);
 
         if let Some(body_expr) = finder.body_expr
             && let Some(loop_span) = finder.loop_span
@@ -2705,7 +2705,7 @@ impl<'diag, 'tcx> MirBorrowckCtxt<'_, 'diag, 'tcx> {
         // Get the body the error happens in
         let Some(body_id) = tcx.hir_node(self.mir_hir_id()).body_id() else { return };
 
-        let body_expr = &tcx.hir_body(body_id).value;
+        let body_expr = tcx.hir_body(body_id).value;
 
         struct ClosureFinder<'hir> {
             tcx: TyCtxt<'hir>,
@@ -2809,7 +2809,7 @@ impl<'diag, 'tcx> MirBorrowckCtxt<'_, 'diag, 'tcx> {
             }
 
             let mut finder = VariableUseFinder { local_id, spans: Vec::new() };
-            finder.visit_expr(&tcx.hir_body(closure.body).value);
+            finder.visit_expr(tcx.hir_body(closure.body).value);
 
             spans = finder.spans;
         } else {
@@ -3843,8 +3843,11 @@ impl<'diag, 'tcx> MirBorrowckCtxt<'_, 'diag, 'tcx> {
             location: Location,
         ) -> impl Iterator<Item = Location> {
             if location.statement_index == 0 {
-                let predecessors = body.basic_blocks.predecessors()[location.block].to_vec();
-                Either::Left(predecessors.into_iter().map(move |bb| body.terminator_loc(bb)))
+                Either::Left(
+                    body.basic_blocks.predecessors()[location.block]
+                        .iter()
+                        .map(|&bb| body.terminator_loc(bb)),
+                )
             } else {
                 Either::Right(std::iter::once(Location {
                     statement_index: location.statement_index - 1,
@@ -3943,25 +3946,12 @@ impl<'diag, 'tcx> MirBorrowckCtxt<'_, 'diag, 'tcx> {
             }
 
             // check for inits
-            let mut any_match = false;
             for ii in &self.move_data.init_loc_map[location] {
                 let init = self.move_data.inits[*ii];
-                match init.kind {
-                    InitKind::Deep | InitKind::NonPanicPathOnly => {
-                        if mpis.contains(&init.path) {
-                            any_match = true;
-                        }
-                    }
-                    InitKind::Shallow => {
-                        if mpi == init.path {
-                            any_match = true;
-                        }
-                    }
+                if mpis.contains(&init.path) {
+                    reinits.push(location);
+                    return true;
                 }
-            }
-            if any_match {
-                reinits.push(location);
-                return true;
             }
             false
         };
@@ -4747,7 +4737,7 @@ fn find_for_loop_span<'hir>(
         }
     }
     let mut finder = ExprFinder { tcx, issue_span, result: None };
-    finder.visit_expr(&tcx.hir_body(body_id).value);
+    finder.visit_expr(tcx.hir_body(body_id).value);
     finder.result
 }
 

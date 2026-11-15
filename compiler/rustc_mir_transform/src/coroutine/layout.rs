@@ -34,7 +34,6 @@ use rustc_index::{Idx, IndexVec};
 use rustc_infer::traits::TraitErrors;
 use rustc_lint_defs::builtin::MUST_NOT_SUSPEND;
 use rustc_middle::mir::*;
-use rustc_middle::ty::consts::ConstExt;
 use rustc_middle::ty::{self, CoroutineArgs, CoroutineArgsExt, Ty, TyCtxt, TypingMode};
 use rustc_mir_dataflow::impls::{
     MaybeBorrowedLocals, MaybeLiveLocals, MaybeRequiresStorage, MaybeStorageLive,
@@ -48,7 +47,7 @@ use rustc_trait_selection::infer::TyCtxtInferExt as _;
 use rustc_trait_selection::traits::{ObligationCause, ObligationCauseCode, ObligationCtxt};
 use tracing::{debug, instrument};
 
-use crate::diagnostics::{MustNotSupend, MustNotSuspendReason};
+use crate::diagnostics::{MustNotSuspend, MustNotSuspendReason};
 
 const SELF_ARG: Local = Local::arg(0);
 
@@ -701,13 +700,13 @@ fn check_must_not_suspend_def(
     hir_id: hir::HirId,
     data: SuspendCheckData<'_>,
 ) -> bool {
-    if let Some(reason_str) = find_attr!(tcx, def_id, MustNotSupend {reason} => reason) {
+    if let Some(reason_str) = find_attr!(tcx, def_id, MustNotSuspend {reason} => reason) {
         let reason = reason_str.map(|s| MustNotSuspendReason { span: data.source_span, reason: s });
         tcx.emit_node_span_lint(
             MUST_NOT_SUSPEND,
             hir_id,
             data.source_span,
-            MustNotSupend {
+            MustNotSuspend {
                 tcx,
                 yield_sp: data.yield_span,
                 reason,

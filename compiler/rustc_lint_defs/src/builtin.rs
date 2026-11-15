@@ -83,6 +83,7 @@ pub mod hardwired {
             NEVER_TYPE_FALLBACK_FLOWING_INTO_UNSAFE,
             NON_CONTIGUOUS_RANGE_ENDPOINTS,
             NON_EXHAUSTIVE_OMITTED_PATTERNS,
+            NO_LINK_ATTRIBUTES,
             OUT_OF_SCOPE_MACRO_CALLS,
             OVERLAPPING_RANGE_ENDPOINTS,
             PARTIAL_STACK_PROTECTOR,
@@ -125,6 +126,7 @@ pub mod hardwired {
             UNCONDITIONAL_PANIC,
             UNCONDITIONAL_RECURSION,
             UNCOVERED_PARAM_IN_PROJECTION,
+            UNEVALUATED_DEFAULT_FIELD_VALUE,
             UNEXPECTED_CFGS,
             UNFULFILLED_LINT_EXPECTATIONS,
             UNINHABITED_STATIC,
@@ -5982,4 +5984,71 @@ declare_lint! {
         report_in_deps: false,
     };
     crate_level_only
+}
+
+declare_lint! {
+    /// The `unevaluated_default_field_value` lint detects default field values that don't get
+    /// evaluated at the definition site because the corresponding struct or enum has type or const
+    /// parameters, meaning they only get evaluated when the struct or enum gets constructed using
+    /// that default (post-monormophization).
+    ///
+    /// ### Example
+    ///
+    /// ```rust,no_run
+    /// #![feature(default_field_values)]
+    ///
+    /// struct Struct<const T: u8> {
+    ///     field1: u8 = 100 + T, // none of these values will be checked until `Struct` is
+    ///     field2: u8 = 100,     // constructed, even if they don't refer to the cont param
+    /// }
+    /// ```
+    ///
+    /// {{produces}}
+    ///
+    /// ### Explanation
+    ///
+    /// Const evaluation requires all values to be known. In the case of default field values, they
+    /// will get evaluated eagerly, but if there are any type or const parameters, the evaluation of
+    /// the default will only occur when materializing a value of its owning struct *and* leaving
+    /// the field with a default value unspecified. For the example above, if you wrote
+    /// `let _: Struct<180> = Struct { .. };`, you would get a const evaluation compile error.
+    ///
+    /// This inconsistency can be confusing, and surprising, because the fields *are* sometimes
+    /// evaluated eagerly.
+    pub UNEVALUATED_DEFAULT_FIELD_VALUE,
+    Warn,
+    r#"detects default field values on types that have const parameters"#,
+    @feature_gate = default_field_values;
+}
+
+declare_lint! {
+    /// The `no_link_attributes` lint detects that you used `#[no_link]` on an
+    /// `extern crate` item.
+    ///
+    /// ### Example
+    ///
+    /// ```rust,compile_fail
+    /// #[no_link]
+    /// extern crate std;
+    /// ```
+    ///
+    /// {{produces}}
+    ///
+    /// ### Explanation
+    ///
+    /// This is a pre-1.0 attribute that accidentally got stabilized. It was only meant
+    /// for compiler plugins which we no longer support, not for regular crates. It is
+    /// rather fragile and can easily lead to linker errors depending on where rustc
+    /// decides to codegen functions and statics, which varies between rustc versions. It
+    /// might also be unsound if a crate for example expects a global constructor it
+    /// defined to run. Using it doesn't have an effect on the size of the produced
+    /// binaries except when it defines a `#[used]` static given that we remove all unused
+    /// functions and statics at link time already.
+    pub NO_LINK_ATTRIBUTES,
+    Deny,
+    "detects usage of `#[no_link]` on `extern crate` items",
+    @future_incompatible = FutureIncompatibleInfo {
+        reason: fcw!(FutureReleaseError #164032),
+        report_in_deps: true,
+    };
 }

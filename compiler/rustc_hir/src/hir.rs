@@ -508,7 +508,7 @@ impl<'hir, Unambig> ConstArg<'hir, Unambig> {
 #[derive(Clone, Copy, Debug, StableHash)]
 #[repr(u8, C)]
 pub enum ConstArgKind<'hir, Unambig = ()> {
-    Tup(&'hir [&'hir ConstArg<'hir>]),
+    Tup(&'hir [ConstArg<'hir>]),
     /// **Note:** Currently this is only used for bare const params
     /// (`N` where `fn foo<const N: usize>(...)`),
     /// not paths to any const (`N` where `const N: usize = ...`).
@@ -517,9 +517,9 @@ pub enum ConstArgKind<'hir, Unambig = ()> {
     Path(QPath<'hir>),
     Anon(&'hir AnonConst),
     /// Represents construction of struct/struct variants
-    Struct(QPath<'hir>, &'hir [&'hir ConstArgExprField<'hir>]),
+    Struct(QPath<'hir>, &'hir [ConstArgExprField<'hir>]),
     /// Tuple constructor variant
-    TupleCall(QPath<'hir>, &'hir [&'hir ConstArg<'hir>]),
+    TupleCall(QPath<'hir>, &'hir [ConstArg<'hir>]),
     /// Array literal argument
     Array(&'hir ConstArgArrayExpr<'hir>),
     /// Error const
@@ -544,7 +544,7 @@ pub struct ConstArgExprField<'hir> {
 #[derive(Clone, Copy, Debug, StableHash)]
 pub struct ConstArgArrayExpr<'hir> {
     pub span: Span,
-    pub elems: &'hir [&'hir ConstArg<'hir>],
+    pub elems: &'hir [ConstArg<'hir>],
 }
 
 /// Tracks what a [GenericArg::Infer] can be inferred to based on its syntax.
@@ -848,6 +848,9 @@ pub enum GenericParamKind<'hir> {
         ty: &'hir Ty<'hir>,
         /// Optional default value for the const generic param
         default: Option<&'hir ConstArg<'hir>>,
+        /// Position of the const parameter in the function's argument list,
+        /// used by `function_arg_const_generics`.
+        arg_pos: Option<u16>,
     },
 }
 
@@ -1275,13 +1278,6 @@ impl<'hir> WhereRegionPredicate<'hir> {
     fn is_param_bound(&self, param_def_id: LocalDefId) -> bool {
         self.lifetime.kind == LifetimeKind::Param(param_def_id)
     }
-}
-
-/// An equality predicate (e.g., `T = int`); currently unsupported.
-#[derive(Debug, Clone, Copy, StableHash)]
-pub struct WhereEqPredicate<'hir> {
-    pub lhs_ty: &'hir Ty<'hir>,
-    pub rhs_ty: &'hir Ty<'hir>,
 }
 
 /// HIR node coupled with its parent's id in the same HIR owner.
@@ -1957,7 +1953,7 @@ pub struct BodyId {
 #[derive(Debug, Clone, Copy, StableHash)]
 pub struct Body<'hir> {
     pub params: &'hir [Param<'hir>],
-    pub value: Expr<'hir>,
+    pub value: &'hir Expr<'hir>,
 }
 
 impl<'hir> Body<'hir> {
@@ -2351,6 +2347,93 @@ impl Expr<'_> {
             | ExprKind::Yield(..)
             | ExprKind::Cast(..)
             | ExprKind::DropTemps(..) => false,
+        }
+    }
+
+    /// Returns true if mir building would consider this expression a constant for the purposes of
+    /// lowering `[CONST; 0]` as `[]`.
+    pub fn is_constant_for_zero_repeat(&self) -> bool {
+        // NB: This needs to be kept in sync with `rustc_mir_build::builder::expr::category::Category::of`
+
+        match self.kind {
+            ExprKind::ConstBlock(_) | ExprKind::Lit(_) => true,
+            ExprKind::Cast(inner, _) | ExprKind::Type(inner, _) => {
+                inner.is_constant_for_zero_repeat()
+            }
+
+            ExprKind::Path(qpath) => {
+                match qpath {
+                    QPath::Resolved(_, Path { res: Res::Def(def_kind, _), .. }) => match def_kind {
+                        DefKind::Const | DefKind::ConstParam | DefKind::AssocConst => true,
+
+                        DefKind::Mod
+                        | DefKind::Struct
+                        | DefKind::Union
+                        | DefKind::Enum
+                        | DefKind::Variant
+                        | DefKind::Trait
+                        | DefKind::TyAlias
+                        | DefKind::ForeignTy
+                        | DefKind::TraitAlias
+                        | DefKind::AssocTy
+                        | DefKind::TyParam
+                        | DefKind::Fn
+                        | DefKind::Static { .. }
+                        | DefKind::Ctor(..)
+                        | DefKind::AssocFn
+                        | DefKind::Macro(_)
+                        | DefKind::ExternCrate
+                        | DefKind::Use
+                        | DefKind::ForeignMod
+                        | DefKind::AnonConst
+                        | DefKind::OpaqueTy
+                        | DefKind::Field
+                        | DefKind::LifetimeParam
+                        | DefKind::GlobalAsm
+                        | DefKind::Impl { .. }
+                        | DefKind::Closure
+                        | DefKind::SyntheticCoroutineBody
+                        | DefKind::TestBinderConstraints => false,
+                    },
+
+                    // A path that resolved to something other than a definition cannot be a const
+                    QPath::Resolved(..) => false,
+
+                    // A type relative expression can only be a const
+                    QPath::TypeRelative(..) => true,
+                }
+            }
+
+            ExprKind::Array(_)
+            | ExprKind::Call(..)
+            | ExprKind::MethodCall(..)
+            | ExprKind::Use(..)
+            | ExprKind::Tup(_)
+            | ExprKind::Binary(..)
+            | ExprKind::Unary(..)
+            | ExprKind::DropTemps(_)
+            | ExprKind::Let(_)
+            | ExprKind::If(..)
+            | ExprKind::Loop(..)
+            | ExprKind::Match(..)
+            | ExprKind::Closure(_)
+            | ExprKind::Block(..)
+            | ExprKind::Assign(..)
+            | ExprKind::AssignOp(..)
+            | ExprKind::Field(..)
+            | ExprKind::Index(..)
+            | ExprKind::AddrOf(..)
+            | ExprKind::Break(..)
+            | ExprKind::Continue(_)
+            | ExprKind::Ret(_)
+            | ExprKind::Become(_)
+            | ExprKind::InlineAsm(_)
+            | ExprKind::OffsetOf(..)
+            | ExprKind::Struct(..)
+            | ExprKind::Repeat(..)
+            | ExprKind::Yield(..)
+            | ExprKind::UnsafeBinderCast(..)
+            | ExprKind::Err(_) => false,
         }
     }
 
@@ -3059,6 +3142,13 @@ impl<'hir> ImplItem<'hir> {
 
     pub fn impl_item_id(&self) -> ImplItemId {
         ImplItemId { owner_id: self.owner_id }
+    }
+
+    /// Returns whether this is an anonymous associated constant in an inherent impl.
+    pub fn is_anon_const(&self) -> bool {
+        matches!(self.impl_kind, ImplItemImplKind::Inherent { .. })
+            && matches!(self.kind, ImplItemKind::Const(..))
+            && self.ident.name == kw::Underscore
     }
 
     pub fn vis_span(&self) -> Option<Span> {
@@ -4527,14 +4617,23 @@ impl FnHeader {
 
 #[derive(Debug, Clone, Copy, StableHash)]
 pub struct TestBinderBody<'hir> {
-    pub foralls: &'hir [TestBinderForall<'hir>],
-    pub exists: &'hir [TestBinderExists<'hir>],
-    /// Constraints to be inserted directly into constraint storage to be proven
-    pub constraints: TestBinderConstraint<'hir>,
-    /// Constraints declared using `where` syntax, used via `register_obligation`
-    pub predicates: &'hir [WherePredicate<'hir>],
+    pub span: Span,
+    pub items: &'hir [TestBinderItem<'hir>],
 }
 
+#[derive(Debug, Clone, Copy, StableHash)]
+pub enum TestBinderItem<'hir> {
+    Forall(TestBinderForall<'hir>),
+    Exists(TestBinderExists<'hir>),
+    RegionEquality {
+        lhs: &'hir Lifetime,
+        rhs: &'hir Lifetime,
+    },
+    /// Constraints to be inserted directly into constraint storage to be proven
+    Constraint(TestBinderConstraint<'hir>),
+    /// Constraints declared using `where` syntax, used via `register_obligation`
+    Predicate(WherePredicate<'hir>),
+}
 #[derive(Debug, Clone, Copy, StableHash)]
 pub struct TestBinderForall<'hir> {
     pub span: Span,
@@ -5275,7 +5374,7 @@ mod size_asserts {
     use super::*;
     // tidy-alphabetical-start
     static_assert_size!(Block<'_>, 48);
-    static_assert_size!(Body<'_>, 80);
+    static_assert_size!(Body<'_>, 24);
     static_assert_size!(Expr<'_>, 64);
     static_assert_size!(ExprKind<'_>, 48);
     static_assert_size!(FnDecl<'_>, 40);

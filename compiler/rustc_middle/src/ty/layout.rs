@@ -21,7 +21,6 @@ use tracing::debug;
 use crate::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use crate::query::TyCtxtAt;
 use crate::traits::ObligationCause;
-use crate::ty::consts::ConstExt;
 use crate::ty::normalize_erasing_regions::NormalizationError;
 use crate::ty::{self, CoroutineArgsExt, Ty, TyCtxt, TypeVisitableExt, Unnormalized};
 
@@ -141,15 +140,20 @@ impl abi::Float {
             F16B => Ty::new_adt(
                 tcx,
                 tcx.adt_def(tcx.require_lang_item(LangItem::F16B, DUMMY_SP)),
-                ty::List::empty(),
+                ty::GenericArgs::empty(),
             ),
             F32 => tcx.types.f32,
             F64 => tcx.types.f64,
+            X87F80 => Ty::new_adt(
+                tcx,
+                tcx.adt_def(tcx.require_lang_item(LangItem::X87F80Raw, DUMMY_SP)),
+                ty::GenericArgs::empty(),
+            ),
             F128 => tcx.types.f128,
             PpcF128 => Ty::new_adt(
                 tcx,
                 tcx.adt_def(tcx.require_lang_item(LangItem::PpcF128, DUMMY_SP)),
-                ty::List::empty(),
+                ty::GenericArgs::empty(),
             ),
         }
     }
@@ -388,7 +392,7 @@ impl<'tcx> SizeSkeleton<'tcx> {
         let err = match tcx.layout_of(typing_env.as_query_input(ty)) {
             Ok(layout) => {
                 if layout.is_sized() {
-                    return Ok(SizeSkeleton::Known(layout.size, Some(layout.align.abi)));
+                    return Ok(SizeSkeleton::Known(layout.size, Some(layout.align)));
                 } else {
                     // Just to be safe, don't claim a known layout for unsized types.
                     return Err(tcx.arena.alloc(LayoutError::Unknown(ty)));
@@ -1029,6 +1033,9 @@ where
                 | ty::Param(_)
                 | ty::Infer(_)
                 | ty::Error(_) => bug!("TyAndLayout::field: unexpected type `{}`", this.ty),
+
+                // FIXME(scrabsha)
+                ty::View(..) => unimplemented!(),
             }
         }
 
@@ -1099,7 +1106,7 @@ where
                         }
                     };
 
-                    PointeeInfo { safe: Some(kind), size, align: layout.align.abi }
+                    PointeeInfo { safe: Some(kind), size, align: layout.align }
                 })
             }
 
@@ -1117,7 +1124,7 @@ where
                     PointeeInfo {
                         safe: Some(PointerKind::Box { unpin, global: this.ty.is_box_global(tcx) }),
                         size,
-                        align: layout.align.abi,
+                        align: layout.align,
                     }
                 })
             }
@@ -1254,6 +1261,12 @@ where
     fn is_complex_number_lang_item(this: TyAndLayout<'tcx>, cx: &C) -> bool {
         let Some(def) = this.ty.ty_adt_def() else { return false };
         cx.tcx().is_lang_item(def.did(), LangItem::Complex)
+    }
+
+    /// Is this type `core::arch::{x86, x86_64}::x87_f80`?
+    fn is_x87_f80_lang_item(this: TyAndLayout<'tcx>, cx: &C) -> bool {
+        let Some(def) = this.ty.ty_adt_def() else { return false };
+        cx.tcx().is_lang_item(def.did(), LangItem::X87F80)
     }
 
     fn is_scalable_vector(this: TyAndLayout<'tcx>) -> bool {
@@ -1429,6 +1442,7 @@ pub fn codegen_handle_fn_abi_err<'tcx>(
     fn_abi_request: FnAbiRequest<'tcx>,
 ) -> ErrorGuaranteed {
     match err {
+        FnAbiError::Layout(LayoutError::ReferencesError(guar)) => guar,
         FnAbiError::Layout(LayoutError::SizeOverflow(_) | LayoutError::InvalidSimd { .. }) => {
             tcx.dcx().emit_err(Spanned { span, node: err })
         }

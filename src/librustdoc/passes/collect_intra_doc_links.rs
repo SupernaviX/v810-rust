@@ -21,7 +21,7 @@ use rustc_middle::ty;
 use rustc_middle::ty::{Ty, TyCtxt};
 use rustc_resolve::rustdoc::pulldown_cmark::LinkType;
 use rustc_resolve::rustdoc::{
-    DocStrings, MalformedGenerics, has_primitive_or_keyword_or_attribute_docs,
+    DocStrings, MalformedGenerics, has_primitive_or_keyword_or_attribute_docs_hir,
     prepare_to_doc_link_resolution, source_span_for_markdown_range, strip_generics_from_path,
 };
 use rustc_span::def_id::ModId;
@@ -217,6 +217,7 @@ pub(crate) struct DiagnosticInfo<'a> {
     dox: &'a str,
     ori_link: &'a str,
     link_range: MarkdownLinkRange,
+    link_kind: LinkType,
 }
 
 pub(crate) struct OwnedDiagnosticInfo {
@@ -224,6 +225,7 @@ pub(crate) struct OwnedDiagnosticInfo {
     dox: String,
     ori_link: String,
     link_range: MarkdownLinkRange,
+    link_kind: LinkType,
 }
 
 impl From<DiagnosticInfo<'_>> for OwnedDiagnosticInfo {
@@ -233,6 +235,7 @@ impl From<DiagnosticInfo<'_>> for OwnedDiagnosticInfo {
             dox: f.dox.to_string(),
             ori_link: f.ori_link.to_string(),
             link_range: f.link_range.clone(),
+            link_kind: f.link_kind,
         }
     }
 }
@@ -244,6 +247,7 @@ impl OwnedDiagnosticInfo {
             ori_link: &self.ori_link,
             dox: &self.dox,
             link_range: self.link_range.clone(),
+            link_kind: self.link_kind,
         }
     }
 }
@@ -543,9 +547,9 @@ fn ty_to_res<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Option<Res> {
         ty::FnDef(..) => panic!("type alias to a function definition"),
         ty::FnPtr(..) => Res::Primitive(Fn),
         ty::Never => Res::Primitive(Never),
-        ty::Adt(ty::AdtDef(Interned(&ty::AdtDefData { did, .. }, _)), _) | ty::Foreign(did) => {
-            Res::from_def_id(tcx, did)
-        }
+        ty::Adt(ty::AdtDef(Interned(&ty::AdtDefData { did, .. }, _)), _)
+        | ty::View(ty::AdtDef(Interned(&ty::AdtDefData { did, .. }, _)), _, _)
+        | ty::Foreign(did) => Res::from_def_id(tcx, did),
         ty::Alias(_, ..)
         | ty::Closure(..)
         | ty::CoroutineClosure(..)
@@ -1081,7 +1085,7 @@ impl LinkCollector<'_, '_> {
                 && item_id
                     .as_local()
                     .is_some_and(|local_def_id| !effective_visibilities.is_exported(local_def_id))
-                && !has_primitive_or_keyword_or_attribute_docs(&item.attrs.other_attrs)
+                && !has_primitive_or_keyword_or_attribute_docs_hir(&item.attrs.other_attrs)
         };
 
         if let Some(def_id) = item.item_id.as_def_id()
@@ -1152,8 +1156,11 @@ impl LinkCollector<'_, '_> {
 
         // Also resolve links in the note text of `#[deprecated]`.
         for attr in &item.attrs.other_attrs {
-            let Attribute::Parsed(AttributeKind::Deprecated { span: depr_span, deprecation }) =
-                attr
+            let Attribute::Parsed(AttributeKind::Deprecated {
+                span: depr_span,
+                deprecation,
+                is_inner,
+            }) = attr
             else {
                 continue;
             };
@@ -1185,7 +1192,12 @@ impl LinkCollector<'_, '_> {
             } else {
                 item.item_id.expect_def_id()
             };
-            try_insert_links(item_id, &DocStrings { outer: note.to_owned(), inner: String::new() });
+            let attr = if *is_inner {
+                DocStrings { outer: String::new(), inner: note.to_owned() }
+            } else {
+                DocStrings { outer: note.to_owned(), inner: String::new() }
+            };
+            try_insert_links(item_id, &attr);
         }
     }
 
@@ -1209,6 +1221,7 @@ impl LinkCollector<'_, '_> {
             dox,
             ori_link: &ori_link.link,
             link_range: ori_link.range.clone(),
+            link_kind: ori_link.kind,
         };
         let PreprocessingInfo { path_str, disambiguator, extra_fragment, link_text } =
             pp_link.as_ref().map_err(|err| err.report(self.cx, diag_info.clone())).ok()?;
@@ -1950,7 +1963,7 @@ fn report_diagnostic(
     tcx: TyCtxt<'_>,
     lint: &'static Lint,
     msg: impl Into<DiagMessage> + Display,
-    DiagnosticInfo { item, ori_link: _, dox, link_range }: &DiagnosticInfo<'_>,
+    DiagnosticInfo { item, dox, link_range, .. }: &DiagnosticInfo<'_>,
     decorate: impl FnOnce(&mut Diag<'_>, Option<rustc_span::Span>, MarkdownLinkRange),
 ) {
     let Some(hir_id) = DocContext::as_local_hir_id(tcx, item.item_id) else {
@@ -2037,10 +2050,10 @@ fn suggest_path_name_typo(
     unresolved: &str,
     has_partial_res: bool,
     disambiguator: Option<Disambiguator>,
-) {
+) -> bool {
     if unresolved.chars().count() <= 1 {
         // There are too many false positives for single character typos.
-        return;
+        return false;
     }
 
     let tcx = collector.cx.tcx;
@@ -2058,8 +2071,10 @@ fn suggest_path_name_typo(
         .map(|child| child.ident.name)
         .filter(|&name| name != lookup)
         .collect::<Vec<_>>();
+
     let Some(candidate) = find_best_match_for_name(&candidates, lookup, None) else {
-        return;
+        // No plausible correction was found.
+        return false;
     };
 
     let msg = format!("there's a similarly named item `{candidate}`");
@@ -2071,10 +2086,16 @@ fn suggest_path_name_typo(
             let mut suggestion = link.to_owned();
             suggestion.replace_range(start..start + unresolved.len(), candidate.as_str());
             diag.span_suggestion_verbose(span, msg, suggestion, Applicability::MaybeIncorrect);
-            return;
+
+            // A replacement suggestion was emitted.
+            return true;
         }
     }
+
+    // We found a candidate but could not construct a precise replacement.
+    // Textual typo advice still counts as useful advice.
     diag.help(msg);
+    true
 }
 
 /// Reports a link that failed to resolve.
@@ -2204,8 +2225,9 @@ fn resolution_failure(
                             diag.note(note);
                         }
 
-                        if !path_is_invalid {
-                            suggest_path_name_typo(
+                        // Prefer a concrete correction over generic advice about external links.
+                        let suggested_item = !path_is_invalid
+                            && suggest_path_name_typo(
                                 collector,
                                 diag,
                                 sp,
@@ -2216,7 +2238,6 @@ fn resolution_failure(
                                 partial_res.is_some(),
                                 disambiguator,
                             );
-                        }
 
                         if !path_str.contains("::") {
                             if disambiguator.is_none_or(|d| d.ns() == MacroNS)
@@ -2238,6 +2259,30 @@ fn resolution_failure(
                                     "to escape `[` and `]` characters, \
                                            add '\\' before them like `\\[` or `\\]`",
                                 );
+
+                                // Use the original Markdown label in the reference-definition example.
+                                let label = diag_info.ori_link;
+
+                                // Keep this as fallback advice for missing references, rather than
+                                // competing with a typo correction or a more specific Rust-path error.
+                                if !suggested_item
+                                    && !path_is_invalid
+                                    && partial_res.is_none()
+                                    && disambiguator.is_none()
+                                    && matches!(
+                                        diag_info.link_kind,
+                                        LinkType::ShortcutUnknown
+                                            | LinkType::CollapsedUnknown
+                                            | LinkType::ReferenceUnknown
+                                    )
+                                    && !label.contains(['[', ']', '\\', '\n', '\r'])
+                                {
+                                    // We cannot know the destination, so offer help rather than an edit.
+                                    diag.help(format!(
+                                        "if you intended to link to external documentation, \
+                                         add a link reference definition: `[{label}]: https://...`"
+                                    ));
+                                }
                             }
                         }
 

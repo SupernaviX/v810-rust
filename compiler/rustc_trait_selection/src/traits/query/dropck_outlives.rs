@@ -2,7 +2,6 @@ use rustc_data_structures::fx::FxHashSet;
 use rustc_infer::traits::TraitErrors;
 use rustc_infer::traits::query::type_op::DropckOutlives;
 use rustc_middle::traits::query::{DropckConstraint, DropckOutlivesResult};
-use rustc_middle::ty::consts::ConstExt;
 use rustc_middle::ty::{self, EarlyBinder, ParamEnvAnd, Ty, TyCtxt, Unnormalized};
 use rustc_span::Span;
 use thin_vec::ThinVec;
@@ -89,6 +88,9 @@ pub fn trivial_dropck_outlives<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
         | ty::Bound(..)
         | ty::Coroutine(..)
         | ty::UnsafeBinder(_) => false,
+
+        // FIXME(scrabsha)
+        ty::View(..) => unimplemented!(),
     }
 }
 
@@ -418,5 +420,8 @@ pub fn dtorck_constraint_for_ty_inner<'tcx>(
             // be fully resolved.
             tcx.dcx().span_delayed_bug(span, format!("Unresolved type in dropck: {:?}.", ty));
         }
+
+        // FIXME(scrabsha)
+        ty::View(..) => unimplemented!(),
     }
 }

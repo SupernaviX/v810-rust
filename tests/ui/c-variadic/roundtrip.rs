@@ -1,5 +1,4 @@
 //@ run-pass
-//@ ignore-backends: gcc
 #![feature(
     const_c_variadic,
     c_variadic_va_arg_safe,
@@ -15,6 +14,8 @@ use std::ffi::*;
 // In rustc we implement `va_arg` for the callee reading from a VaList, but still rely on LLVM
 // for exactly how to pass c-variadic arguments and for constructing the VaList. Here we test
 // that the rustc implementation works with what LLVM gives us.
+//
+// FIXME: add a roundtrip test for c_longdouble and the types it aliases (x87 f80 and ibm f128).
 
 #[allow(improper_ctypes_definitions)]
 const unsafe extern "C" fn variadic<T: VaArgSafe>(mut ap: ...) -> (T, T) {
