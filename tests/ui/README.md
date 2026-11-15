@@ -1376,12 +1376,6 @@ These tests revolve around `#[no_mangle]` attribute, as well as consistently man
 
 Exercises `Sync` trait and auto-derive thereof.
 
-## `tests/ui/target-cpu/`: `-C target-cpu` command line flag
-
-This command line option instructs rustc to generate code specifically for a particular processor.
-
-**FIXME**: Contains a single test, maybe put it in a directory about misc codegen options?
-
 ## `tests/ui/target-feature/`: `#[target_feature(enable = "relaxed-simd")]`
 
 Exercises the `#[target_feature(..)]` attribute. See [Target feature attribute | Reference](https://doc.rust-lang.org/reference/attributes/codegen.html#the-target_feature-attribute).
