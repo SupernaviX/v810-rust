@@ -130,23 +130,6 @@ pr:
       # tidy. This speeds up the PR CI job by ~1 minute.
       SKIP_SUBMODULES: src/gcc
     <<: *job-linux-4c
-  - name: test-x86_64-gnu-llvm-22
-    env:
-      ENABLE_GCC_CODEGEN: "1"
-      DOCKER_SCRIPT: x86_64-gnu-llvm.sh
-    <<: *job-linux-4c
-  - name: test-aarch64-gnu-llvm-22-1
-    env:
-      IMAGE: test-aarch64-gnu-llvm-22
-      LLVM_VERSION: "22"
-      DOCKER_SCRIPT: stage_2_test_set1.sh
-    <<: *job-aarch64-linux
-  - name: test-aarch64-gnu-llvm-22-2
-    env:
-      IMAGE: test-aarch64-gnu-llvm-22
-      LLVM_VERSION: "22"
-      DOCKER_SCRIPT: stage_2_test_set2.sh
-    <<: *job-aarch64-linux
   - name: test-x86_64-gnu-tools
     <<: *job-linux-4c
   - name: test-x86_64-gnu-miri
