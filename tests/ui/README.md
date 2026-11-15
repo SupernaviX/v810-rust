@@ -215,7 +215,7 @@ Tests for the `--check-cfg` compiler mechanism  for checking cfg configurations,
 
 See [Checking conditional configurations | The rustc book](https://doc.rust-lang.org/rustc/check-cfg.html).
 
-## `tests/ui/checked-type-alias/`
+## `tests/ui/checked-type-aliases/`
 
 Tests for `#![feature(checked_type_aliases)]`. See [Tracking issue for checked type aliases](https://github.com/rust-lang/rust/issues/112792).
 
@@ -848,6 +848,10 @@ See:
 - [Lints | The rustc book](https://doc.rust-lang.org/rustc/lints/index.html)
 - [Lint reasons | Reference](https://doc.rust-lang.org/reference/attributes/diagnostics.html#lint-reasons)
 
+## `tests/ui/lint_helper_namespace/`
+
+Tests for lint helper attributes such as `#[lint::as_ptr]`.
+
 ## `tests/ui/liveness/`
 
 Tests exercising analysis for unused variables, unreachable statements, functions which are supposed to return a value but do not, as well as values moved elsewhere before they could be used by a function.
@@ -1372,12 +1376,6 @@ These tests revolve around `#[no_mangle]` attribute, as well as consistently man
 
 Exercises `Sync` trait and auto-derive thereof.
 
-## `tests/ui/target-cpu/`: `-C target-cpu` command line flag
-
-This command line option instructs rustc to generate code specifically for a particular processor.
-
-**FIXME**: Contains a single test, maybe put it in a directory about misc codegen options?
-
 ## `tests/ui/target-feature/`: `#[target_feature(enable = "relaxed-simd")]`
 
 Exercises the `#[target_feature(..)]` attribute. See [Target feature attribute | Reference](https://doc.rust-lang.org/reference/attributes/codegen.html#the-target_feature-attribute).
@@ -1409,6 +1407,10 @@ Broad category for parallelism and multi-threaded tests, including attempting to
 ## `tests/ui/tool-attributes/`: External tool attributes
 
 Exercises [tool attributes](https://doc.rust-lang.org/reference/attributes.html#tool-attributes).
+
+## `tests/ui/tpde`
+
+Exercises the experimental TPDE-LLVM codegen backend.
 
 ## `tests/ui/track-diagnostics/`
 

@@ -8,7 +8,7 @@ use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::{self, Command, Stdio};
+use std::process::{self, Command, ExitCode, Stdio};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -37,7 +37,7 @@ use tracing::{debug, info};
 
 use self::rust::HirCollector;
 use crate::config::{MergeDoctests, Options as RustdocOptions, OutputFormat};
-use crate::html::markdown::{CodeLineMapping, ErrorCodes, Ignore, LangString, MdRelLine};
+use crate::html::markdown::{CodeBlockPosition, CodeLineMapping, ErrorCodes, Ignore, LangString};
 use crate::lint::init_lints;
 
 /// Type used to display times (compilation and total) information for merged doctests.
@@ -142,7 +142,7 @@ fn get_doctest_dir(opts: &RustdocOptions) -> io::Result<TempDir> {
     builder.tempdir()
 }
 
-pub(crate) fn run(dcx: DiagCtxtHandle<'_>, input: Input, options: RustdocOptions) {
+pub(crate) fn run(dcx: DiagCtxtHandle<'_>, input: Input, options: RustdocOptions) -> ExitCode {
     let invalid_codeblock_attributes_name = crate::lint::INVALID_CODEBLOCK_ATTRIBUTES.name;
 
     // See core::create_config for what's going on here.
@@ -173,7 +173,7 @@ pub(crate) fn run(dcx: DiagCtxtHandle<'_>, input: Input, options: RustdocOptions
         lint_cap: Some(options.lint_cap.unwrap_or(lint::Forbid)),
         cg: options.codegen_options.clone(),
         externs: options.externs.clone(),
-        unstable_features: options.unstable_features,
+        unstable_features: options.unstable_features.clone(),
         actually_rustdoc: true,
         edition: options.edition,
         target_triple: options.target.clone(),
@@ -216,7 +216,7 @@ pub(crate) fn run(dcx: DiagCtxtHandle<'_>, input: Input, options: RustdocOptions
         .map_err(|error| format!("failed to create temporary directory: {error:?}"))
     {
         Ok(temp_dir) => temp_dir,
-        Err(error) => return crate::wrap_return(dcx, Err(error)),
+        Err(error) => dcx.fatal(error),
     };
     let args_path = temp_dir.path().join("rustdoc-cfgs");
     crate::wrap_return(dcx, generate_args_file(&args_path, &options));
@@ -281,7 +281,7 @@ pub(crate) fn run(dcx: DiagCtxtHandle<'_>, input: Input, options: RustdocOptions
         ..
     } = match result {
         Ok(Some(collector)) => collector,
-        Ok(None) => return,
+        Ok(None) => return ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{error}");
             // Since some files in the temporary folder are still owned and alive, we need
@@ -289,19 +289,21 @@ pub(crate) fn run(dcx: DiagCtxtHandle<'_>, input: Input, options: RustdocOptions
             if !save_temps {
                 let _ = std::fs::remove_dir_all(temp_dir.path());
             }
-            std::process::exit(1);
+            return ExitCode::FAILURE;
         }
     };
 
-    run_tests(
+    let exit_code = run_tests(
         dcx,
         opts,
         &rustdoc_options,
         &unused_extern_reports,
         standalone_tests,
         mergeable_tests,
-        Some(temp_dir),
     );
+    if exit_code != ExitCode::SUCCESS {
+        return exit_code;
+    }
 
     let compiling_test_count = compiling_test_count.load(Ordering::SeqCst);
 
@@ -343,6 +345,7 @@ pub(crate) fn run(dcx: DiagCtxtHandle<'_>, input: Input, options: RustdocOptions
             eprintln!("{unused_extern_json}");
         }
     }
+    ExitCode::SUCCESS
 }
 
 pub(crate) fn run_tests(
@@ -352,9 +355,7 @@ pub(crate) fn run_tests(
     unused_extern_reports: &Arc<Mutex<Vec<UnusedExterns>>>,
     mut standalone_tests: Vec<test::TestDescAndFn>,
     mergeable_tests: FxIndexMap<MergeableTestKey, Vec<(DocTestBuilder, ScrapedDocTest)>>,
-    // We pass this argument so we can drop it manually before using `exit`.
-    mut temp_dir: Option<TempDir>,
-) {
+) -> ExitCode {
     let mut test_args = Vec::with_capacity(rustdoc_options.test_args.len() + 1);
     test_args.insert(0, "rustdoctest".to_string());
     test_args.extend_from_slice(&rustdoc_options.test_args);
@@ -434,15 +435,12 @@ pub(crate) fn run_tests(
         let standalone_test_refs = &standalone_tests.iter().collect::<Vec<_>>();
         let exit = test::test_main(&test_args, standalone_test_refs);
         let times = times.times_in_secs();
-        // We ensure temp dir destructor is called.
-        std::mem::drop(standalone_tests);
-        std::mem::drop(temp_dir.take());
         if let Some((total_time, compilation_time)) = times {
             test::print_merged_doctests_times(&test_args, total_time, compilation_time);
         }
         // Fall through on success, the caller may want to do more stuff.
         if exit != std::process::ExitCode::SUCCESS {
-            exit.exit_process();
+            return exit;
         }
     } else {
         // If the first condition branch exited successfully, it will
@@ -452,11 +450,7 @@ pub(crate) fn run_tests(
             test::print_merged_doctests_times(&test_args, total_time, compilation_time);
         }
     }
-    // We ensure temp dir destructor is called.
-    std::mem::drop(temp_dir);
-    if nb_errors != 0 {
-        std::process::exit(test::ERROR_EXIT_CODE.into());
-    }
+    if nb_errors != 0 { test::ERROR_EXIT_CODE.into() } else { ExitCode::SUCCESS }
 }
 
 // Look for `#![doc(test(no_crate_inject))]`, used by crates in the std facade.
@@ -575,7 +569,7 @@ pub(crate) struct RunnableDocTest<'a> {
     /// In a standalone test this is just the regular test code.
     full_test_code: String,
     full_test_line_offset: usize,
-    test_opts: &'a IndividualTestOptions,
+    test_opts: IndividualTestOptions,
     global_opts: &'a GlobalTestOptions,
     langstr: LangString,
     line: usize,
@@ -654,9 +648,12 @@ fn run_test(
         },
     ]);
     if let ErrorOutputType::HumanReadable { kind, color_config } = rustdoc_options.error_format {
-        let short = kind.short();
-        let unicode = kind == HumanReadableErrorType { unicode: true, short };
+        let HumanReadableErrorType { no_graphics, short, unicode } = kind;
 
+        if no_graphics {
+            compiler_args
+                .extend_from_slice(&["--error-format".to_owned(), "human-no-graphics".to_owned()]);
+        }
         if short {
             compiler_args.extend_from_slice(&["--error-format".to_owned(), "short".to_owned()]);
         }
@@ -1020,7 +1017,7 @@ pub(crate) trait DocTestVisitor {
         &mut self,
         test: String,
         config: LangString,
-        rel_line: MdRelLine,
+        position: CodeBlockPosition,
         code_mappings: Vec<CodeLineMapping>,
     );
     fn visit_header(&mut self, _name: &str, _level: u32) {}
@@ -1143,8 +1140,6 @@ fn generate_test_desc_and_fn(
     unused_externs: Arc<Mutex<Vec<UnusedExterns>>>,
 ) -> test::TestDescAndFn {
     let target_str = rustdoc_options.target.to_string();
-    let rustdoc_test_options =
-        IndividualTestOptions::new(&rustdoc_options, &test.test_id, scraped_test.local_path());
 
     debug!("creating test {}: {}", scraped_test.name, scraped_test.text);
     test::TestDescAndFn {
@@ -1168,8 +1163,13 @@ fn generate_test_desc_and_fn(
             test_type: test::TestType::DocTest,
         },
         testfn: test::DynTestFn(Arc::new(move || {
+            let rustdoc_test_options = IndividualTestOptions::new(
+                &rustdoc_options,
+                &test.test_id,
+                scraped_test.local_path(),
+            );
             doctest_run_fn(
-                &rustdoc_test_options,
+                rustdoc_test_options,
                 &opts,
                 &test,
                 &scraped_test,
@@ -1181,7 +1181,7 @@ fn generate_test_desc_and_fn(
 }
 
 fn doctest_run_fn(
-    test_opts: &IndividualTestOptions,
+    test_opts: IndividualTestOptions,
     global_opts: &GlobalTestOptions,
     doctest: &DocTestBuilder,
     scraped_test: &ScrapedDocTest,
@@ -1271,10 +1271,14 @@ impl DocTestVisitor for Vec<usize> {
         &mut self,
         _test: String,
         _config: LangString,
-        rel_line: MdRelLine,
+        position: CodeBlockPosition,
         _code_mappings: Vec<CodeLineMapping>,
     ) {
-        self.push(1 + rel_line.offset());
+        let line = match position {
+            CodeBlockPosition::Relative(rel_line) => 1 + rel_line.offset(),
+            CodeBlockPosition::Span(_) => unreachable!(),
+        };
+        self.push(line);
     }
 }
 

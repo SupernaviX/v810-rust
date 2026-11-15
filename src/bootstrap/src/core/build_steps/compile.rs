@@ -1374,6 +1374,8 @@ fn rustc_cargo_env(builder: &Builder<'_>, cargo: &mut Cargo, target: TargetSelec
         // We want to enable Polonius Alpha and Next Trait Solver by default on nighty
         cargo.env("CFG_DEFAULT_POLONIUS_NEXT", "1");
         cargo.env("CFG_DEFAULT_NEXT_SOLVER_GLOBALLY", "1");
+        // Enable 2 threads for the parallel frontend by default on nightly
+        cargo.env("CFG_DEFAULT_FRONTEND_JOBS", "2");
     }
 
     // These conditionals represent a tension between three forces:
@@ -1420,6 +1422,12 @@ fn rustc_cargo_env(builder: &Builder<'_>, cargo: &mut Cargo, target: TargetSelec
         else if target.starts_with("loongarch") {
             cargo.env("JEMALLOC_SYS_WITH_LG_PAGE", "14");
         }
+    }
+
+    // Plumb the `rust.wasm-panic-unwind-default` configuration option into the
+    // `rustc_target` crate.
+    if builder.config.wasm_panic_unwind_default {
+        cargo.env("CFG_WASM_PANIC_UNWIND_DEFAULT", "1");
     }
 }
 
@@ -2544,6 +2552,26 @@ impl CommandLineStep for Assemble {
         }
 
         maybe_install_llvm_bitcode_linker();
+
+        if builder.config.llvm_tpde {
+            debug!("`llvm_tpde` requested");
+            // The rustc TPDE integration is Linux-only for now
+            if !host.contains("linux") {
+                builder.info(&format!("host target `{host}` not supported by tpde. skipping"));
+            } else {
+                // Put TPDE next to librustc_driver.so
+                let tpde_output = builder.ensure(llvm::Tpde { target: host });
+                let target_libdir =
+                    builder.sysroot_target_libdir(target_compiler, target_compiler.host);
+                let target_dst_lib =
+                    target_libdir.join(tpde_output.plugin_path().file_name().unwrap());
+                builder.copy_link(
+                    tpde_output.plugin_path(),
+                    &target_dst_lib,
+                    FileType::NativeLibrary,
+                );
+            }
+        }
 
         // Ensure that `libLLVM.so` ends up in the newly build compiler directory,
         // so that it can be found when the newly built `rustc` is run.

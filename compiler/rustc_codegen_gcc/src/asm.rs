@@ -1,5 +1,3 @@
-// cSpell:ignoreRegExp [afkspqvwy]reg
-
 use std::borrow::Cow;
 use std::fmt::Write;
 
@@ -698,6 +696,7 @@ fn explicit_reg_to_gcc(reg: InlineAsmReg) -> &'static str {
         InlineAsmReg::Arm(reg) => reg.name(),
         InlineAsmReg::AArch64(reg) => reg.name(),
         InlineAsmReg::M68k(reg) => reg.name(),
+        InlineAsmReg::Mips(reg) => reg.name(),
         _ => unimplemented!(),
     }
 }

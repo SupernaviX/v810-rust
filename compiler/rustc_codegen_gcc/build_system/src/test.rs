@@ -10,9 +10,9 @@ use boml::Toml;
 use crate::build;
 use crate::config::{Channel, ConfigInfo};
 use crate::utils::{
-    create_dir, get_sysroot_dir, get_toolchain, git_clone, git_clone_root_dir, remove_file,
-    run_command, run_command_with_env, run_command_with_output_and_env,
-    run_command_with_output_and_env_no_err, rustc_version_info, split_args, walk_dir,
+    create_dir, get_sysroot_dir, get_toolchain, git_clone_root_dir, remove_file, run_command,
+    run_command_with_env, run_command_with_output, run_command_with_output_and_env,
+    run_command_with_output_and_env_no_err, setup_rustc_folder, split_args, walk_dir,
 };
 
 /// Exit code of `y.sh test` when the tests ran and reported failures, as opposed to the build
@@ -50,13 +50,6 @@ fn get_runners() -> Runners {
     runners.insert("--build-sysroot", ("Build sysroot", build_sysroot));
     runners.insert("--std-tests", ("Run std tests", std_tests));
     runners.insert("--asm-tests", ("Run asm tests", asm_tests));
-    runners.insert("--extended-tests", ("Run extended sysroot tests", extended_sysroot_tests));
-    runners.insert("--extended-rand-tests", ("Run extended rand tests", extended_rand_tests));
-    runners.insert(
-        "--extended-regex-example-tests",
-        ("Run extended regex example tests", extended_regex_example_tests),
-    );
-    runners.insert("--extended-regex-tests", ("Run extended regex tests", extended_regex_tests));
     runners.insert("--mini-tests", ("Run mini tests", mini_tests));
     runners.insert("--gcc-asm-tests", ("Run cg_gcc asm tests", test_asm));
     runners.insert("--cargo-tests", ("Run cargo tests", cargo_tests));
@@ -79,24 +72,16 @@ fn get_number_after_arg(
 }
 
 fn show_usage() {
-    println!(
-        r#"
-`test` command help:
-
-    --features [arg]       : Add a new feature [arg]
-    --use-system-gcc       : Use system installed libgccjit
-    --build-only           : Only build rustc_codegen_gcc then exits
-    --nb-parts             : Used to split rustc_tests (for CI needs)
-    --current-part         : Used with `--nb-parts`, allows you to specify which parts to test"#
-    );
-    ConfigInfo::show_usage();
-    for (option, (doc, _)) in get_runners() {
-        // FIXME: Instead of using the hard-coded `23` value, better to compute it instead.
-        let needed_spaces = 23_usize.saturating_sub(option.len());
-        let spaces: String = std::iter::repeat_n(' ', needed_spaces).collect();
-        println!("    {option}{spaces}: {doc}");
-    }
-    println!("    --help                 : Show this help");
+    println!("`test` command help:\n");
+    let mut options = vec![
+        ("--use-system-gcc", "Use system installed libgccjit"),
+        ("--build-only", "Only build rustc_codegen_gcc then exits"),
+        ("--nb-parts", "Used to split rustc_tests (for CI needs)"),
+        ("--current-part", "Used with `--nb-parts`, allows you to specify which parts to test"),
+    ];
+    options.extend(ConfigInfo::usage());
+    options.extend(get_runners().into_iter().map(|(option, (doc, _))| (option, doc)));
+    crate::utils::show_help_with_indent(options, true);
 }
 
 #[derive(Default, Debug)]
@@ -194,7 +179,7 @@ impl TestArg {
 }
 
 fn build_if_no_backend(env: &Env, args: &TestArg) -> Result<(), String> {
-    if args.config_info.backend.is_some() {
+    if args.config_info.backend.is_some() || args.config_info.prebuilt_backend_path.is_some() {
         return Ok(());
     }
     let mut command: Vec<&dyn AsRef<OsStr>> = vec![&"cargo", &"rustc"];
@@ -231,6 +216,12 @@ fn cargo_tests(test_env: &Env, test_args: &TestArg) -> Result<(), String> {
         "CG_RUSTFLAGS".into(),
         test_env.get("CG_RUSTFLAGS").map(|s| s.as_str()).unwrap_or("").to_string(),
     );
+    if test_args.config_info.prebuilt_backend_path.is_some() {
+        env.insert("CG_GCC_BACKEND_PATH".into(), test_args.config_info.cg_backend_path.clone());
+    }
+    if test_args.config_info.prebuilt_sysroot_path.is_some() {
+        env.insert("CG_GCC_SYSROOT_PATH".into(), test_args.config_info.sysroot_path.clone());
+    }
     // Pass all the default args + the user-specified ones.
     let mut args: Vec<&dyn AsRef<OsStr>> = vec![&"cargo", &"test"];
     args.extend(test_args.test_args.iter().map(|s| s as &dyn AsRef<OsStr>));
@@ -256,6 +247,8 @@ fn mini_tests(env: &Env, args: &TestArg) -> Result<(), String> {
         &"mini_core",
         &"--crate-type",
         &crate_types,
+        &"--edition",
+        &"2024",
         &"--target",
         &args.config_info.target_triple,
     ]);
@@ -550,33 +543,16 @@ fn get_llvm_filecheck(env: &Env) -> Result<String, String> {
 }
 
 fn setup_rustc(env: &mut Env, args: &TestArg) -> Result<PathBuf, String> {
+    let rust_dir = setup_rustc_folder(env)?;
+
     let toolchain = format!(
         "+{channel}-{host}",
         channel = get_toolchain()?, // May also include date
         host = args.config_info.host_triple
     );
-    let rust_dir_path = Path::new(crate::BUILD_DIR).join("rust");
-    // If the repository was already cloned, command will fail, so doesn't matter.
-    let _ = git_clone("https://github.com/rust-lang/rust.git", Some(&rust_dir_path), false);
-    let rust_dir: Option<&Path> = Some(&rust_dir_path);
-    run_command(&[&"git", &"checkout", &"--", &"tests/"], rust_dir)?;
-    run_command_with_output_and_env(&[&"git", &"fetch"], rust_dir, Some(env))?;
-    let rustc_commit = match rustc_version_info(env.get("RUSTC").map(|s| s.as_str()))?.commit_hash {
-        Some(commit_hash) => commit_hash,
-        None => return Err("Couldn't retrieve rustc commit hash".to_string()),
-    };
-    if rustc_commit != "unknown" {
-        run_command_with_output_and_env(
-            &[&"git", &"checkout", &rustc_commit],
-            rust_dir,
-            Some(env),
-        )?;
-    } else {
-        run_command_with_output_and_env(&[&"git", &"checkout"], rust_dir, Some(env))?;
-    }
 
     let cargo = String::from_utf8(
-        run_command_with_env(&[&"rustup", &"which", &"cargo"], rust_dir, Some(env))?.stdout,
+        run_command_with_env(&[&"rustup", &"which", &"cargo"], Some(&rust_dir), Some(env))?.stdout,
     )
     .map_err(|error| format!("Failed to retrieve cargo path: {error:?}"))
     .and_then(|cargo| {
@@ -584,8 +560,12 @@ fn setup_rustc(env: &mut Env, args: &TestArg) -> Result<PathBuf, String> {
         if cargo.is_empty() { Err("`cargo` path is empty".to_string()) } else { Ok(cargo) }
     })?;
     let rustc = String::from_utf8(
-        run_command_with_env(&[&"rustup", &toolchain, &"which", &"rustc"], rust_dir, Some(env))?
-            .stdout,
+        run_command_with_env(
+            &[&"rustup", &toolchain, &"which", &"rustc"],
+            Some(&rust_dir),
+            Some(env),
+        )?
+        .stdout,
     )
     .map_err(|error| format!("Failed to retrieve rustc path: {error:?}"))
     .and_then(|rustc| {
@@ -601,7 +581,7 @@ fn setup_rustc(env: &mut Env, args: &TestArg) -> Result<PathBuf, String> {
             String::new()
         }
     };
-    let file_path = rust_dir_path.join("config.toml");
+    let file_path = rust_dir.join("config.toml");
     std::fs::write(
         &file_path,
         format!(
@@ -630,7 +610,7 @@ download-ci-llvm = false
         ),
     )
     .map_err(|error| format!("Failed to write into `{}`: {:?}", file_path.display(), error))?;
-    Ok(rust_dir_path)
+    Ok(rust_dir)
 }
 
 fn asm_tests(env: &Env, args: &TestArg) -> Result<(), String> {
@@ -639,14 +619,7 @@ fn asm_tests(env: &Env, args: &TestArg) -> Result<(), String> {
     // FIXME: create a function "display_if_not_quiet" or something along the line.
     println!("[TEST] rustc asm test suite");
 
-    let codegen_backend_path = format!(
-        "{pwd}/target/{channel}/librustc_codegen_gcc.{dylib_ext}",
-        pwd = std::env::current_dir()
-            .map_err(|error| format!("`current_dir` failed: {error:?}"))?
-            .display(),
-        channel = args.config_info.channel.as_str(),
-        dylib_ext = args.config_info.dylib_ext,
-    );
+    let codegen_backend_path = &args.config_info.cg_backend_path;
 
     let extra =
         if args.is_using_gcc_master_branch() { "" } else { " -Csymbol-mangling-version=v0" };
@@ -734,8 +707,12 @@ where
 
 struct Project {
     url: &'static str,
+    /// The commit to test instead of the head of the default branch.
+    commit: Option<&'static str>,
     /// Arguments added to both the `cargo build` and the `cargo test` invocations.
     cargo_arguments: &'static [&'static str],
+    /// Arguments added to the `cargo test` invocation only.
+    test_cargo_arguments: &'static [&'static str],
     /// Arguments forwarded to the test harness by `cargo test`.
     test_harness_arguments: &'static [&'static str],
     /// Variables added to the environment of both invocations.
@@ -744,11 +721,28 @@ struct Project {
 
 impl Project {
     const fn new(url: &'static str) -> Self {
-        Self { url, cargo_arguments: &[], test_harness_arguments: &[], environment_variables: &[] }
+        Self {
+            url,
+            commit: None,
+            cargo_arguments: &[],
+            test_cargo_arguments: &[],
+            test_harness_arguments: &[],
+            environment_variables: &[],
+        }
+    }
+
+    const fn commit(mut self, commit: &'static str) -> Self {
+        self.commit = Some(commit);
+        self
     }
 
     const fn cargo_arguments(mut self, arguments: &'static [&'static str]) -> Self {
         self.cargo_arguments = arguments;
+        self
+    }
+
+    const fn test_cargo_arguments(mut self, arguments: &'static [&'static str]) -> Self {
+        self.test_cargo_arguments = arguments;
         self
     }
 
@@ -779,16 +773,29 @@ const PROJECTS: &[Project] = &[
     Project::new("https://github.com/marshallpierce/rust-base64"),
     Project::new("https://github.com/serde-rs/serde"),
     Project::new("https://github.com/rayon-rs/rayon"),
+    // regex 1.12.2, the version rustc depends on.
+    Project::new("https://github.com/rust-lang/regex")
+        .commit("5ea3eb1e95f0338e283f5f0b4681f0891a1cd836")
+        .test_cargo_arguments(&["--tests"]),
     // The test suite refuses to build unless every feature is enabled; it otherwise spawns a
     // nested `cargo test --all-features` which would not use this backend.
     Project::new("https://github.com/time-rs/time").cargo_arguments(&["--all-features"]),
+    Project::new("https://github.com/rust-lang/regex")
+        .commit("5ea3eb1e95f0338e283f5f0b4681f0891a1cd836")
+        .cargo_arguments(&["-p", "regex-automata"])
+        .test_cargo_arguments(&["--lib"]),
     Project::new("https://github.com/bitflags/bitflags"),
     Project::new("https://github.com/dtolnay/itoa"),
     // The `ui` test compares against the diagnostics of the compiler it was blessed with, so it
     // fails on the nightly we use no matter which backend produces the code.
     Project::new("https://github.com/rust-lang-nursery/lazy-static.rs")
         .test_harness_arguments(&["--skip", "ui", "--exact"]),
+    Project::new("https://github.com/taiki-e/portable-atomic"),
     Project::new("https://github.com/BurntSushi/memchr"),
+    // rand 0.9.3, the version rustc depends on.
+    Project::new("https://github.com/rust-random/rand")
+        .commit("1aeee9f4c506f9f737c6c37c169ccdc365bfbabf")
+        .cargo_arguments(&["--workspace"]),
     Project::new("https://github.com/rust-lang/log"),
     Project::new("https://github.com/rust-random/getrandom"),
     Project::new("https://github.com/rust-lang/cfg-if"),
@@ -805,6 +812,13 @@ fn test_project(
 ) -> Result<(), String> {
     let clone_result = git_clone_root_dir(project.url, projects_path, true)?;
     let repo_path = Path::new(&clone_result.repo_dir);
+    if let Some(commit) = project.commit {
+        run_command_with_output(
+            &[&"git", &"fetch", &"--depth", &"1", &"origin", &commit],
+            Some(repo_path),
+        )?;
+        run_command_with_output(&[&"git", &"checkout", &"--detach", &commit], Some(repo_path))?;
+    }
 
     let mut project_environment = env.clone();
     let rustflags = format!(
@@ -824,6 +838,8 @@ fn test_project(
     let mut test_command: Vec<&dyn AsRef<OsStr>> = vec![&"test"];
     test_command
         .extend(project.cargo_arguments.iter().map(|argument| argument as &dyn AsRef<OsStr>));
+    test_command
+        .extend(project.test_cargo_arguments.iter().map(|argument| argument as &dyn AsRef<OsStr>));
     if !project.test_harness_arguments.is_empty() {
         test_command.push(&"--");
         test_command.extend(
@@ -991,121 +1007,6 @@ fn test_alloc(env: &Env, args: &TestArg) -> Result<(), String> {
     let _ = remove_dir_all(path.join("target"));
     // FIXME(antoyo): run in release mode when we fix the failures.
     run_cargo_command(&[&"test"], Some(&path), env, args)?;
-    Ok(())
-}
-
-fn extended_rand_tests(env: &Env, args: &TestArg) -> Result<(), String> {
-    if !args.is_using_gcc_master_branch() {
-        println!("Not using GCC master branch. Skipping `extended_rand_tests`.");
-        return Ok(());
-    }
-    let mut env = env.clone();
-    // newer aho_corasick versions throw a deprecation warning
-    let rustflags =
-        format!("{} --cap-lints warn", env.get("RUSTFLAGS").cloned().unwrap_or_default());
-    env.insert("RUSTFLAGS".to_string(), rustflags);
-
-    let path = Path::new(crate::BUILD_DIR).join("rand");
-    run_cargo_command(&[&"clean"], Some(&path), &env, args)?;
-    // FIXME: create a function "display_if_not_quiet" or something along the line.
-    println!("[TEST] rust-random/rand");
-    run_cargo_command(&[&"test", &"--workspace"], Some(&path), &env, args)?;
-    Ok(())
-}
-
-fn extended_regex_example_tests(env: &Env, args: &TestArg) -> Result<(), String> {
-    if !args.is_using_gcc_master_branch() {
-        println!("Not using GCC master branch. Skipping `extended_regex_example_tests`.");
-        return Ok(());
-    }
-    let path = Path::new(crate::BUILD_DIR).join("regex");
-    run_cargo_command(&[&"clean"], Some(&path), env, args)?;
-    // FIXME: create a function "display_if_not_quiet" or something along the line.
-    println!("[TEST] rust-lang/regex example shootout-regex-dna");
-    let mut env = env.clone();
-    // newer aho_corasick versions throw a deprecation warning
-    let rustflags =
-        format!("{} --cap-lints warn", env.get("RUSTFLAGS").cloned().unwrap_or_default());
-    env.insert("RUSTFLAGS".to_string(), rustflags);
-    // Make sure `[codegen mono items] start` doesn't poison the diff
-    run_cargo_command(&[&"build", &"--example", &"shootout-regex-dna"], Some(&path), &env, args)?;
-
-    run_cargo_command_with_callback(
-        &[&"run", &"--example", &"shootout-regex-dna"],
-        Some(&path),
-        &env,
-        args,
-        |cargo_command, cwd, env| {
-            // FIXME: rewrite this with `child.stdin.write_all()` because
-            // `examples/regexdna-input.txt` is very small.
-            let mut command: Vec<&dyn AsRef<OsStr>> = vec![&"bash", &"-c"];
-            let cargo_args =
-                cargo_command.iter().map(|s| s.as_ref().to_str().unwrap()).collect::<Vec<_>>();
-            let bash_command = format!(
-                "cat examples/regexdna-input.txt | {} | grep -v 'Spawned thread' > res.txt",
-                cargo_args.join(" "),
-            );
-            command.push(&bash_command);
-            run_command_with_output_and_env(&command, cwd, Some(env))?;
-            run_command_with_output_and_env(
-                &[&"diff", &"-u", &"res.txt", &"examples/regexdna-output.txt"],
-                cwd,
-                Some(env),
-            )?;
-            Ok(())
-        },
-    )?;
-
-    Ok(())
-}
-
-fn extended_regex_tests(env: &Env, args: &TestArg) -> Result<(), String> {
-    if !args.is_using_gcc_master_branch() {
-        println!("Not using GCC master branch. Skipping `extended_regex_tests`.");
-        return Ok(());
-    }
-    // FIXME: create a function "display_if_not_quiet" or something along the line.
-    println!("[TEST] rust-lang/regex tests");
-    let mut env = env.clone();
-    // newer aho_corasick versions throw a deprecation warning
-    let rustflags =
-        format!("{} --cap-lints warn", env.get("RUSTFLAGS").cloned().unwrap_or_default());
-    env.insert("RUSTFLAGS".to_string(), rustflags);
-    let path = Path::new(crate::BUILD_DIR).join("regex");
-    run_cargo_command(
-        &[
-            &"test",
-            &"--tests",
-            &"--",
-            // FIXME: try removing `--exclude-should-panic` argument
-            &"--exclude-should-panic",
-            &"--test-threads",
-            &"1",
-            &"-Zunstable-options",
-            &"-q",
-        ],
-        Some(&path),
-        &env,
-        args,
-    )?;
-    Ok(())
-}
-
-fn extended_sysroot_tests(env: &Env, args: &TestArg) -> Result<(), String> {
-    // pushd simple-raytracer
-    // echo "[BENCH COMPILE] ebobby/simple-raytracer"
-    // hyperfine --runs "${RUN_RUNS:-10}" --warmup 1 --prepare "cargo clean" \
-    // "RUSTC=rustc RUSTFLAGS='' cargo build" \
-    // "../y.sh cargo build"
-
-    // echo "[BENCH RUN] ebobby/simple-raytracer"
-    // cp ./target/debug/main ./raytracer_cg_gcc
-    // hyperfine --runs "${RUN_RUNS:-10}" ./raytracer_cg_llvm ./raytracer_cg_gcc
-    // popd
-    extended_rand_tests(env, args)?;
-    extended_regex_example_tests(env, args)?;
-    extended_regex_tests(env, args)?;
-
     Ok(())
 }
 
@@ -1681,7 +1582,6 @@ fn run_all(env: &Env, args: &TestArg) -> Result<(), String> {
     std_tests(env, args)?;
     // asm_tests(env, args)?;
     test_libcore(env, args)?;
-    extended_sysroot_tests(env, args)?;
     cargo_tests(env, args)?;
     no_builtins_tests(env, args)?;
     test_rustc(env, args)?;

@@ -14,10 +14,10 @@ use rustc_session::config::{
     CoverageOptions, DebugInfo, DumpMonoStatsFormat, ErrorOutputType, ExternEntry, ExternLocation,
     Externs, FmtDebug, FunctionReturn, IncrementalStateAssertion, InliningThreshold, Input,
     InstrumentCoverage, InstrumentMcount, InstrumentMcountOpts, InstrumentXRay, LinkSelfContained,
-    LinkerPluginLto, LocationDetail, LtoCli, MirIncludeSpans, NextSolverConfig, Offload, Options,
-    OutFileName, OutputType, OutputTypes, PAuthKey, PacRet, Passes, PatchableFunctionEntry,
-    Polonius, ProcMacroExecutionStrategy, Strip, SwitchWithOptPath, SymbolManglingVersion,
-    WasiExecModel, build_session_options, rustc_optgroups,
+    LinkerPluginLto, LlvmTpde, LocationDetail, LtoCli, MirIncludeSpans, NextSolverConfig, Offload,
+    Options, OutFileName, OutputType, OutputTypes, PAuthKey, PacRet, Passes,
+    PatchableFunctionEntry, Polonius, ProcMacroExecutionStrategy, Strip, SwitchWithOptPath,
+    SymbolManglingVersion, WasiExecModel, build_session_options, rustc_optgroups,
 };
 use rustc_session::search_paths::SearchPath;
 use rustc_session::utils::{CanonicalizedPath, NativeLib};
@@ -346,7 +346,7 @@ fn test_search_paths_tracking_hash_different_order() {
     let early_dcx = EarlyDiagCtxt::new(JSON);
     const JSON: ErrorOutputType = ErrorOutputType::Json {
         pretty: false,
-        json_rendered: HumanReadableErrorType { short: false, unicode: false },
+        json_rendered: HumanReadableErrorType { no_graphics: false, short: false, unicode: false },
         color_config: ColorConfig::Never,
     };
 
@@ -639,6 +639,7 @@ fn test_codegen_options_tracking_hash() {
     tracked!(debuginfo, DebugInfo::Limited);
     tracked!(dwarf_version, Some(5));
     tracked!(embed_bitcode, false);
+    tracked!(embed_metadata, Some(false));
     tracked!(force_frame_pointers, FramePointer::Always);
     tracked!(force_unwind_tables, Some(true));
     tracked!(instrument_coverage, InstrumentCoverage::Yes);
@@ -788,6 +789,7 @@ fn test_unstable_options_tracking_hash() {
     tracked!(always_encode_mir, true);
     tracked!(annotate_moves, AnnotateMoves::Enabled(Some(1234)));
     tracked!(assume_incomplete_release, true);
+    tracked!(async_panic, false);
     tracked!(autodiff, vec![AutoDiff::Enable, AutoDiff::NoTT]);
     tracked!(autodiff_post_passes, Some("function(mem2reg,instsimplify,simplifycfg)".to_string()));
     tracked!(binary_dep_depinfo, true);
@@ -819,7 +821,7 @@ fn test_unstable_options_tracking_hash() {
     tracked!(direct_access_external_data, Some(true));
     tracked!(dual_proc_macros, true);
     tracked!(dwarf_version, Some(5));
-    tracked!(embed_metadata, false);
+    tracked!(embed_metadata, Some(false));
     tracked!(embed_source, true);
     tracked!(export_executable_symbols, true);
     tracked!(fewer_names, Some(true));
@@ -844,6 +846,8 @@ fn test_unstable_options_tracking_hash() {
     tracked!(lint_llvm_ir, true);
     tracked!(llvm_module_flag, vec![("bar".to_string(), 123, "max".to_string())]);
     tracked!(llvm_plugins, vec![String::from("plugin_name")]);
+    tracked!(llvm_tpde, Some(LlvmTpde::Only));
+    tracked!(llvm_tpde, Some(LlvmTpde::Try));
     tracked!(llvm_writable, true);
     tracked!(location_detail, LocationDetail { file: true, line: false, column: false });
     tracked!(maximal_hir_to_mir_coverage, true);

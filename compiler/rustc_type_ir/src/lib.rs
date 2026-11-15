@@ -27,12 +27,7 @@
 #![allow(rustc::usage_of_type_ir_traits)]
 #![cfg_attr(feature = "nightly", allow(internal_features))]
 #![cfg_attr(feature = "nightly", feature(associated_type_defaults, rustc_attrs, negative_impls))]
-// NOTE: the outer `cfg_attr` is only there so that r-a doesn't see the nightly-only `bootstrap`
-// in the inner `cfg_attr`. When the latter is removed, the former can be removed as well.
-#![cfg_attr(
-    feature = "nightly",
-    cfg_attr(not(bootstrap), deny(rustc::missing_generic_type_visitable_derive))
-)]
+#![deny(rustc::missing_generic_type_visitable_derive)]
 // tidy-alphabetical-end
 
 extern crate self as rustc_type_ir;
@@ -61,6 +56,7 @@ pub mod relate;
 pub mod search_graph;
 pub mod solve;
 pub mod sty;
+pub mod transmute;
 pub mod walk;
 
 // These modules are not `pub` since they are glob-imported.
@@ -76,6 +72,7 @@ mod generic_visit;
 mod infer_ctxt;
 mod interner;
 mod opaque_ty;
+mod param_env;
 mod pattern;
 mod predicate;
 mod predicate_kind;
@@ -106,6 +103,7 @@ pub use generic_visit::*;
 pub use infer_ctxt::*;
 pub use interner::*;
 pub use opaque_ty::*;
+pub use param_env::*;
 pub use pattern::*;
 pub use predicate::*;
 pub use predicate_kind::*;
@@ -374,6 +372,7 @@ rustc_index::newtype_index! {
     /// type -- an idealized representative of "types in general" that we
     /// use for checking generic functions.
     #[stable_hash]
+    #[default]
     #[encodable]
     #[orderable]
     #[debug_format = "U{}"]
@@ -418,12 +417,6 @@ impl UniverseIndex {
     /// Returns `true` if `self` is the root universe, otherwise false.
     pub fn is_root(self) -> bool {
         self == Self::ROOT
-    }
-}
-
-impl Default for UniverseIndex {
-    fn default() -> Self {
-        Self::ROOT
     }
 }
 

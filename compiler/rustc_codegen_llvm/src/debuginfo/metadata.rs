@@ -6,11 +6,11 @@ use std::{assert_matches, iter, ptr};
 
 use libc::{c_longlong, c_uint};
 use rustc_abi::{Align, Endian, Layout, NumScalableVectors, Size};
+use rustc_ast::{IntTy, UintTy};
 use rustc_codegen_ssa::debuginfo::type_names::{VTableNameKind, cpp_like_debuginfo};
 use rustc_codegen_ssa::traits::*;
 use rustc_hir::def::{CtorKind, DefKind};
 use rustc_hir::def_id::{DefId, LOCAL_CRATE};
-use rustc_middle::ty::consts::ConstExt;
 use rustc_middle::ty::layout::{
     HasTypingEnv, LayoutOf, TyAndLayout, WIDE_PTR_ADDR, WIDE_PTR_EXTRA,
 };
@@ -90,7 +90,7 @@ macro_rules! return_if_di_node_created_in_meantime {
 /// Extract size and alignment from a TyAndLayout.
 #[inline]
 fn size_and_align_of(ty_and_layout: TyAndLayout<'_>) -> (Size, Align) {
-    (ty_and_layout.size, ty_and_layout.align.abi)
+    (ty_and_layout.size, ty_and_layout.align)
 }
 
 /// Creates debuginfo for a fixed size array (e.g. `[u64; 123]`).
@@ -180,7 +180,7 @@ fn build_pointer_or_reference_di_node<'ll, 'tcx>(
         None => {
             // This is a thin pointer. Create a regular pointer type and give it the correct name.
             assert_eq!(
-                (pointer_size, pointer_align.abi),
+                (pointer_size, pointer_align),
                 cx.size_and_align_of(ptr_type),
                 "ptr_type={ptr_type}, pointee_type={pointee_type}",
             );
@@ -189,7 +189,7 @@ fn build_pointer_or_reference_di_node<'ll, 'tcx>(
                 cx,
                 pointee_type_di_node,
                 pointer_size,
-                pointer_align.abi,
+                pointer_align,
                 &ptr_type_debuginfo_name,
             );
 
@@ -243,7 +243,7 @@ fn build_pointer_or_reference_di_node<'ll, 'tcx>(
                         cx,
                         pointee_type_di_node,
                         addr_field.size,
-                        addr_field.align.abi,
+                        addr_field.align,
                         "",
                     );
 
@@ -326,9 +326,7 @@ fn build_subroutine_type_di_node<'ll, 'tcx>(
     let name = compute_debuginfo_type_name(cx.tcx, fn_ty, false);
     let (size, align) = match fn_ty.kind() {
         ty::FnDef(..) => (Size::ZERO, Align::ONE),
-        ty::FnPtr(..) => {
-            (cx.tcx.data_layout.pointer_size(), cx.tcx.data_layout.pointer_align().abi)
-        }
+        ty::FnPtr(..) => (cx.tcx.data_layout.pointer_size(), cx.tcx.data_layout.pointer_align()),
         _ => unreachable!(),
     };
     let di_node = create_pointer_type(cx, fn_di_node, size, align, &name);
@@ -503,6 +501,9 @@ pub(crate) fn spanned_type_di_node<'ll, 'tcx>(
         | ty::Error(_) => {
             bug!("debuginfo: unexpected type in type_di_node(): {:?}", t)
         }
+
+        // FIXME(scrabsha)
+        ty::View(..) => unimplemented!(),
     };
 
     {
@@ -533,7 +534,7 @@ pub(crate) fn spanned_type_di_node<'ll, 'tcx>(
 
 // FIXME(mw): Cache this via a regular UniqueTypeId instead of an extra field in the debug context.
 fn recursion_marker_type_di_node<'ll, 'tcx>(cx: &CodegenCx<'ll, 'tcx>) -> &'ll DIType {
-    *debug_context(cx).recursion_marker_type.get_or_init(move || {
+    debug_context(cx).recursion_marker_type.get_or_init(move || {
         // The choice of type here is pretty arbitrary -
         // anything reading the debuginfo for a recursive
         // type is going to see *something* weird - the only
@@ -795,9 +796,50 @@ fn build_basic_type_di_node<'ll, 'tcx>(
         _ => bug!("debuginfo::build_basic_type_di_node - `t` is invalid type"),
     };
 
-    let ty_di_node = create_basic_type(cx, name, cx.size_of(t), encoding);
+    // Around LLDB 21 or 22, LLDB started using prebuilt Clang type nodes for primitives rather than
+    // reading the full DWARF data. These nodes are based on the size and signedness of the
+    // primitive, and ignore pretty much all other fields. This causes 2 issues:
+    // 1. type names get normalized to C-style names which isn't ideal. The normalization occurs
+    // even in generic args.
+    // 2. if you have a generic type `S<T>`, and 2 instantiations are `S<u64>`
+    // and `S<usize>` (on a 64-bit target), the use of prebuilt nodes causes a name collision.
+    // Whichever instantiation is interacted with first will work fine, all others will break a
+    // bunch of stuff in the LLDB pipeline. To avoid this, we explicitly treat `usize` and `isize`
+    // as typedefs of their equivalent types. For more info see: llvm/llvm-project#196812
 
-    if !cpp_like_debuginfo {
+    let mut needs_typedef = cpp_like_debuginfo;
+
+    let ty_di_node = match t.kind() {
+        ty::Uint(UintTy::Usize) => {
+            needs_typedef = true;
+
+            let equivalent = match t.primitive_size(cx.tcx).bits() {
+                8 => cx.tcx.types.u8,
+                16 => cx.tcx.types.u16,
+                32 => cx.tcx.types.u32,
+                64 => cx.tcx.types.u64,
+                128 => cx.tcx.types.u128,
+                x => bug!("Unexpected signed int size {x}"),
+            };
+            type_di_node(cx, equivalent)
+        }
+        ty::Int(IntTy::Isize) => {
+            needs_typedef = true;
+
+            let equivalent = match t.primitive_size(cx.tcx).bits() {
+                8 => cx.tcx.types.i8,
+                16 => cx.tcx.types.i16,
+                32 => cx.tcx.types.i32,
+                64 => cx.tcx.types.i64,
+                128 => cx.tcx.types.i128,
+                x => bug!("Unexpected signed int size: {x}"),
+            };
+            type_di_node(cx, equivalent)
+        }
+        _ => create_basic_type(cx, name, cx.size_of(t), encoding),
+    };
+
+    if !needs_typedef {
         return DINodeCreationResult::new(ty_di_node, false);
     }
 
@@ -951,7 +993,7 @@ pub(crate) fn build_compile_unit_di_node<'ll, 'tcx>(
         );
         let flags = c"";
 
-        let unit_metadata = llvm::LLVMRustDIBuilderCreateCompileUnit(
+        llvm::LLVMRustDIBuilderCreateCompileUnit(
             debug_context.builder.as_ref(),
             dwarf_const::DW_LANG_Rust,
             compile_unit_file,
@@ -968,11 +1010,10 @@ pub(crate) fn build_compile_unit_di_node<'ll, 'tcx>(
             kind,
             0,
             tcx.sess.opts.unstable_opts.split_dwarf_inlining,
+            tcx.sess.opts.unstable_opts.debuginfo_for_profiling,
             debug_name_table_kind,
-        );
-
-        return unit_metadata;
-    };
+        )
+    }
 }
 
 /// Creates a `DW_TAG_member` entry inside the DIE represented by the given `type_di_node`.
@@ -1473,7 +1514,7 @@ fn build_generic_type_param_di_nodes<'ll, 'tcx>(
 pub(crate) fn build_global_var_di_node<'ll>(
     cx: &CodegenCx<'ll, '_>,
     def_id: DefId,
-    global: &'ll Value,
+    global: Value<'ll>,
 ) {
     if cx.dbg_cx.is_none() {
         return;
@@ -1554,7 +1595,7 @@ fn build_vtable_type_di_node<'ll, 'tcx>(
     let usize_di_node = type_di_node(cx, tcx.types.usize);
     let pointer_layout = cx.layout_of(void_pointer_ty);
     let pointer_size = pointer_layout.size;
-    let pointer_align = pointer_layout.align.abi;
+    let pointer_align = pointer_layout.align;
     // If `usize` is not pointer-sized and -aligned then the size and alignment computations
     // for the vtable as a whole would be wrong. Let's make sure this holds even on weird
     // platforms.
@@ -1682,7 +1723,7 @@ fn build_unsafe_binder_type_di_node<'ll, 'tcx>(
 /// global variable (which is simply returned), or an addrspacecast constant expression.
 /// If the given value is an addrspacecast, the cast is removed and the global variable behind
 /// the cast is returned.
-fn find_vtable_behind_cast<'ll>(vtable: &'ll Value) -> &'ll Value {
+fn find_vtable_behind_cast<'ll>(vtable: Value<'ll>) -> Value<'ll> {
     // The vtable is a global variable, which may be behind an addrspacecast.
     unsafe {
         if let Some(c) = llvm::LLVMIsAConstantExpr(vtable) {
@@ -1698,7 +1739,7 @@ pub(crate) fn apply_vcall_visibility_metadata<'ll, 'tcx>(
     cx: &CodegenCx<'ll, 'tcx>,
     ty: Ty<'tcx>,
     trait_ref: Option<ExistentialTraitRef<'tcx>>,
-    vtable: &'ll Value,
+    vtable: Value<'ll>,
 ) {
     // FIXME(flip1995): The virtual function elimination optimization only works with full LTO in
     // LLVM at the moment.
@@ -1763,7 +1804,7 @@ pub(crate) fn create_vtable_di_node<'ll, 'tcx>(
     cx: &CodegenCx<'ll, 'tcx>,
     ty: Ty<'tcx>,
     poly_trait_ref: Option<ty::ExistentialTraitRef<'tcx>>,
-    vtable: &'ll Value,
+    vtable: Value<'ll>,
 ) {
     if cx.dbg_cx.is_none() {
         return;
@@ -1818,7 +1859,7 @@ pub(crate) fn extend_scope_to_file<'ll>(
 }
 
 fn tuple_field_name(field_index: usize) -> Cow<'static, str> {
-    const TUPLE_FIELD_NAMES: [&'static str; 16] = [
+    const TUPLE_FIELD_NAMES: [&str; 16] = [
         "__0", "__1", "__2", "__3", "__4", "__5", "__6", "__7", "__8", "__9", "__10", "__11",
         "__12", "__13", "__14", "__15",
     ];

@@ -5,7 +5,7 @@ use clippy_utils::res::MaybeDef as _;
 use clippy_utils::ty::implements_trait_with_env;
 use clippy_utils::visitors::for_each_expr;
 use clippy_utils::{fulfill_or_allowed, is_doc_hidden, is_inside_always_const_context, method_chain_args, return_ty};
-use rustc_hir::{BodyId, FnSig, OwnerId, Safety};
+use rustc_hir::{BodyId, FnSig, HeaderSafety, OwnerId, Safety};
 use rustc_lint::LateContext;
 use rustc_middle::ty;
 use rustc_span::{Span, sym};
@@ -34,14 +34,14 @@ pub fn check(
     }
 
     let span = cx.tcx.def_span(owner_id);
-    match (headers.safety, sig.header.safety()) {
-        (false, Safety::Unsafe) => span_lint(
+    match (headers.safety, sig.header.safety) {
+        (false, HeaderSafety::Normal(Safety::Unsafe)) => span_lint(
             cx,
             MISSING_SAFETY_DOC,
             span,
             "unsafe function's docs are missing a `# Safety` section",
         ),
-        (true, Safety::Safe) => span_lint(
+        (true, HeaderSafety::Normal(Safety::Safe) | HeaderSafety::SafeTargetFeatures) => span_lint(
             cx,
             UNNECESSARY_SAFETY_DOC,
             span,
@@ -74,7 +74,7 @@ pub fn check(
             && let Some(future) = cx.tcx.lang_items().future_trait()
             && let typeck = cx.tcx.typeck_body(body_id)
             && let body = cx.tcx.hir_body(body_id)
-            && let ret_ty = typeck.expr_ty(&body.value)
+            && let ret_ty = typeck.expr_ty(body.value)
             && implements_trait_with_env(
                 cx.tcx,
                 ty::TypingEnv::non_body_analysis(cx.tcx, owner_id.def_id),

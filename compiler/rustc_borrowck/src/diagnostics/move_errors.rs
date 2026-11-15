@@ -1,6 +1,7 @@
 use rustc_abi::FieldIdx;
 use rustc_data_structures::fx::FxHashSet;
-use rustc_errors::{Applicability, Diag};
+use rustc_errors::{Applicability, Diag, MultiSpan};
+use rustc_hir::def::DefKind;
 use rustc_hir::intravisit::Visitor;
 use rustc_hir::{self as hir, CaptureBy, ExprKind, HirId, Node};
 use rustc_middle::mir::*;
@@ -339,7 +340,7 @@ impl<'diag, 'tcx> MirBorrowckCtxt<'_, 'diag, 'tcx> {
         // Find the closure that captured the binding.
         let mut expr_finder = FindExprBySpan::new(args_span, tcx);
         expr_finder.include_closures = true;
-        expr_finder.visit_expr(&tcx.hir_body(body_id).value);
+        expr_finder.visit_expr(tcx.hir_body(body_id).value);
         let Some(closure_expr) = expr_finder.result else { return };
         let ExprKind::Closure(closure) = closure_expr.kind else { return };
         // We'll only suggest cloning the binding if it's a `move` closure.
@@ -349,7 +350,7 @@ impl<'diag, 'tcx> MirBorrowckCtxt<'_, 'diag, 'tcx> {
         let use_span = use_spans.var_or_use();
         let mut expr_finder = FindExprBySpan::new(use_span, tcx);
         expr_finder.include_closures = true;
-        expr_finder.visit_expr(&tcx.hir_body(body_id).value);
+        expr_finder.visit_expr(tcx.hir_body(body_id).value);
         let Some(use_expr) = expr_finder.result else { return };
         let parent = tcx.parent_hir_node(use_expr.hir_id);
         if let Node::Expr(expr) = parent
@@ -634,7 +635,7 @@ impl<'diag, 'tcx> MirBorrowckCtxt<'_, 'diag, 'tcx> {
         &self,
         def_id: DefId,
         asyncness: ty::Asyncness,
-    ) -> Option<Span> {
+    ) -> Option<MultiSpan> {
         let tcx = self.infcx.tcx;
         let typeck_result = tcx.typeck(self.mir_def_id());
         // Check whether the closure is an argument to a call, if so,
@@ -642,14 +643,21 @@ impl<'diag, 'tcx> MirBorrowckCtxt<'_, 'diag, 'tcx> {
         let closure_hir_id = tcx.local_def_id_to_hir_id(def_id.expect_local());
         let hir::Node::Expr(parent) = tcx.parent_hir_node(closure_hir_id) else { return None };
 
+        let mut context = vec![];
         let gen_clauses = match parent.kind {
             hir::ExprKind::Call(callee, _) => {
                 let ty = typeck_result.node_type_opt(callee.hir_id)?;
                 let ty::FnDef(fn_def_id, args) = *ty.kind() else { return None };
+                context.push(tcx.def_span(fn_def_id).shrink_to_lo());
+                if tcx.def_kind(fn_def_id) == DefKind::AssocFn {
+                    context.push(tcx.def_span(tcx.parent(fn_def_id)).shrink_to_lo());
+                }
                 tcx.clauses_of(fn_def_id).instantiate(tcx, args.no_bound_vars().unwrap())
             }
             hir::ExprKind::MethodCall(..) => {
                 let (_, method) = typeck_result.type_dependent_def(parent.hir_id)?;
+                context.push(tcx.def_span(method).shrink_to_lo());
+                context.push(tcx.def_span(tcx.parent(method)).shrink_to_lo());
                 let args = typeck_result.node_args(parent.hir_id);
                 tcx.clauses_of(method).instantiate(tcx, args)
             }
@@ -658,7 +666,7 @@ impl<'diag, 'tcx> MirBorrowckCtxt<'_, 'diag, 'tcx> {
 
         // Check whether one of the where-bounds requires the closure to impl `Fn[Mut]`
         // or `AsyncFn[Mut]`.
-        for (clause, span) in gen_clauses.clauses.iter().zip(gen_clauses.spans.iter()) {
+        for (clause, &span) in gen_clauses.clauses.iter().zip(gen_clauses.spans.iter()) {
             let clause = clause.skip_norm_wip();
             let dominated_by_fn_trait = self
                 .closure_clause_kind(clause, def_id, asyncness)
@@ -668,7 +676,11 @@ impl<'diag, 'tcx> MirBorrowckCtxt<'_, 'diag, 'tcx> {
                 // `<TyOfCapturingClosure as AsyncFnMut>`.
                 // We point at the bound that coerced the closure, which could be changed
                 // to `FnOnce()` or `AsyncFnOnce()` to avoid the move error.
-                return Some(*span);
+                let mut span: MultiSpan = span.into();
+                for context in context {
+                    span.push_span_context(context);
+                }
+                return Some(span);
             }
         }
         None

@@ -3,7 +3,6 @@ use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_middle::mir;
 use rustc_middle::mir::interpret::{EvalToValTreeResult, GlobalId, ValTreeCreationError};
 use rustc_middle::traits::ObligationCause;
-use rustc_middle::ty::consts::ConstExt;
 use rustc_middle::ty::layout::{LayoutCx, TyAndLayout};
 use rustc_middle::ty::{self, Ty, TyCtxt};
 use rustc_span::{DUMMY_SP, bug};
@@ -209,6 +208,9 @@ fn const_to_valtree_inner<'tcx>(
         | ty::Coroutine(..)
         | ty::CoroutineWitness(..)
         | ty::UnsafeBinder(_) => Err(ValTreeCreationError::NonSupportedType(ty)),
+
+        // FIXME(scrabsha)
+        ty::View(..) => unimplemented!(),
     };
 
     visited.remove(place);
@@ -383,6 +385,9 @@ pub fn valtree_to_const_value<'tcx>(
         | ty::UnsafeBinder(_) => {
             bug!("no ValTree should have been created for type {:?}", cv.ty.kind())
         }
+
+        // FIXME(scrabsha)
+        ty::View(..) => unimplemented!(),
     }
 }
 

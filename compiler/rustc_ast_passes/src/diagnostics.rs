@@ -201,16 +201,6 @@ pub(crate) struct FnParamDocComment {
     pub span: Span,
 }
 
-// FIXME(splat): add splat to the allowed built-in attributes when it is complete/stabilized
-#[derive(Diagnostic)]
-#[diag(
-    "allow, cfg, cfg_attr, deny, expect, forbid, and warn are the only allowed built-in attributes in function parameters"
-)]
-pub(crate) struct FnParamForbiddenAttr {
-    #[primary_span]
-    pub span: Span,
-}
-
 #[derive(Diagnostic)]
 #[diag("`#[{$eii_name}]` is not allowed to have `#[{$attr_name}]`")]
 pub(crate) struct EiiImplAttributeNotSupported<'a> {
@@ -226,6 +216,14 @@ pub(crate) struct EiiImplAttributeNotSupported<'a> {
 #[diag("`self` parameter is only allowed in associated functions")]
 #[note("associated functions are those in `impl` or `trait` definitions")]
 pub(crate) struct FnParamForbiddenSelf {
+    #[primary_span]
+    #[label("not semantically valid as function parameter")]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag("`const` parameter is only allowed in free/trait/impl functions")]
+pub(crate) struct InvalidConstParam {
     #[primary_span]
     #[label("not semantically valid as function parameter")]
     pub span: Span,
@@ -689,6 +687,15 @@ pub(crate) struct PatternFnPointer {
 pub(crate) struct PatternParenthesizedArgList {
     #[primary_span]
     pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag("C-variadic parameters aren't allowed in parenthesized argument lists")]
+pub(crate) struct PathFoundCVariadicParams {
+    #[primary_span]
+    pub span: Span,
+    #[suggestion("remove the C-variadics", applicability = "machine-applicable", code = "")]
+    pub sugg_span: Span,
 }
 
 #[derive(Diagnostic)]
@@ -1324,4 +1331,12 @@ pub(crate) struct AbiCustomCannotBeCold {
 
     #[label("`extern \"custom\"` because of this")]
     pub abi_span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag("showing the spans of the {$kind}")]
+pub(crate) struct ShowSpan {
+    #[primary_span]
+    pub span: Span,
+    pub kind: &'static str,
 }
