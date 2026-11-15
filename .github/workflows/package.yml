@@ -20,7 +20,7 @@ jobs:
           - os: windows-2022
             host: x86_64-pc-windows-msvc
             free_disk: false
-          - os: macos-14
+          - os: macos-26
             host: aarch64-apple-darwin
             free_disk: false
           - os: ubuntu-24.04
@@ -123,7 +123,7 @@ jobs:
       - name: Download Darwin artifacts
         uses: actions/download-artifact@v5
         with:
-          name: macos-14
+          name: macos-26
       - name: Download Linux artifacts
         uses: actions/download-artifact@v5
         with:
