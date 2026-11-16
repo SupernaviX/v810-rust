@@ -1380,7 +1380,7 @@ extern "C" void LLVMRustPositionBuilderPastAllocas(LLVMBuilderRef B,
 extern "C" void LLVMRustPositionBuilderAtStart(LLVMBuilderRef B,
                                                LLVMBasicBlockRef BB) {
   auto Point = unwrap(BB)->getFirstInsertionPt();
-  unwrap(B)->SetInsertPoint(unwrap(BB), Point);
+  unwrap(B)->SetInsertPoint(Point);
 }
 
 extern "C" void LLVMRustPositionBefore(LLVMBuilderRef B, LLVMValueRef Instr) {
